@@ -1,4 +1,4 @@
-"""DQN agent implementation for the snake game."""
+﻿"""DQN agent implementation for the snake game."""
 
 from __future__ import annotations
 
@@ -23,34 +23,45 @@ except ImportError:
 
 
 class ReplayBuffer:
-    """Simple experience replay buffer."""
+    """Experience replay buffer that stores tensors directly on device."""
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, device: torch.device) -> None:
         self.capacity = capacity
-        self._buffer: Deque[Tuple[np.ndarray, int, float, np.ndarray, bool]] = deque(maxlen=capacity)
+        self.device = device
+        self._buffer: Deque[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = deque(maxlen=capacity)
 
     def __len__(self) -> int:
         return len(self._buffer)
 
     def push(
         self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        done: bool,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        reward: torch.Tensor,
+        next_state: torch.Tensor,
+        done: torch.Tensor,
     ) -> None:
-        self._buffer.append((state, action, reward, next_state, done))
+        self._buffer.append(
+            (
+                state.detach().to(self.device),
+                action.detach().to(self.device),
+                reward.detach().to(self.device),
+                next_state.detach().to(self.device),
+                done.detach().to(self.device),
+            )
+        )
 
-    def sample(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
         batch = random.sample(self._buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         return (
-            np.stack(states).astype(np.float32),
-            np.array(actions, dtype=np.int64),
-            np.array(rewards, dtype=np.float32),
-            np.stack(next_states).astype(np.float32),
-            np.array(dones, dtype=np.float32),
+            torch.stack(states, dim=0),
+            torch.stack(actions, dim=0),
+            torch.stack(rewards, dim=0),
+            torch.stack(next_states, dim=0),
+            torch.stack(dones, dim=0),
         )
 
 
@@ -88,7 +99,7 @@ class DQNAgent:
         epsilon_start: float = 1.0,
         epsilon_final: float = 0.05,
         epsilon_decay: float = 0.995,
-        device: str | None = None,
+        device: str | torch.device | None = None,
         game_config: GameConfig | None = None,
     ) -> None:
         self.state_dim = state_dim
@@ -113,7 +124,7 @@ class DQNAgent:
         self.target_net.eval()
 
         self.optimizer = Adam(self.policy_net.parameters(), lr=lr)
-        self.replay_buffer = ReplayBuffer(replay_capacity)
+        self.replay_buffer = ReplayBuffer(replay_capacity, self.device)
         self.learn_step_counter = 0
 
         self.loss_fn = nn.SmoothL1Loss()
@@ -121,46 +132,51 @@ class DQNAgent:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def select_action(self, state: np.ndarray, *, epsilon_override: float | None = None) -> int:
-        """Epsilon-greedy policy."""
+    def select_action(
+        self,
+        state: np.ndarray | torch.Tensor,
+        *,
+        epsilon_override: float | None = None,
+    ) -> int:
+        """Epsilon-greedy policy operating on tensors."""
         epsilon = self.epsilon if epsilon_override is None else epsilon_override
         if random.random() < epsilon:
             return random.randrange(self.action_dim)
-        state_tensor = torch.from_numpy(state).to(self.device).unsqueeze(0)
+        state_tensor = self._ensure_tensor(state).view(1, -1)
         with torch.no_grad():
             q_values = self.policy_net(state_tensor)
         return int(q_values.argmax(dim=1).item())
 
     def remember(
         self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        done: bool,
+        state: np.ndarray | torch.Tensor,
+        action: int | torch.Tensor,
+        reward: float | torch.Tensor,
+        next_state: np.ndarray | torch.Tensor,
+        done: bool | float | torch.Tensor,
     ) -> None:
-        self.replay_buffer.push(state, action, reward, next_state, done)
+        state_t = self._ensure_tensor(state)
+        next_state_t = self._ensure_tensor(next_state)
+        action_t = torch.as_tensor(action, dtype=torch.long, device=self.device).view(-1)
+        reward_t = torch.as_tensor(reward, dtype=torch.float32, device=self.device).view(-1)
+        done_t = torch.as_tensor(done, dtype=torch.float32, device=self.device).view(-1)
+        self.replay_buffer.push(state_t, action_t, reward_t, next_state_t, done_t)
 
     def learn(self) -> float | None:
         if len(self.replay_buffer) < max(self.batch_size, self.min_replay_size):
             return None
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
 
-        states_t = torch.from_numpy(states).to(self.device)
-        actions_t = torch.from_numpy(actions).to(self.device)
-        rewards_t = torch.from_numpy(rewards).to(self.device)
-        next_states_t = torch.from_numpy(next_states).to(self.device)
-        dones_t = torch.from_numpy(dones).to(self.device)
-
-        q_values = self.policy_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        q_values = self.policy_net(states).gather(1, actions.long())
+        q_values = q_values.squeeze(1)
 
         with torch.no_grad():
-            next_q_values = self.target_net(next_states_t).max(dim=1).values
-            targets = rewards_t + self.gamma * (1 - dones_t) * next_q_values
+            next_q_values = self.target_net(next_states).max(dim=1).values
+            targets = rewards.squeeze(1) + self.gamma * (1 - dones.squeeze(1)) * next_q_values
 
         loss = self.loss_fn(q_values, targets)
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=5.0)
         self.optimizer.step()
@@ -199,7 +215,7 @@ class DQNAgent:
         )
 
     @classmethod
-    def load(cls, path: str, *, device: str | None = None) -> "DQNAgent":
+    def load(cls, path: str, *, device: str | torch.device | None = None) -> "DQNAgent":
         checkpoint = torch.load(path, map_location=device or ("cuda" if torch.cuda.is_available() else "cpu"))
         metadata = checkpoint["metadata"]
         agent = cls(
@@ -231,9 +247,16 @@ class DQNAgent:
         if self.epsilon > self.epsilon_final:
             self.epsilon = max(self.epsilon_final, self.epsilon * self.epsilon_decay)
 
+    def _ensure_tensor(self, value: np.ndarray | torch.Tensor) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().to(self.device, dtype=torch.float32)
+        else:
+            tensor = torch.from_numpy(value).to(self.device, dtype=torch.float32)
+        return tensor.view(-1)
 
-def flatten_observation(grid: np.ndarray) -> np.ndarray:
-    return grid.astype(np.float32).flatten()
+
+def flatten_observation(grid: np.ndarray, device: torch.device | str) -> torch.Tensor:
+    return torch.from_numpy(grid).to(device=device, dtype=torch.float32).view(-1)
 
 
 __all__ = ["DQNAgent", "ReplayBuffer", "flatten_observation"]

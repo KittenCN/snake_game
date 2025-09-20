@@ -9,7 +9,7 @@ import os
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -71,13 +71,13 @@ def evaluate_agent(agent: DQNAgent, env: SnakeGameEnv, episodes: int) -> Dict[st
     try:
         for _ in range(episodes):
             env.reset()
-            state = flatten_observation(env.as_numpy())
+            state = flatten_observation(env.as_numpy(), agent.device)
             total_reward = 0.0
-            for step in range(10_000):
+            for _ in range(10_000):
                 action = agent.select_action(state, epsilon_override=0.0)
                 _, reward, done, _ = env.step(Action(action))
                 total_reward += reward
-                state = flatten_observation(env.as_numpy())
+                state = flatten_observation(env.as_numpy(), agent.device)
                 if done:
                     break
             rewards.append(total_reward)
@@ -136,14 +136,14 @@ def train() -> None:
 
     for episode in range(1, args.episodes + 1):
         env.reset(seed=args.seed + episode)
-        state = flatten_observation(env.as_numpy())
+        state = flatten_observation(env.as_numpy(), agent.device)
         episode_reward = 0.0
         losses: List[float] = []
 
-        for step in range(args.max_steps):
+        for _ in range(args.max_steps):
             action = agent.select_action(state)
             _, reward, done, info = env.step(Action(action))
-            next_state = flatten_observation(env.as_numpy())
+            next_state = flatten_observation(env.as_numpy(), agent.device)
             agent.remember(state, action, reward, next_state, done)
             loss = agent.learn()
             if loss is not None:
@@ -194,7 +194,6 @@ def train() -> None:
                 f"epsilon={agent.epsilon:.3f} | avg_loss={metrics['avg_loss']}"
             )
 
-    # Final checkpoint if we never improved during eval
     if best_reward == -math.inf:
         agent.save(str(output_path))
 
@@ -203,4 +202,3 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
-

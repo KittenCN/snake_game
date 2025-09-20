@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--console", action="store_true", help="Run in console (ASCII) mode instead of GUI")
     parser.add_argument("--render", action="store_true", help="Render ASCII board to the console (console mode)")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for the environment")
+    parser.add_argument("--device", type=str, default=None, help="Override device for inference (cpu/cuda)")
     return parser.parse_args()
 
 
@@ -56,13 +57,13 @@ def build_env_from_metadata(agent: DQNAgent, seed: Optional[int]) -> SnakeGameEn
 
 def run_episode(agent: DQNAgent, env: SnakeGameEnv, delay: float, render: bool) -> dict:
     env.reset()
-    state = flatten_observation(env.as_numpy())
+    state = flatten_observation(env.as_numpy(), agent.device)
     total_reward = 0.0
     while True:
         action = agent.select_action(state, epsilon_override=0.0)
         obs, reward, done, info = env.step(Action(action))
         total_reward += reward
-        state = flatten_observation(env.as_numpy())
+        state = flatten_observation(env.as_numpy(), agent.device)
         if render:
             board = env.render(to_string=True)
             print(board)
@@ -83,7 +84,7 @@ def main() -> None:
         print(f"Model file not found: {model_path}")
         return
 
-    agent = DQNAgent.load(str(model_path))
+    agent = DQNAgent.load(str(model_path), device=args.device)
     env = build_env_from_metadata(agent, args.seed)
 
     print(f"Loaded model from {model_path.resolve()}")
@@ -105,14 +106,13 @@ def main() -> None:
             print(f"Averages: reward={avg_reward:.3f} score={avg_score:.2f} steps={avg_steps:.1f}")
         return
 
-    # GUI mode -----------------------------------------------------------------
     agent.epsilon = 0.0
     results: List[dict] = []
     gui: Optional[SnakeGameGUI] = None
 
     def controller(current_env: SnakeGameEnv) -> Action:
-        state = flatten_observation(current_env.as_numpy())
-        action_idx = agent.select_action(state, epsilon_override=0.0)
+        state_tensor = flatten_observation(current_env.as_numpy(), agent.device)
+        action_idx = agent.select_action(state_tensor, epsilon_override=0.0)
         return Action(action_idx)
 
     def on_episode_end(summary: dict) -> None:
