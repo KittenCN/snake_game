@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import time
 
-from .env import SnakeGameEnv
+try:
+    from .env import SnakeGameEnv
+except ImportError:
+    import os
+    import sys
+
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from env import SnakeGameEnv
 
 
 def main() -> None:

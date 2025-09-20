@@ -1,0 +1,41 @@
+{
+  "game_config": {
+    "width": 12,
+    "height": 12,
+    "initial_length": 3,
+    "reward_step": -0.01,
+    "reward_food": 1.0,
+    "reward_death": -1.0,
+    "allow_wrap": false,
+    "seed": 42
+  },
+  "train_args": {
+    "episodes": 1000,
+    "max_steps": 500,
+    "width": 12,
+    "height": 12,
+    "initial_length": 3,
+    "allow_wrap": false,
+    "seed": 42,
+    "eval_interval": 50,
+    "eval_episodes": 5,
+    "lr": 0.001,
+    "gamma": 0.99,
+    "batch_size": 128,
+    "replay_capacity": 50000,
+    "min_replay": 2000,
+    "target_update": 1000,
+    "epsilon_start": 1.0,
+    "epsilon_final": 0.05,
+    "epsilon_decay": 0.995,
+    "hidden": [
+      256,
+      256
+    ],
+    "device": null,
+    "output": "models/dqn_snake.pt",
+    "log_dir": "runs",
+    "render_frequency": 0
+  },
+  "best_avg_reward": 0.8699999999999999
+}

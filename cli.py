@@ -5,7 +5,14 @@ from __future__ import annotations
 import argparse
 import time
 
-from .env import Action, GameConfig, SnakeGameEnv
+try:
+    from .env import Action, GameConfig, SnakeGameEnv
+except ImportError:
+    import os
+    import sys
+
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from env import Action, GameConfig, SnakeGameEnv
 
 
 def parse_args() -> argparse.Namespace:

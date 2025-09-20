@@ -1,4 +1,4 @@
-# Snake Game Environment
+﻿# Snake Game Environment
 
 This package contains a pure-Python implementation of the Snake game with a reinforcement-learning-friendly API.
 
@@ -37,18 +37,23 @@ python -m snake_game
 The demo prints the board state after each action; stop the program with `Ctrl+C` when finished.
 
 ## PyTorch DQN Agent
+## PyTorch DQN Agent
 
-A Deep Q-Network baseline is provided in snake_game.dqn_agent. Train it with:
+A Deep Q-Network baseline is provided in `snake_game.dqn_agent`.
 
-`ash
+Train it with:
+```bash
 python -m snake_game.train_dqn --episodes 1000 --width 12 --height 12
-`
+```
 
-Checkpoints (default models/dqn_snake.pt) can then be played back with:
+Once trained (default checkpoint `models/dqn_snake.pt`), launch GUI inference with all defaults:
+```bash
+python -m snake_game.play_dqn
+```
 
-`ash
-python -m snake_game.play_dqn --model models/dqn_snake.pt --episodes 3 --render
-`
+Use console rendering instead of the GUI:
+```bash
+python -m snake_game.play_dqn --console --render
+```
 
-Install requirements such as 	orch and 
-umpy before training.
+Install dependencies such as `torch` and `numpy` before training.

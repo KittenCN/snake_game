@@ -149,7 +149,11 @@ class SnakeGameEnv:
             self._spawn_food()
         else:
             tail = self._snake.pop()
-            self._occupied.remove(tail)
+            if tail in self._occupied:
+                self._occupied.remove(tail)
+            else:
+                # Rare desync guard: rebuild occupied cells to the current snake body.
+                self._occupied = set(self._snake)
 
         if self._food is None:
             self._done = True

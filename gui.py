@@ -1,11 +1,11 @@
-"""Tkinter-based GUI for the snake game environment."""
+﻿"""Tkinter-based GUI for the snake game environment."""
 
 from __future__ import annotations
 
 import argparse
 import tkinter as tk
 from tkinter import messagebox
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from .env import Action, GameConfig, SnakeGameEnv
@@ -14,8 +14,7 @@ except ImportError:
     import sys
 
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-    from snake_game.env import Action, GameConfig, SnakeGameEnv
-
+    from env import Action, GameConfig, SnakeGameEnv
 
 
 class SnakeGameGUI:
@@ -27,6 +26,8 @@ class SnakeGameGUI:
         speed_ms: int = 150,
         title: str = "Snake Game",
         master: Optional[tk.Tk] = None,
+        controller: Optional[Callable[[SnakeGameEnv], Action]] = None,
+        on_episode_end: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self.config = config or GameConfig()
         self.env = SnakeGameEnv(self.config)
@@ -35,6 +36,9 @@ class SnakeGameGUI:
         self._pending_action: Action = Action.RIGHT
         self._running = False
         self._after_id: Optional[str] = None
+        self._controller = controller
+        self._on_episode_end = on_episode_end
+        self._episode_reward: float = 0.0
 
         self.root = master or tk.Tk()
         self.root.title(title)
@@ -60,7 +64,8 @@ class SnakeGameGUI:
         tk.Button(control_frame, text="Restart", command=self.reset).pack(side=tk.LEFT, padx=5)
         tk.Button(control_frame, text="Quit", command=self.root.quit).pack(side=tk.LEFT, padx=5)
 
-        self.root.bind("<KeyPress>", self._on_key_press)
+        if self._controller is None:
+            self.root.bind("<KeyPress>", self._on_key_press)
 
     # ------------------------------------------------------------------
     # Public API
@@ -76,10 +81,12 @@ class SnakeGameGUI:
         self.env.reset()
         self._pending_action = self.env.direction
         self._running = True
+        self._episode_reward = 0.0
         self._update_status(reward=0.0, info={})
         self._draw_board()
         self._after_id = self.root.after(self.speed_ms, self._tick)
-        self.root.focus_force()
+        if self._controller is None:
+            self.root.focus_force()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -87,17 +94,36 @@ class SnakeGameGUI:
     def _tick(self) -> None:
         if not self._running:
             return
-        observation, reward, done, info = self.env.step(self._pending_action)
+
+        if self._controller is not None:
+            action = self._controller(self.env)
+        else:
+            action = self._pending_action
+        if not isinstance(action, Action):
+            action = Action(action)
+
+        observation, reward, done, info = self.env.step(action)
+        self._episode_reward += reward
         self._draw_board()
         self._update_status(reward=reward, info=info)
+
         if done:
             self._running = False
             self._after_id = None
-            messagebox.showinfo(
-                "Game Over",
-                f"Event: {info.get('event', 'finished')}\nScore: {observation['score']}\nSteps: {observation['steps']}",
-                parent=self.root,
-            )
+            summary = {
+                "reward": self._episode_reward,
+                "score": observation["score"],
+                "steps": observation["steps"],
+                "info": info,
+            }
+            if self._on_episode_end is not None:
+                self._on_episode_end(summary)
+            if self._controller is None:
+                messagebox.showinfo(
+                    "Game Over",
+                    f"Event: {info.get('event', 'finished')}\nScore: {observation['score']}\nSteps: {observation['steps']}",
+                    parent=self.root,
+                )
         else:
             self._after_id = self.root.after(self.speed_ms, self._tick)
 
@@ -141,6 +167,10 @@ class SnakeGameGUI:
         if action in self.env.legal_actions():
             self._pending_action = action
 
+
+# ----------------------------------------------------------------------
+# CLI helper for manual play
+# ----------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Snake game GUI")

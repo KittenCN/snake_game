@@ -6,13 +6,14 @@ import argparse
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
 try:
     from .dqn_agent import DQNAgent, flatten_observation
     from .env import Action, GameConfig, SnakeGameEnv
+    from .gui import SnakeGameGUI
 except ImportError:
     import os
     import sys
@@ -20,19 +21,30 @@ except ImportError:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from dqn_agent import DQNAgent, flatten_observation
     from env import Action, GameConfig, SnakeGameEnv
+    from gui import SnakeGameGUI
+
+
+DEFAULT_MODEL_PATH = Path("models/dqn_snake.pt")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run inference for a trained DQN snake agent")
-    parser.add_argument("--model", type=str, required=True, help="Path to the trained model checkpoint (.pt)")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=str(DEFAULT_MODEL_PATH),
+        help=f"Path to the trained model checkpoint (.pt). Default: {DEFAULT_MODEL_PATH}",
+    )
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to play")
-    parser.add_argument("--delay", type=float, default=0.05, help="Sleep time between steps (seconds)")
-    parser.add_argument("--render", action="store_true", help="Render ASCII board to the console")
+    parser.add_argument("--delay", type=float, default=0.05, help="Delay between steps (seconds)")
+    parser.add_argument("--cell-size", type=int, default=25, help="GUI cell size in pixels")
+    parser.add_argument("--console", action="store_true", help="Run in console (ASCII) mode instead of GUI")
+    parser.add_argument("--render", action="store_true", help="Render ASCII board to the console (console mode)")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for the environment")
     return parser.parse_args()
 
 
-def build_env_from_metadata(agent: DQNAgent, seed: int | None) -> SnakeGameEnv:
+def build_env_from_metadata(agent: DQNAgent, seed: Optional[int]) -> SnakeGameEnv:
     if agent.game_config is not None:
         base_config = GameConfig(**asdict(agent.game_config))
     else:
@@ -66,27 +78,77 @@ def run_episode(agent: DQNAgent, env: SnakeGameEnv, delay: float, render: bool) 
 
 def main() -> None:
     args = parse_args()
-    agent = DQNAgent.load(args.model)
+    model_path = Path(args.model)
+    if not model_path.exists():
+        print(f"Model file not found: {model_path}")
+        return
+
+    agent = DQNAgent.load(str(model_path))
     env = build_env_from_metadata(agent, args.seed)
 
-    print(f"Loaded model from {Path(args.model).resolve()}")
-    print(f"Playing {args.episodes} episode(s) with grid {env.config.width}x{env.config.height}")
+    print(f"Loaded model from {model_path.resolve()}")
 
-    stats: List[dict] = []
-    for idx in range(1, args.episodes + 1):
-        print(f"Episode {idx}")
-        result = run_episode(agent, env, args.delay, args.render)
-        stats.append(result)
+    if args.console:
+        print(f"Playing {args.episodes} episode(s) with grid {env.config.width}x{env.config.height} (console mode)")
+        stats: List[dict] = []
+        for idx in range(1, args.episodes + 1):
+            print(f"Episode {idx}")
+            result = run_episode(agent, env, args.delay, args.render)
+            stats.append(result)
+            print(
+                f" -> reward={result['reward']:.3f} score={result['score']} steps={result['steps']}"
+            )
+        if stats:
+            avg_reward = np.mean([s["reward"] for s in stats])
+            avg_score = np.mean([s["score"] for s in stats])
+            avg_steps = np.mean([s["steps"] for s in stats])
+            print(f"Averages: reward={avg_reward:.3f} score={avg_score:.2f} steps={avg_steps:.1f}")
+        return
+
+    # GUI mode -----------------------------------------------------------------
+    agent.epsilon = 0.0
+    results: List[dict] = []
+    gui: Optional[SnakeGameGUI] = None
+
+    def controller(current_env: SnakeGameEnv) -> Action:
+        state = flatten_observation(current_env.as_numpy())
+        action_idx = agent.select_action(state, epsilon_override=0.0)
+        return Action(action_idx)
+
+    def on_episode_end(summary: dict) -> None:
+        results.append(summary)
+        idx = len(results)
         print(
-            f" -> reward={result['reward']:.3f} score={result['score']} steps={result['steps']}"
+            f"Episode {idx} -> reward={summary['reward']:.3f} "
+            f"score={summary['score']} steps={summary['steps']}"
         )
+        if gui is not None:
+            if idx >= args.episodes:
+                gui.root.after(500, gui.root.quit)
+            else:
+                gui.root.after(500, gui.reset)
 
-    avg_reward = np.mean([s["reward"] for s in stats]) if stats else 0.0
-    avg_score = np.mean([s["score"] for s in stats]) if stats else 0.0
-    avg_steps = np.mean([s["steps"] for s in stats]) if stats else 0.0
-    print(f"Averages: reward={avg_reward:.3f} score={avg_score:.2f} steps={avg_steps:.1f}")
+    speed_ms = max(20, int(args.delay * 1000))
+    gui = SnakeGameGUI(
+        env.config,
+        cell_size=args.cell_size,
+        speed_ms=speed_ms,
+        title="Snake DQN Inference",
+        controller=controller,
+        on_episode_end=on_episode_end,
+    )
+
+    print(f"Playing {args.episodes} episode(s) with grid {gui.env.config.width}x{gui.env.config.height} (GUI mode)")
+    gui.start()
+
+    if results:
+        avg_reward = np.mean([s["reward"] for s in results])
+        avg_score = np.mean([s["score"] for s in results])
+        avg_steps = np.mean([s["steps"] for s in results])
+        print(f"Averages: reward={avg_reward:.3f} score={avg_score:.2f} steps={avg_steps:.1f}")
+    else:
+        print("No episodes completed.")
 
 
 if __name__ == "__main__":
     main()
-
