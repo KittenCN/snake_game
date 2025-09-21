@@ -10,7 +10,7 @@
     "seed": 42
   },
   "train_args": {
-    "episodes": 1000,
+    "episodes": 50000,
     "max_steps": 500,
     "width": 12,
     "height": 12,
@@ -21,8 +21,8 @@
     "eval_episodes": 5,
     "lr": 0.001,
     "gamma": 0.99,
-    "batch_size": 128,
-    "replay_capacity": 50000,
+    "batch_size": 256,
+    "replay_capacity": 500000,
     "min_replay": 2000,
     "target_update": 1000,
     "epsilon_start": 1.0,
@@ -37,5 +37,5 @@
     "log_dir": "runs",
     "render_frequency": 0
   },
-  "best_avg_reward": 0.8699999999999999
+  "best_avg_reward": 3.6400000000000157
 }

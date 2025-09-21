@@ -84,6 +84,15 @@ class QNetwork(nn.Module):
 class DQNAgent:
     """Deep Q-Network agent tailored for the snake environment."""
 
+    @staticmethod
+    def _resolve_device(device: str | torch.device | None) -> torch.device:
+        if device is None:
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            return torch.device("cpu")
+        return resolved
+
     def __init__(
         self,
         state_dim: int,
@@ -115,7 +124,7 @@ class DQNAgent:
         self.epsilon_start = epsilon_start
         self.epsilon_final = epsilon_final
         self.epsilon_decay = epsilon_decay
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = self._resolve_device(device)
         self.game_config = game_config
 
         self.policy_net = QNetwork(state_dim, action_dim, hidden_sizes).to(self.device)
@@ -216,7 +225,8 @@ class DQNAgent:
 
     @classmethod
     def load(cls, path: str, *, device: str | torch.device | None = None) -> "DQNAgent":
-        checkpoint = torch.load(path, map_location=device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        load_device = cls._resolve_device(device)
+        checkpoint = torch.load(path, map_location=load_device)
         metadata = checkpoint["metadata"]
         agent = cls(
             state_dim=metadata["state_dim"],
@@ -231,7 +241,7 @@ class DQNAgent:
             epsilon_start=metadata.get("epsilon_start", 0.0),
             epsilon_final=metadata.get("epsilon_final", 0.0),
             epsilon_decay=1.0,
-            device=device or metadata.get("device"),
+            device=cls._resolve_device(device or metadata.get("device")),
             game_config=GameConfig(**metadata["game_config"]) if metadata.get("game_config") else None,
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
