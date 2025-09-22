@@ -9,7 +9,7 @@ import os
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -108,33 +108,68 @@ def train() -> None:
     state_dim = int(np.prod(observation_shape))
     action_dim = len(Action)
 
-    agent = DQNAgent(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        hidden_sizes=tuple(args.hidden),
-        lr=args.lr,
-        gamma=args.gamma,
-        batch_size=args.batch_size,
-        replay_capacity=args.replay_capacity,
-        min_replay_size=args.min_replay,
-        target_update_interval=args.target_update,
-        epsilon_start=args.epsilon_start,
-        epsilon_final=args.epsilon_final,
-        epsilon_decay=args.epsilon_decay,
-        device=args.device,
-        game_config=game_config,
-    )
-
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = output_path.with_suffix(".meta.json")
+
+    best_reward = -math.inf
+    start_episode = 1
+
+    if output_path.exists():
+        print(f"Resuming training from {output_path}")
+        agent = DQNAgent.load(str(output_path), device=args.device)
+        if agent.game_config is not None and asdict(agent.game_config) != asdict(game_config):
+            print("Loaded agent configuration differs from CLI arguments; using configuration from checkpoint.")
+            game_config = agent.game_config
+            env = SnakeGameEnv(game_config)
+            observation_shape = env.observation_shape()
+            state_dim = int(np.prod(observation_shape))
+            action_dim = len(Action)
+        if meta_path.exists():
+            try:
+                with meta_path.open("r", encoding="utf-8") as meta_fp:
+                    previous_meta = json.load(meta_fp)
+                best_reward = previous_meta.get("best_avg_reward", best_reward)
+                if best_reward is None:
+                    best_reward = -math.inf
+                start_episode = max(1, previous_meta.get("episodes_completed", 0) + 1)
+            except json.JSONDecodeError:
+                print(f"Warning: Could not parse metadata file {meta_path}; continuing from defaults.")
+    else:
+        agent = DQNAgent(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_sizes=tuple(args.hidden),
+            lr=args.lr,
+            gamma=args.gamma,
+            batch_size=args.batch_size,
+            replay_capacity=args.replay_capacity,
+            min_replay_size=args.min_replay,
+            target_update_interval=args.target_update,
+            epsilon_start=args.epsilon_start,
+            epsilon_final=args.epsilon_final,
+            epsilon_decay=args.epsilon_decay,
+            device=args.device,
+            game_config=game_config,
+        )
+
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"train_log_{int(time.time())}.jsonl"
 
-    best_reward = -math.inf
-    total_steps = 0
+    def write_metadata(best_reward_value: Optional[float], episodes_completed: int) -> None:
+        metadata = {
+            "game_config": asdict(agent.game_config or game_config),
+            "train_args": vars(args),
+            "best_avg_reward": best_reward_value,
+            "episodes_completed": episodes_completed,
+            "epsilon": agent.epsilon,
+            "learn_step_counter": agent.learn_step_counter,
+        }
+        with meta_path.open("w", encoding="utf-8") as meta_fp:
+            json.dump(metadata, meta_fp, indent=2)
 
-    for episode in range(1, args.episodes + 1):
+    for episode in range(start_episode, start_episode + args.episodes):
         env.reset(seed=args.seed + episode)
         state = flatten_observation(env.as_numpy(), agent.device)
         episode_reward = 0.0
@@ -150,7 +185,6 @@ def train() -> None:
                 losses.append(loss)
             state = next_state
             episode_reward += reward
-            total_steps += 1
             if done:
                 break
 
@@ -174,28 +208,23 @@ def train() -> None:
             if avg_reward > best_reward:
                 best_reward = avg_reward
                 agent.save(str(output_path))
-                with open(output_path.with_suffix(".meta.json"), "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "game_config": asdict(game_config),
-                            "train_args": vars(args),
-                            "best_avg_reward": best_reward,
-                        },
-                        f,
-                        indent=2,
-                    )
+            write_metadata(best_reward if best_reward != -math.inf else None, episode)
 
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(metrics) + "\n")
 
-        if episode % 10 == 0 or episode == 1:
+        if episode % 10 == 0 or episode == start_episode:
             print(
                 f"Episode {episode:5d} | reward={episode_reward:7.3f} | score={env.score:3d} | steps={env.steps:4d} | "
                 f"epsilon={agent.epsilon:.3f} | avg_loss={metrics['avg_loss']}"
             )
 
+    last_episode = start_episode + args.episodes - 1
     if best_reward == -math.inf:
         agent.save(str(output_path))
+        write_metadata(None, last_episode)
+    else:
+        write_metadata(best_reward, last_episode)
 
     print(f"Training complete. Model saved to {output_path}")
 

@@ -216,7 +216,9 @@ class DQNAgent:
                     "epsilon_start": self.epsilon_start,
                     "epsilon_final": self.epsilon_final,
                     "epsilon_decay": self.epsilon_decay,
+                    "epsilon": self.epsilon,
                     "device": str(self.device),
+                    "learn_step_counter": self.learn_step_counter,
                     "game_config": asdict(self.game_config) if self.game_config else None,
                 },
             },
@@ -247,7 +249,8 @@ class DQNAgent:
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(checkpoint["target_state_dict"])
         agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        agent.epsilon = metadata.get("epsilon_final", 0.0)
+        agent.learn_step_counter = metadata.get("learn_step_counter", 0)
+        agent.epsilon = metadata.get("epsilon", metadata.get("epsilon_final", 0.0))
         return agent
 
     # ------------------------------------------------------------------
