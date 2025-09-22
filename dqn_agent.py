@@ -66,19 +66,48 @@ class ReplayBuffer:
 
 
 class QNetwork(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_sizes: Sequence[int]) -> None:
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_sizes: Sequence[int],
+        *,
+        dueling: bool = False,
+        dueling_hidden: int | None = None,
+    ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
         input_dim = state_dim
         for hidden in hidden_sizes:
-            layers.append(nn.Linear(input_dim, hidden))
-            layers.append(nn.ReLU())
+            layers.extend([nn.Linear(input_dim, hidden), nn.ReLU()])
             input_dim = hidden
-        layers.append(nn.Linear(input_dim, action_dim))
-        self.model = nn.Sequential(*layers)
+        self.feature_extractor = nn.Sequential(*layers) if layers else nn.Identity()
+        feature_dim = input_dim if layers else state_dim
+
+        self.dueling = dueling
+        if dueling:
+            hidden_dim = dueling_hidden or feature_dim
+            self.value_head = nn.Sequential(
+                nn.Linear(feature_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.advantage_head = nn.Sequential(
+                nn.Linear(feature_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim),
+            )
+        else:
+            self.q_head = nn.Linear(feature_dim, action_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return self.model(x)
+        features = self.feature_extractor(x)
+        if self.dueling:
+            value = self.value_head(features)
+            advantages = self.advantage_head(features)
+            advantages = advantages - advantages.mean(dim=1, keepdim=True)
+            return value + advantages
+        return self.q_head(features)
 
 
 class DQNAgent:
@@ -108,6 +137,8 @@ class DQNAgent:
         target_update_tau: float = 0.0,
         hard_update_interval: int = 0,
         use_double_dqn: bool = True,
+        use_dueling: bool = True,
+        dueling_hidden: int | None = None,
         epsilon_start: float = 1.0,
         epsilon_final: float = 0.05,
         epsilon_decay: float = 0.995,
@@ -126,6 +157,8 @@ class DQNAgent:
         self.target_update_tau = max(0.0, target_update_tau)
         self.hard_update_interval = hard_update_interval
         self.use_double_dqn = use_double_dqn
+        self.use_dueling = use_dueling
+        self.dueling_hidden = dueling_hidden
         self.epsilon = epsilon_start
         self.epsilon_start = epsilon_start
         self.epsilon_final = epsilon_final
@@ -136,8 +169,20 @@ class DQNAgent:
         if self.target_update_tau <= 0.0 and self.hard_update_interval <= 0:
             self.hard_update_interval = self.target_update_interval
 
-        self.policy_net = QNetwork(state_dim, action_dim, hidden_sizes).to(self.device)
-        self.target_net = QNetwork(state_dim, action_dim, hidden_sizes).to(self.device)
+        self.policy_net = QNetwork(
+            state_dim,
+            action_dim,
+            hidden_sizes,
+            dueling=self.use_dueling,
+            dueling_hidden=self.dueling_hidden,
+        ).to(self.device)
+        self.target_net = QNetwork(
+            state_dim,
+            action_dim,
+            hidden_sizes,
+            dueling=self.use_dueling,
+            dueling_hidden=self.dueling_hidden,
+        ).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -156,7 +201,6 @@ class DQNAgent:
         *,
         epsilon_override: float | None = None,
     ) -> int:
-        """Epsilon-greedy policy operating on tensors."""
         epsilon = self.epsilon if epsilon_override is None else epsilon_override
         if random.random() < epsilon:
             return random.randrange(self.action_dim)
@@ -226,6 +270,8 @@ class DQNAgent:
                     "target_update_tau": self.target_update_tau,
                     "hard_update_interval": self.hard_update_interval,
                     "use_double_dqn": self.use_double_dqn,
+                    "use_dueling": self.use_dueling,
+                    "dueling_hidden": self.dueling_hidden,
                     "epsilon_start": self.epsilon_start,
                     "epsilon_final": self.epsilon_final,
                     "epsilon_decay": self.epsilon_decay,
@@ -255,6 +301,8 @@ class DQNAgent:
             target_update_tau=metadata.get("target_update_tau", 0.0),
             hard_update_interval=metadata.get("hard_update_interval", 0),
             use_double_dqn=metadata.get("use_double_dqn", True),
+            use_dueling=metadata.get("use_dueling", True),
+            dueling_hidden=metadata.get("dueling_hidden"),
             epsilon_start=metadata.get("epsilon_start", 0.0),
             epsilon_final=metadata.get("epsilon_final", 0.0),
             epsilon_decay=metadata.get("epsilon_decay", 1.0),

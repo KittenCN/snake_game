@@ -46,9 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-update-tau", type=float, default=0.005, help="Soft target update coefficient (0 disables)")
     parser.add_argument("--hard-update-interval", type=int, default=0, help="Explicit hard update interval when tau is 0")
     parser.add_argument("--disable-double-dqn", action="store_true", help="Disable Double DQN updates")
+    parser.add_argument("--disable-dueling", action="store_true", help="Disable dueling network architecture")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon-final", type=float, default=0.05, help="Final epsilon")
     parser.add_argument("--epsilon-decay", type=float, default=0.99, help="Multiplicative epsilon decay per step")
+    parser.add_argument("--reward-step", type=float, default=-0.002, help="Base reward per step (typically negative)")
+    parser.add_argument("--reward-food", type=float, default=5.0, help="Reward granted for eating food")
+    parser.add_argument("--reward-death", type=float, default=-2.0, help="Penalty for dying")
     parser.add_argument("--reward-shaping-scale", type=float, default=0.1, help="Scaling factor for distance-based reward shaping")
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256], help="Hidden layer sizes for the Q-network")
     parser.add_argument("--device", type=str, default=None, help="Override torch device (cpu/cuda)")
@@ -108,6 +112,9 @@ def train() -> None:
         height=args.height,
         initial_length=args.initial_length,
         allow_wrap=args.allow_wrap,
+        reward_step=args.reward_step,
+        reward_food=args.reward_food,
+        reward_death=args.reward_death,
         seed=args.seed,
     )
     env = SnakeGameEnv(game_config)
@@ -158,6 +165,7 @@ def train() -> None:
             target_update_tau=args.target_update_tau,
             hard_update_interval=args.hard_update_interval,
             use_double_dqn=not args.disable_double_dqn,
+            use_dueling=not args.disable_dueling,
             epsilon_start=args.epsilon_start,
             epsilon_final=args.epsilon_final,
             epsilon_decay=args.epsilon_decay,
@@ -263,3 +271,7 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
+
+
+
+
