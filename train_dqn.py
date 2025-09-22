@@ -141,6 +141,7 @@ def train() -> None:
                     previous_meta = json.load(meta_fp)
                 best_reward = previous_meta.get("best_avg_reward", best_reward)
                 start_episode = max(1, previous_meta.get("episodes_completed", 0) + 1)
+                print(f"Resuming from episode {start_episode} with best avg reward {best_reward}")
             except json.JSONDecodeError:
                 print(f"Warning: Could not parse metadata file {meta_path}; continuing from defaults.")
     else:

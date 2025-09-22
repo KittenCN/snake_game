@@ -42,7 +42,7 @@
     "render_frequency": 0
   },
   "best_avg_reward": 7.960000000000052,
-  "episodes_completed": 1000,
+  "episodes_completed": 3000,
   "epsilon": 0.05,
-  "learn_step_counter": 107603
+  "learn_step_counter": 199487
 }
