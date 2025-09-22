@@ -28,7 +28,7 @@ except ImportError:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a DQN agent to play snake using PyTorch")
-    parser.add_argument("--episodes", type=int, default=1_000, help="Number of training episodes")
+    parser.add_argument("--episodes", type=int, default=1_000, help="Number of training episodes in this run")
     parser.add_argument("--max-steps", type=int, default=500, help="Maximum steps per episode")
     parser.add_argument("--width", type=int, default=12, help="Grid width")
     parser.add_argument("--height", type=int, default=12, help="Grid height")
@@ -37,15 +37,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--eval-interval", type=int, default=50, help="Episodes between evaluation runs")
     parser.add_argument("--eval-episodes", type=int, default=5, help="Evaluation episodes per checkpoint")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for gradient updates")
-    parser.add_argument("--replay-capacity", type=int, default=50_000, help="Replay buffer capacity")
-    parser.add_argument("--min-replay", type=int, default=2_000, help="Minimum replay buffer size before learning")
-    parser.add_argument("--target-update", type=int, default=1_000, help="Target network update interval (steps)")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for gradient updates")
+    parser.add_argument("--replay-capacity", type=int, default=200_000, help="Replay buffer capacity")
+    parser.add_argument("--min-replay", type=int, default=5_000, help="Minimum replay buffer size before learning")
+    parser.add_argument("--target-update", type=int, default=5_000, help="Fallback hard target update interval (steps)")
+    parser.add_argument("--target-update-tau", type=float, default=0.005, help="Soft target update coefficient (0 disables)")
+    parser.add_argument("--hard-update-interval", type=int, default=0, help="Explicit hard update interval when tau is 0")
+    parser.add_argument("--disable-double-dqn", action="store_true", help="Disable Double DQN updates")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon-final", type=float, default=0.05, help="Final epsilon")
-    parser.add_argument("--epsilon-decay", type=float, default=0.995, help="Multiplicative epsilon decay per step")
+    parser.add_argument("--epsilon-decay", type=float, default=0.99, help="Multiplicative epsilon decay per step")
+    parser.add_argument("--reward-shaping-scale", type=float, default=0.1, help="Scaling factor for distance-based reward shaping")
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256], help="Hidden layer sizes for the Q-network")
     parser.add_argument("--device", type=str, default=None, help="Override torch device (cpu/cuda)")
     parser.add_argument("--output", type=str, default="models/dqn_snake.pt", help="Where to store the trained model")
@@ -57,10 +61,13 @@ def parse_args() -> argparse.Namespace:
 def set_global_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
-    random_seed = seed % (2**32)
     import random
 
-    random.seed(random_seed)
+    random.seed(seed % (2**32))
+
+
+def manhattan_distance(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
 def evaluate_agent(agent: DQNAgent, env: SnakeGameEnv, episodes: int) -> Dict[str, float]:
@@ -117,7 +124,10 @@ def train() -> None:
 
     if output_path.exists():
         print(f"Resuming training from {output_path}")
-        agent = DQNAgent.load(str(output_path), device=args.device)
+        agent = DQNAgent.load(
+            str(output_path),
+            device=args.device,
+        )
         if agent.game_config is not None and asdict(agent.game_config) != asdict(game_config):
             print("Loaded agent configuration differs from CLI arguments; using configuration from checkpoint.")
             game_config = agent.game_config
@@ -130,8 +140,6 @@ def train() -> None:
                 with meta_path.open("r", encoding="utf-8") as meta_fp:
                     previous_meta = json.load(meta_fp)
                 best_reward = previous_meta.get("best_avg_reward", best_reward)
-                if best_reward is None:
-                    best_reward = -math.inf
                 start_episode = max(1, previous_meta.get("episodes_completed", 0) + 1)
             except json.JSONDecodeError:
                 print(f"Warning: Could not parse metadata file {meta_path}; continuing from defaults.")
@@ -146,6 +154,9 @@ def train() -> None:
             replay_capacity=args.replay_capacity,
             min_replay_size=args.min_replay,
             target_update_interval=args.target_update,
+            target_update_tau=args.target_update_tau,
+            hard_update_interval=args.hard_update_interval,
+            use_double_dqn=not args.disable_double_dqn,
             epsilon_start=args.epsilon_start,
             epsilon_final=args.epsilon_final,
             epsilon_decay=args.epsilon_decay,
@@ -172,25 +183,45 @@ def train() -> None:
     for episode in range(start_episode, start_episode + args.episodes):
         env.reset(seed=args.seed + episode)
         state = flatten_observation(env.as_numpy(), agent.device)
-        episode_reward = 0.0
+        episode_env_reward = 0.0
+        episode_shaped_reward = 0.0
         losses: List[float] = []
 
         for _ in range(args.max_steps):
+            prev_head = env.snake[0]
+            prev_food = env.food
+            prev_distance = None
+            if args.reward_shaping_scale > 0 and prev_food is not None:
+                prev_distance = manhattan_distance(prev_head, prev_food)
+
             action = agent.select_action(state)
-            _, reward, done, info = env.step(Action(action))
+            obs, reward, done, info = env.step(Action(action))
             next_state = flatten_observation(env.as_numpy(), agent.device)
-            agent.remember(state, action, reward, next_state, done)
+
+            shaped_reward = reward
+            if (
+                args.reward_shaping_scale > 0
+                and prev_distance is not None
+                and info.get("event") != "ate_food"
+                and prev_food is not None
+            ):
+                new_distance = manhattan_distance(env.snake[0], prev_food)
+                shaped_reward += args.reward_shaping_scale * (prev_distance - new_distance)
+
+            agent.remember(state, action, shaped_reward, next_state, done)
             loss = agent.learn()
             if loss is not None:
                 losses.append(loss)
             state = next_state
-            episode_reward += reward
+            episode_env_reward += reward
+            episode_shaped_reward += shaped_reward
             if done:
                 break
 
         metrics = {
             "episode": episode,
-            "reward": episode_reward,
+            "reward": episode_env_reward,
+            "shaped_reward": episode_shaped_reward,
             "score": env.score,
             "steps": env.steps,
             "epsilon": agent.epsilon,
@@ -210,13 +241,13 @@ def train() -> None:
                 agent.save(str(output_path))
             write_metadata(best_reward if best_reward != -math.inf else None, episode)
 
-        with open(log_file, "a", encoding="utf-8") as f:
+        with log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(metrics) + "\n")
 
         if episode % 10 == 0 or episode == start_episode:
             print(
-                f"Episode {episode:5d} | reward={episode_reward:7.3f} | score={env.score:3d} | steps={env.steps:4d} | "
-                f"epsilon={agent.epsilon:.3f} | avg_loss={metrics['avg_loss']}"
+                f"Episode {episode:5d} | reward={episode_env_reward:7.3f} | score={env.score:3d} | steps={env.steps:4d} | "
+                f"epsilon={agent.epsilon:.3f} | avg_loss={metrics['avg_loss']} | shaped={episode_shaped_reward:7.3f}"
             )
 
     last_episode = start_episode + args.episodes - 1

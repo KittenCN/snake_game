@@ -105,6 +105,9 @@ class DQNAgent:
         replay_capacity: int = 50_000,
         min_replay_size: int = 1_000,
         target_update_interval: int = 1_000,
+        target_update_tau: float = 0.0,
+        hard_update_interval: int = 0,
+        use_double_dqn: bool = True,
         epsilon_start: float = 1.0,
         epsilon_final: float = 0.05,
         epsilon_decay: float = 0.995,
@@ -120,12 +123,18 @@ class DQNAgent:
         self.replay_capacity = replay_capacity
         self.min_replay_size = min_replay_size
         self.target_update_interval = target_update_interval
+        self.target_update_tau = max(0.0, target_update_tau)
+        self.hard_update_interval = hard_update_interval
+        self.use_double_dqn = use_double_dqn
         self.epsilon = epsilon_start
         self.epsilon_start = epsilon_start
         self.epsilon_final = epsilon_final
         self.epsilon_decay = epsilon_decay
         self.device = self._resolve_device(device)
         self.game_config = game_config
+
+        if self.target_update_tau <= 0.0 and self.hard_update_interval <= 0:
+            self.hard_update_interval = self.target_update_interval
 
         self.policy_net = QNetwork(state_dim, action_dim, hidden_sizes).to(self.device)
         self.target_net = QNetwork(state_dim, action_dim, hidden_sizes).to(self.device)
@@ -176,11 +185,14 @@ class DQNAgent:
             return None
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
 
-        q_values = self.policy_net(states).gather(1, actions.long())
-        q_values = q_values.squeeze(1)
+        q_values = self.policy_net(states).gather(1, actions.long()).squeeze(1)
 
         with torch.no_grad():
-            next_q_values = self.target_net(next_states).max(dim=1).values
+            if self.use_double_dqn:
+                next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
+                next_q_values = self.target_net(next_states).gather(1, next_actions).squeeze(1)
+            else:
+                next_q_values = self.target_net(next_states).max(dim=1).values
             targets = rewards.squeeze(1) + self.gamma * (1 - dones.squeeze(1)) * next_q_values
 
         loss = self.loss_fn(q_values, targets)
@@ -191,9 +203,7 @@ class DQNAgent:
         self.optimizer.step()
 
         self.learn_step_counter += 1
-        if self.learn_step_counter % self.target_update_interval == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
-
+        self._update_target_network()
         self._decay_epsilon()
         return float(loss.item())
 
@@ -213,6 +223,9 @@ class DQNAgent:
                     "replay_capacity": self.replay_capacity,
                     "min_replay_size": self.min_replay_size,
                     "target_update_interval": self.target_update_interval,
+                    "target_update_tau": self.target_update_tau,
+                    "hard_update_interval": self.hard_update_interval,
+                    "use_double_dqn": self.use_double_dqn,
                     "epsilon_start": self.epsilon_start,
                     "epsilon_final": self.epsilon_final,
                     "epsilon_decay": self.epsilon_decay,
@@ -227,8 +240,7 @@ class DQNAgent:
 
     @classmethod
     def load(cls, path: str, *, device: str | torch.device | None = None) -> "DQNAgent":
-        load_device = cls._resolve_device(device)
-        checkpoint = torch.load(path, map_location=load_device)
+        checkpoint = torch.load(path, map_location=cls._resolve_device(device))
         metadata = checkpoint["metadata"]
         agent = cls(
             state_dim=metadata["state_dim"],
@@ -240,9 +252,12 @@ class DQNAgent:
             replay_capacity=metadata.get("replay_capacity", 1),
             min_replay_size=metadata.get("min_replay_size", 1),
             target_update_interval=metadata.get("target_update_interval", 1_000),
+            target_update_tau=metadata.get("target_update_tau", 0.0),
+            hard_update_interval=metadata.get("hard_update_interval", 0),
+            use_double_dqn=metadata.get("use_double_dqn", True),
             epsilon_start=metadata.get("epsilon_start", 0.0),
             epsilon_final=metadata.get("epsilon_final", 0.0),
-            epsilon_decay=1.0,
+            epsilon_decay=metadata.get("epsilon_decay", 1.0),
             device=cls._resolve_device(device or metadata.get("device")),
             game_config=GameConfig(**metadata["game_config"]) if metadata.get("game_config") else None,
         )
@@ -256,6 +271,16 @@ class DQNAgent:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _update_target_network(self) -> None:
+        if self.target_update_tau > 0.0:
+            with torch.no_grad():
+                for target_param, param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+                    target_param.data.mul_(1 - self.target_update_tau).add_(param.data, alpha=self.target_update_tau)
+        elif self.hard_update_interval > 0 and self.learn_step_counter % self.hard_update_interval == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+        elif self.target_update_interval > 0 and self.learn_step_counter % self.target_update_interval == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+
     def _decay_epsilon(self) -> None:
         if self.epsilon > self.epsilon_final:
             self.epsilon = max(self.epsilon_final, self.epsilon * self.epsilon_decay)

@@ -10,7 +10,7 @@
     "seed": 42
   },
   "train_args": {
-    "episodes": 50000,
+    "episodes": 1000,
     "max_steps": 500,
     "width": 12,
     "height": 12,
@@ -19,15 +19,19 @@
     "seed": 42,
     "eval_interval": 50,
     "eval_episodes": 5,
-    "lr": 0.001,
+    "lr": 0.0005,
     "gamma": 0.99,
-    "batch_size": 256,
-    "replay_capacity": 500000,
-    "min_replay": 2000,
-    "target_update": 1000,
+    "batch_size": 64,
+    "replay_capacity": 200000,
+    "min_replay": 5000,
+    "target_update": 5000,
+    "target_update_tau": 0.005,
+    "hard_update_interval": 0,
+    "disable_double_dqn": false,
     "epsilon_start": 1.0,
     "epsilon_final": 0.05,
-    "epsilon_decay": 0.995,
+    "epsilon_decay": 0.99,
+    "reward_shaping_scale": 0.1,
     "hidden": [
       256,
       256
@@ -37,5 +41,8 @@
     "log_dir": "runs",
     "render_frequency": 0
   },
-  "best_avg_reward": 3.6400000000000157
+  "best_avg_reward": 7.960000000000052,
+  "episodes_completed": 1000,
+  "epsilon": 0.05,
+  "learn_step_counter": 107603
 }
