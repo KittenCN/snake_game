@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-shaping-scale", type=float, default=0.18, help="Scaling factor for distance-based reward shaping")
     parser.add_argument("--max-idle-steps", type=int, default=90, help="Terminate episode after this many steps without eating (0 disables)")
     parser.add_argument("--idle-penalty", type=float, default=-5.0, help="Additional penalty applied on idle timeout")
+    parser.add_argument("--n-step", type=int, default=3, help="Number of steps for multi-step TD returns")
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256], help="Hidden layer sizes for the Q-network")
     parser.add_argument("--device", type=str, default=None, help="Override torch device (cpu/cuda)")
     parser.add_argument("--output", type=str, default="models/dqn_snake.pt", help="Where to store the trained model")
@@ -154,6 +155,7 @@ def train() -> None:
         print(f"Resuming training from {output_path}")
         agent = DQNAgent.load(str(output_path), device=args.device)
         agent.game_config = game_config
+        agent.set_n_step(args.n_step)
         if meta_path.exists():
             try:
                 with meta_path.open("r", encoding="utf-8") as meta_fp:
@@ -181,6 +183,7 @@ def train() -> None:
             epsilon_start=args.epsilon_start,
             epsilon_final=args.epsilon_final,
             epsilon_decay=args.epsilon_decay,
+            n_step=args.n_step,
             device=args.device,
             game_config=game_config,
             obs_shape=obs_shape,
@@ -198,6 +201,7 @@ def train() -> None:
             "episodes_completed": episodes_completed,
             "epsilon": agent.epsilon,
             "learn_step_counter": agent.learn_step_counter,
+            "n_step": agent.n_step,
         }
         with meta_path.open("w", encoding="utf-8") as meta_fp:
             json.dump(metadata, meta_fp, indent=2)

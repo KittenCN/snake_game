@@ -40,7 +40,7 @@ class GameConfig:
     width: int = 20
     height: int = 20
     initial_length: int = 3
-    reward_step: float = -0.002
+    reward_step: float = -0.003
     reward_food: float = 5.0
     reward_death: float = -2.0
     allow_wrap: bool = False
