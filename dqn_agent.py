@@ -163,8 +163,6 @@ class DQNAgent:
         epsilon_start: float = 1.0,
         epsilon_final: float = 0.01,
         epsilon_decay: float = 0.997,
-        n_step: int = 3,
-        reward_clip: float | None = None,
         device: str | torch.device | None = None,
         game_config: GameConfig | None = None,
         obs_shape: Tuple[int, int, int] | None = None,
@@ -187,16 +185,12 @@ class DQNAgent:
         self.epsilon_start = epsilon_start
         self.epsilon_final = epsilon_final
         self.epsilon_decay = epsilon_decay
-        self.reward_clip = None if reward_clip is None or reward_clip <= 0 else float(reward_clip)
-        self.n_step = max(1, n_step)
         self.device = self._resolve_device(device)
         self.game_config = game_config
 
         if obs_shape is None:
-            if game_config is None:
-                raise ValueError("obs_shape or game_config must be provided")
-            obs_shape = (3, game_config.height, game_config.width)
-        self.obs_shape = obs_shape
+            raise ValueError("obs_shape must be provided for convolutional network")
+        self.obs_shape = obs_shape  # (C, H, W)
 
         if self.target_update_tau <= 0.0 and self.hard_update_interval <= 0:
             self.hard_update_interval = self.target_update_interval
@@ -215,9 +209,6 @@ class DQNAgent:
         self.learn_step_counter = 0
 
         self.loss_fn = nn.SmoothL1Loss()
-        self.n_step_buffer: Deque[
-            Tuple[torch.Tensor, torch.Tensor, float, torch.Tensor, bool]
-        ] = deque(maxlen=self.n_step)
 
     # ------------------------------------------------------------------
     # Public API
@@ -244,27 +235,17 @@ class DQNAgent:
         next_state: np.ndarray | torch.Tensor,
         done: bool | float | torch.Tensor,
     ) -> None:
-        state_t = self._ensure_tensor(state).detach()
-        next_state_t = self._ensure_tensor(next_state).detach()
+        state_t = self._ensure_tensor(state)
+        next_state_t = self._ensure_tensor(next_state)
         action_t = torch.as_tensor(action, dtype=torch.long, device=self.device).view(-1)
-        reward_scalar = float(reward if isinstance(reward, (int, float)) else torch.as_tensor(reward).item())
-        done_bool = bool(done if isinstance(done, (bool, int, float)) else torch.as_tensor(done).item())
-
-        self.n_step_buffer.append((state_t, action_t, reward_scalar, next_state_t, done_bool))
-
-        if len(self.n_step_buffer) >= self.n_step:
-            self._push_n_step_transition()
-
-        if done_bool:
-            while self.n_step_buffer:
-                self._push_n_step_transition()
+        reward_t = torch.as_tensor(reward, dtype=torch.float32, device=self.device).view(-1)
+        done_t = torch.as_tensor(done, dtype=torch.float32, device=self.device).view(-1)
+        self.replay_buffer.push(state_t, action_t, reward_t, next_state_t, done_t)
 
     def learn(self) -> float | None:
         if len(self.replay_buffer) < max(self.batch_size, self.min_replay_size):
             return None
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        if self.reward_clip is not None:
-            rewards = rewards.clamp(-self.reward_clip, self.reward_clip)
 
         q_values = self.policy_net(states).gather(1, actions.long()).squeeze(1)
 
@@ -312,12 +293,10 @@ class DQNAgent:
                     "epsilon_start": self.epsilon_start,
                     "epsilon_final": self.epsilon_final,
                     "epsilon_decay": self.epsilon_decay,
-                    "reward_clip": self.reward_clip,
                     "epsilon": self.epsilon,
                     "device": str(self.device),
                     "learn_step_counter": self.learn_step_counter,
                     "obs_shape": self.obs_shape,
-                    "n_step": self.n_step,
                     "game_config": asdict(self.game_config) if self.game_config else None,
                 },
             },
@@ -329,11 +308,8 @@ class DQNAgent:
         checkpoint = torch.load(path, map_location=cls._resolve_device(device))
         metadata = checkpoint["metadata"]
         obs_shape = tuple(metadata.get("obs_shape")) if metadata.get("obs_shape") else None
-        if obs_shape is None and metadata.get("game_config"):
-            cfg = metadata["game_config"]
-            obs_shape = (3, cfg["height"], cfg["width"])
         agent = cls(
-            state_dim=metadata.get("state_dim", 0),
+            state_dim=metadata["state_dim"],
             action_dim=metadata["action_dim"],
             hidden_sizes=tuple(metadata.get("hidden_sizes", (256, 256))),
             lr=metadata.get("lr", 2e-4),
@@ -350,8 +326,6 @@ class DQNAgent:
             epsilon_start=metadata.get("epsilon_start", 1.0),
             epsilon_final=metadata.get("epsilon_final", 0.01),
             epsilon_decay=metadata.get("epsilon_decay", 0.997),
-            n_step=metadata.get("n_step", 3),
-            reward_clip=metadata.get("reward_clip"),
             device=cls._resolve_device(device or metadata.get("device")),
             game_config=GameConfig(**metadata["game_config"]) if metadata.get("game_config") else None,
             obs_shape=obs_shape,
@@ -363,53 +337,9 @@ class DQNAgent:
         agent.epsilon = metadata.get("epsilon", metadata.get("epsilon_final", 0.01))
         return agent
 
-    def set_n_step(self, n_step: int) -> None:
-        self.n_step = max(1, n_step)
-        self.n_step_buffer = deque(maxlen=self.n_step)
-
-    def current_lr(self) -> float:
-        return float(self.optimizer.param_groups[0]['lr'])
-
-    def scale_learning_rate(self, factor: float, min_lr: float = 0.0) -> float:
-        if factor <= 0.0:
-            raise ValueError('factor must be positive')
-        min_lr = max(0.0, float(min_lr))
-        new_lr: float | None = None
-        for group in self.optimizer.param_groups:
-            updated = group['lr'] * factor
-            if factor < 1.0:
-                updated = max(updated, min_lr)
-            group['lr'] = updated
-            new_lr = updated
-        if new_lr is None:
-            raise RuntimeError('Optimizer has no parameter groups')
-        return float(new_lr)
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _push_n_step_transition(self) -> None:
-        reward, next_state, done = self._get_n_step_info()
-        state, action = self.n_step_buffer[0][0], self.n_step_buffer[0][1]
-        reward_tensor = torch.tensor([reward], dtype=torch.float32, device=self.device)
-        if self.reward_clip is not None:
-            reward_tensor.clamp_(-self.reward_clip, self.reward_clip)
-        done_tensor = torch.tensor([float(done)], dtype=torch.float32, device=self.device)
-        self.replay_buffer.push(state, action, reward_tensor, next_state, done_tensor)
-        self.n_step_buffer.popleft()
-
-    def _get_n_step_info(self) -> Tuple[float, torch.Tensor, bool]:
-        reward = 0.0
-        next_state = self.n_step_buffer[-1][3]
-        done = self.n_step_buffer[-1][4]
-        for idx, (_, _, r, next_s, d) in enumerate(self.n_step_buffer):
-            reward += (self.gamma ** idx) * r
-            if d:
-                next_state = next_s
-                done = True
-                break
-        return reward, next_state.clone().detach(), done
-
     def _update_target_network(self) -> None:
         if self.target_update_tau > 0.0:
             with torch.no_grad():
@@ -431,12 +361,14 @@ class DQNAgent:
             tensor = torch.from_numpy(value).to(self.device, dtype=torch.float32)
         if tensor.dim() == 1:
             tensor = tensor.view(self.obs_shape)
-        elif tensor.dim() == 3 and tensor.shape[0] != self.obs_shape[0]:
+        elif tensor.dim() == 3 and tensor.shape[-1] == self.obs_shape[0]:
             tensor = tensor.permute(2, 0, 1)
         return tensor
 
 
 def flatten_observation(grid: np.ndarray, device: torch.device | str) -> torch.Tensor:
+    import torch
+
     tensor = torch.from_numpy(grid).permute(2, 0, 1).to(device=device, dtype=torch.float32)
     return tensor
 
