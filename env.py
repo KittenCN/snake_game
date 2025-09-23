@@ -112,7 +112,7 @@ class SnakeGameEnv:
         return self._observation()
 
     def step(self, action: Union[int, Action]) -> Tuple[Dict[str, object], float, bool, Dict[str, object]]:
-        """Advance the environment by one action."""
+        """Advance the environment by one step of the given action."""
         if self._done:
             raise RuntimeError("Episode finished. Call reset() before stepping again.")
 
@@ -203,28 +203,18 @@ class SnakeGameEnv:
         return self._done
 
     def legal_actions(self) -> Tuple[Action, ...]:
-        """Return the actions that do not reverse the current direction."""
         return tuple(action for action in Action if action != self._OPPOSITE[self._direction])
 
     def sample_action(self) -> Action:
-        """Sample a legal random action using the environment RNG."""
         return self._rng.choice(self.legal_actions())
 
     def observation_shape(self) -> Tuple[int, int, int]:
-        """Return the (height, width, channels) of the numpy observation."""
         return (self.config.height, self.config.width, 3)
 
     def as_numpy(self) -> "numpy.ndarray":  # type: ignore[name-defined]
-        """Return a dense (H, W, 3) representation of the current grid.
-
-        Channel 0: snake body (including head)
-        Channel 1: food
-        Channel 2: snake head
-        """
-
         try:
             import numpy as np
-        except ImportError as exc:  # pragma: no cover - defensive error path
+        except ImportError as exc:  # pragma: no cover
             raise RuntimeError(
                 "numpy is required for as_numpy(). Install it or skip calling this method."
             ) from exc
@@ -244,7 +234,6 @@ class SnakeGameEnv:
         return grid
 
     def render(self, *, to_string: bool = False) -> str:
-        """Render the grid as ASCII art. Set to_string to True to return the grid."""
         symbols = {"empty": " .", "snake": " S", "head": " H", "food": " F"}
         rows: List[str] = []
         snake_body = set(self._snake)
@@ -268,7 +257,6 @@ class SnakeGameEnv:
         return board
 
     def observation(self) -> Dict[str, object]:
-        """Return the current observation without mutating state."""
         return self._observation()
 
     # ------------------------------------------------------------------
@@ -321,4 +309,3 @@ class SnakeGameEnv:
 
 
 __all__ = ["Action", "GameConfig", "SnakeGameEnv"]
-

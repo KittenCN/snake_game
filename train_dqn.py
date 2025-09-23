@@ -26,7 +26,6 @@ except ImportError:
     from dqn_agent import DQNAgent, flatten_observation
     from env import Action, GameConfig, SnakeGameEnv
 
-
 GridSeed = Optional[int]
 
 
@@ -47,19 +46,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-capacity", type=int, default=200_000, help="Replay buffer capacity")
     parser.add_argument("--min-replay", type=int, default=5_000, help="Minimum replay buffer size before learning")
     parser.add_argument("--target-update", type=int, default=5_000, help="Fallback hard target update interval (steps)")
-    parser.add_argument("--target-update-tau", type=float, default=0.005, help="Soft target update coefficient (0 disables)")
+    parser.add_argument("--target-update-tau", type=float, default=0.01, help="Soft target update coefficient (0 disables)")
     parser.add_argument("--hard-update-interval", type=int, default=0, help="Explicit hard update interval when tau is 0")
     parser.add_argument("--disable-double-dqn", action="store_true", help="Disable Double DQN updates")
     parser.add_argument("--disable-dueling", action="store_true", help="Disable dueling network architecture")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
-    parser.add_argument("--epsilon-final", type=float, default=0.05, help="Final epsilon")
-    parser.add_argument("--epsilon-decay", type=float, default=0.99, help="Multiplicative epsilon decay per step")
+    parser.add_argument("--epsilon-final", type=float, default=0.02, help="Final epsilon")
+    parser.add_argument("--epsilon-decay", type=float, default=0.995, help="Multiplicative epsilon decay per step")
     parser.add_argument("--reward-step", type=float, default=-0.002, help="Base reward per step (typically negative)")
     parser.add_argument("--reward-food", type=float, default=5.0, help="Reward granted for eating food")
     parser.add_argument("--reward-death", type=float, default=-2.0, help="Penalty for dying")
-    parser.add_argument("--reward-shaping-scale", type=float, default=0.1, help="Scaling factor for distance-based reward shaping")
-    parser.add_argument("--max-idle-steps", type=int, default=200, help="Terminate episode after this many steps without eating (0 disables)")
-    parser.add_argument("--idle-penalty", type=float, default=-1.0, help="Additional penalty applied on idle timeout")
+    parser.add_argument("--reward-shaping-scale", type=float, default=0.2, help="Scaling factor for distance-based reward shaping")
+    parser.add_argument("--max-idle-steps", type=int, default=150, help="Terminate episode after this many steps without eating (0 disables)")
+    parser.add_argument("--idle-penalty", type=float, default=-3.0, help="Additional penalty applied on idle timeout")
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256], help="Hidden layer sizes for the Q-network")
     parser.add_argument("--device", type=str, default=None, help="Override torch device (cpu/cuda)")
     parser.add_argument("--output", type=str, default="models/dqn_snake.pt", help="Where to store the trained model")
@@ -97,7 +96,7 @@ def evaluate_agent(
     original_epsilon = agent.epsilon
     try:
         for _ in range(episodes):
-            eval_seed: GridSeed = rng.randint(0, 2**63 - 1) if rng is not None else None
+            eval_seed: GridSeed = rng.randint(0, 2**32 - 1) if rng is not None else None
             env.reset(seed=eval_seed)
             state = flatten_observation(env.as_numpy(), agent.device)
             total_reward = 0.0
@@ -202,7 +201,7 @@ def train() -> None:
             json.dump(metadata, meta_fp, indent=2)
 
     for episode in range(start_episode, start_episode + args.episodes):
-        episode_seed: GridSeed = rng.randint(0, 2**63 - 1) if rng is not None else None
+        episode_seed: GridSeed = rng.randint(0, 2**32 - 1) if rng is not None else None
         train_env.reset(seed=episode_seed)
         state = flatten_observation(train_env.as_numpy(), agent.device)
         episode_env_reward = 0.0
