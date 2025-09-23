@@ -45,6 +45,8 @@ class GameConfig:
     reward_death: float = -2.0
     allow_wrap: bool = False
     seed: Optional[int] = None
+    max_idle_steps: int = 0
+    idle_penalty: float = -1.0
 
     def validate(self) -> None:
         if self.width <= 2 or self.height <= 2:
@@ -53,6 +55,8 @@ class GameConfig:
             raise ValueError(
                 "initial_length must be at least 1 and smaller than the grid dimensions."
             )
+        if self.max_idle_steps < 0:
+            raise ValueError("max_idle_steps must be non-negative")
 
 
 class SnakeGameEnv:
@@ -77,6 +81,7 @@ class SnakeGameEnv:
         self._score: int = 0
         self._steps: int = 0
         self._done: bool = False
+        self._steps_since_food: int = 0
 
     # ------------------------------------------------------------------
     # Core environment API
@@ -94,6 +99,7 @@ class SnakeGameEnv:
         self._steps = 0
         self._done = False
         self._direction = Action.RIGHT
+        self._steps_since_food = 0
 
         start_x = self.config.width // 2
         start_y = self.config.height // 2
@@ -147,6 +153,7 @@ class SnakeGameEnv:
             self._score += 1
             info["event"] = "ate_food"
             self._spawn_food()
+            self._steps_since_food = 0
         else:
             tail = self._snake.pop()
             if tail in self._occupied:
@@ -154,6 +161,13 @@ class SnakeGameEnv:
             else:
                 # Rare desync guard: rebuild occupied cells to the current snake body.
                 self._occupied = set(self._snake)
+            self._steps_since_food += 1
+
+        if self.config.max_idle_steps > 0 and self._steps_since_food >= self.config.max_idle_steps:
+            self._done = True
+            reward += self.config.idle_penalty
+            info["event"] = "idle_timeout"
+            return self._observation(), reward, self._done, info
 
         if self._food is None:
             self._done = True
@@ -270,6 +284,7 @@ class SnakeGameEnv:
             "done": self._done,
             "width": self.config.width,
             "height": self.config.height,
+            "steps_since_food": self._steps_since_food,
         }
 
     def _spawn_food(self) -> None:

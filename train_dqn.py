@@ -58,7 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-food", type=float, default=5.0, help="Reward granted for eating food")
     parser.add_argument("--reward-death", type=float, default=-2.0, help="Penalty for dying")
     parser.add_argument("--reward-shaping-scale", type=float, default=0.1, help="Scaling factor for distance-based reward shaping")
-    parser.add_argument("--hunger-penalty", type=float, default=0.001, help="Additional penalty per consecutive step without eating")
+    parser.add_argument("--max-idle-steps", type=int, default=200, help="Terminate episode after this many steps without eating (0 disables)")
+    parser.add_argument("--idle-penalty", type=float, default=-1.0, help="Additional penalty applied on idle timeout")
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256], help="Hidden layer sizes for the Q-network")
     parser.add_argument("--device", type=str, default=None, help="Override torch device (cpu/cuda)")
     parser.add_argument("--output", type=str, default="models/dqn_snake.pt", help="Where to store the trained model")
@@ -70,7 +71,7 @@ def parse_args() -> argparse.Namespace:
 def set_global_seed(seed: Optional[int]) -> random.Random:
     rng = random.Random()
     if seed is None:
-        seed = random.SystemRandom().randrange(2**63)
+        seed = random.SystemRandom().randrange(2**32)
         print(f"Using generated seed {seed}")
     seed32 = seed % (2**32)
     np.random.seed(seed32)
@@ -132,6 +133,8 @@ def train() -> None:
         reward_death=args.reward_death,
         allow_wrap=args.allow_wrap,
         seed=None,
+        max_idle_steps=args.max_idle_steps,
+        idle_penalty=args.idle_penalty,
     )
 
     train_env = SnakeGameEnv(game_config)
@@ -205,7 +208,6 @@ def train() -> None:
         episode_env_reward = 0.0
         episode_shaped_reward = 0.0
         losses: List[float] = []
-        steps_since_food = 0
 
         for _ in range(args.max_steps):
             previous_food = train_env.food
@@ -228,13 +230,6 @@ def train() -> None:
             ):
                 new_distance = manhattan_distance(train_env.snake[0], previous_food)
                 shaped_reward += args.reward_shaping_scale * (previous_distance - new_distance)
-
-            if info.get("event") == "ate_food":
-                steps_since_food = 0
-            else:
-                steps_since_food += 1
-                if args.hunger_penalty > 0:
-                    shaped_reward -= args.hunger_penalty * steps_since_food
 
             agent.remember(state, action, shaped_reward, next_state, done)
             loss = agent.learn()
