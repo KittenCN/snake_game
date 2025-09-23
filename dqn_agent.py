@@ -65,44 +65,65 @@ class ReplayBuffer:
         )
 
 
-class QNetwork(nn.Module):
+class ConvDuelingQNetwork(nn.Module):
     def __init__(
         self,
-        state_dim: int,
+        obs_shape: Tuple[int, int, int],  # (C, H, W)
         action_dim: int,
         hidden_sizes: Sequence[int],
         *,
-        dueling: bool = False,
-        dueling_hidden: int | None = None,
+        use_dueling: bool = True,
     ) -> None:
         super().__init__()
-        layers: list[nn.Module] = []
-        input_dim = state_dim
-        for hidden in hidden_sizes:
-            layers.extend([nn.Linear(input_dim, hidden), nn.ReLU()])
-            input_dim = hidden
-        self.feature_extractor = nn.Sequential(*layers) if layers else nn.Identity()
-        feature_dim = input_dim if layers else state_dim
+        channels, height, width = obs_shape
+        self.use_dueling = use_dueling
 
-        self.dueling = dueling
-        if dueling:
-            hidden_dim = dueling_hidden or feature_dim
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+
+        conv_out_dim = self._conv_out_dim(channels, height, width)
+
+        mlp_layers: list[nn.Module] = []
+        input_dim = conv_out_dim
+        for hidden in hidden_sizes:
+            mlp_layers.extend([nn.Linear(input_dim, hidden), nn.ReLU()])
+            input_dim = hidden
+        self.mlp = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
+        feature_dim = input_dim
+
+        if self.use_dueling:
+            head_dim = max(64, feature_dim // 2)
             self.value_head = nn.Sequential(
-                nn.Linear(feature_dim, hidden_dim),
+                nn.Linear(feature_dim, head_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, 1),
+                nn.Linear(head_dim, 1),
             )
             self.advantage_head = nn.Sequential(
-                nn.Linear(feature_dim, hidden_dim),
+                nn.Linear(feature_dim, head_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
+                nn.Linear(head_dim, action_dim),
             )
         else:
             self.q_head = nn.Linear(feature_dim, action_dim)
 
+    def _conv_out_dim(self, channels: int, height: int, width: int) -> int:
+        with torch.no_grad():
+            sample = torch.zeros(1, channels, height, width)
+            out = self.conv(sample)
+            return out.view(1, -1).shape[1]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        features = self.feature_extractor(x)
-        if self.dueling:
+        x = self.conv(x)
+        x = torch.flatten(x, start_dim=1)
+        features = self.mlp(x)
+        if self.use_dueling:
             value = self.value_head(features)
             advantages = self.advantage_head(features)
             advantages = advantages - advantages.mean(dim=1, keepdim=True)
@@ -128,22 +149,23 @@ class DQNAgent:
         action_dim: int,
         *,
         hidden_sizes: Sequence[int] = (256, 256),
-        lr: float = 1e-3,
+        lr: float = 2e-4,
         gamma: float = 0.99,
-        batch_size: int = 128,
-        replay_capacity: int = 50_000,
-        min_replay_size: int = 1_000,
-        target_update_interval: int = 1_000,
-        target_update_tau: float = 0.0,
+        batch_size: int = 64,
+        replay_capacity: int = 200_000,
+        min_replay_size: int = 5_000,
+        target_update_interval: int = 5_000,
+        target_update_tau: float = 0.006,
         hard_update_interval: int = 0,
         use_double_dqn: bool = True,
         use_dueling: bool = True,
         dueling_hidden: int | None = None,
         epsilon_start: float = 1.0,
-        epsilon_final: float = 0.05,
-        epsilon_decay: float = 0.995,
+        epsilon_final: float = 0.01,
+        epsilon_decay: float = 0.997,
         device: str | torch.device | None = None,
         game_config: GameConfig | None = None,
+        obs_shape: Tuple[int, int, int] | None = None,
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -166,22 +188,18 @@ class DQNAgent:
         self.device = self._resolve_device(device)
         self.game_config = game_config
 
+        if obs_shape is None:
+            raise ValueError("obs_shape must be provided for convolutional network")
+        self.obs_shape = obs_shape  # (C, H, W)
+
         if self.target_update_tau <= 0.0 and self.hard_update_interval <= 0:
             self.hard_update_interval = self.target_update_interval
 
-        self.policy_net = QNetwork(
-            state_dim,
-            action_dim,
-            hidden_sizes,
-            dueling=self.use_dueling,
-            dueling_hidden=self.dueling_hidden,
+        self.policy_net = ConvDuelingQNetwork(
+            self.obs_shape, action_dim, hidden_sizes, use_dueling=self.use_dueling
         ).to(self.device)
-        self.target_net = QNetwork(
-            state_dim,
-            action_dim,
-            hidden_sizes,
-            dueling=self.use_dueling,
-            dueling_hidden=self.dueling_hidden,
+        self.target_net = ConvDuelingQNetwork(
+            self.obs_shape, action_dim, hidden_sizes, use_dueling=self.use_dueling
         ).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
@@ -204,7 +222,7 @@ class DQNAgent:
         epsilon = self.epsilon if epsilon_override is None else epsilon_override
         if random.random() < epsilon:
             return random.randrange(self.action_dim)
-        state_tensor = self._ensure_tensor(state).view(1, -1)
+        state_tensor = self._ensure_tensor(state).unsqueeze(0)
         with torch.no_grad():
             q_values = self.policy_net(state_tensor)
         return int(q_values.argmax(dim=1).item())
@@ -278,6 +296,7 @@ class DQNAgent:
                     "epsilon": self.epsilon,
                     "device": str(self.device),
                     "learn_step_counter": self.learn_step_counter,
+                    "obs_shape": self.obs_shape,
                     "game_config": asdict(self.game_config) if self.game_config else None,
                 },
             },
@@ -288,32 +307,34 @@ class DQNAgent:
     def load(cls, path: str, *, device: str | torch.device | None = None) -> "DQNAgent":
         checkpoint = torch.load(path, map_location=cls._resolve_device(device))
         metadata = checkpoint["metadata"]
+        obs_shape = tuple(metadata.get("obs_shape")) if metadata.get("obs_shape") else None
         agent = cls(
             state_dim=metadata["state_dim"],
             action_dim=metadata["action_dim"],
             hidden_sizes=tuple(metadata.get("hidden_sizes", (256, 256))),
-            lr=metadata.get("lr", 1e-3),
+            lr=metadata.get("lr", 2e-4),
             gamma=metadata.get("gamma", 0.99),
-            batch_size=metadata.get("batch_size", 128),
-            replay_capacity=metadata.get("replay_capacity", 1),
-            min_replay_size=metadata.get("min_replay_size", 1),
-            target_update_interval=metadata.get("target_update_interval", 1_000),
-            target_update_tau=metadata.get("target_update_tau", 0.0),
+            batch_size=metadata.get("batch_size", 64),
+            replay_capacity=metadata.get("replay_capacity", 200_000),
+            min_replay_size=metadata.get("min_replay_size", 5_000),
+            target_update_interval=metadata.get("target_update_interval", 5_000),
+            target_update_tau=metadata.get("target_update_tau", 0.006),
             hard_update_interval=metadata.get("hard_update_interval", 0),
             use_double_dqn=metadata.get("use_double_dqn", True),
             use_dueling=metadata.get("use_dueling", True),
             dueling_hidden=metadata.get("dueling_hidden"),
-            epsilon_start=metadata.get("epsilon_start", 0.0),
-            epsilon_final=metadata.get("epsilon_final", 0.0),
-            epsilon_decay=metadata.get("epsilon_decay", 1.0),
+            epsilon_start=metadata.get("epsilon_start", 1.0),
+            epsilon_final=metadata.get("epsilon_final", 0.01),
+            epsilon_decay=metadata.get("epsilon_decay", 0.997),
             device=cls._resolve_device(device or metadata.get("device")),
             game_config=GameConfig(**metadata["game_config"]) if metadata.get("game_config") else None,
+            obs_shape=obs_shape,
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(checkpoint["target_state_dict"])
         agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         agent.learn_step_counter = metadata.get("learn_step_counter", 0)
-        agent.epsilon = metadata.get("epsilon", metadata.get("epsilon_final", 0.0))
+        agent.epsilon = metadata.get("epsilon", metadata.get("epsilon_final", 0.01))
         return agent
 
     # ------------------------------------------------------------------
@@ -338,11 +359,18 @@ class DQNAgent:
             tensor = value.detach().to(self.device, dtype=torch.float32)
         else:
             tensor = torch.from_numpy(value).to(self.device, dtype=torch.float32)
-        return tensor.view(-1)
+        if tensor.dim() == 1:
+            tensor = tensor.view(self.obs_shape)
+        elif tensor.dim() == 3 and tensor.shape[-1] == self.obs_shape[0]:
+            tensor = tensor.permute(2, 0, 1)
+        return tensor
 
 
 def flatten_observation(grid: np.ndarray, device: torch.device | str) -> torch.Tensor:
-    return torch.from_numpy(grid).to(device=device, dtype=torch.float32).view(-1)
+    import torch
+
+    tensor = torch.from_numpy(grid).permute(2, 0, 1).to(device=device, dtype=torch.float32)
+    return tensor
 
 
 __all__ = ["DQNAgent", "ReplayBuffer", "flatten_observation"]

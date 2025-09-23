@@ -141,6 +141,7 @@ def train() -> None:
     observation_shape = train_env.observation_shape()
     state_dim = int(np.prod(observation_shape))
     action_dim = len(Action)
+    obs_shape = (observation_shape[2], observation_shape[0], observation_shape[1])
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +183,7 @@ def train() -> None:
             epsilon_decay=args.epsilon_decay,
             device=args.device,
             game_config=game_config,
+            obs_shape=obs_shape,
         )
 
     log_dir = Path(args.log_dir)
