@@ -1,4 +1,4 @@
-﻿"""DQN agent implementation for the snake game."""
+"""DQN agent implementation for the snake game."""
 
 from __future__ import annotations
 
@@ -164,6 +164,7 @@ class DQNAgent:
         epsilon_final: float = 0.01,
         epsilon_decay: float = 0.997,
         n_step: int = 3,
+        reward_clip: float | None = None,
         device: str | torch.device | None = None,
         game_config: GameConfig | None = None,
         obs_shape: Tuple[int, int, int] | None = None,
@@ -186,6 +187,7 @@ class DQNAgent:
         self.epsilon_start = epsilon_start
         self.epsilon_final = epsilon_final
         self.epsilon_decay = epsilon_decay
+        self.reward_clip = None if reward_clip is None or reward_clip <= 0 else float(reward_clip)
         self.n_step = max(1, n_step)
         self.device = self._resolve_device(device)
         self.game_config = game_config
@@ -261,6 +263,8 @@ class DQNAgent:
         if len(self.replay_buffer) < max(self.batch_size, self.min_replay_size):
             return None
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        if self.reward_clip is not None:
+            rewards = rewards.clamp(-self.reward_clip, self.reward_clip)
 
         q_values = self.policy_net(states).gather(1, actions.long()).squeeze(1)
 
@@ -308,6 +312,7 @@ class DQNAgent:
                     "epsilon_start": self.epsilon_start,
                     "epsilon_final": self.epsilon_final,
                     "epsilon_decay": self.epsilon_decay,
+                    "reward_clip": self.reward_clip,
                     "epsilon": self.epsilon,
                     "device": str(self.device),
                     "learn_step_counter": self.learn_step_counter,
@@ -346,6 +351,7 @@ class DQNAgent:
             epsilon_final=metadata.get("epsilon_final", 0.01),
             epsilon_decay=metadata.get("epsilon_decay", 0.997),
             n_step=metadata.get("n_step", 3),
+            reward_clip=metadata.get("reward_clip"),
             device=cls._resolve_device(device or metadata.get("device")),
             game_config=GameConfig(**metadata["game_config"]) if metadata.get("game_config") else None,
             obs_shape=obs_shape,
@@ -361,6 +367,24 @@ class DQNAgent:
         self.n_step = max(1, n_step)
         self.n_step_buffer = deque(maxlen=self.n_step)
 
+    def current_lr(self) -> float:
+        return float(self.optimizer.param_groups[0]['lr'])
+
+    def scale_learning_rate(self, factor: float, min_lr: float = 0.0) -> float:
+        if factor <= 0.0:
+            raise ValueError('factor must be positive')
+        min_lr = max(0.0, float(min_lr))
+        new_lr: float | None = None
+        for group in self.optimizer.param_groups:
+            updated = group['lr'] * factor
+            if factor < 1.0:
+                updated = max(updated, min_lr)
+            group['lr'] = updated
+            new_lr = updated
+        if new_lr is None:
+            raise RuntimeError('Optimizer has no parameter groups')
+        return float(new_lr)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -368,6 +392,8 @@ class DQNAgent:
         reward, next_state, done = self._get_n_step_info()
         state, action = self.n_step_buffer[0][0], self.n_step_buffer[0][1]
         reward_tensor = torch.tensor([reward], dtype=torch.float32, device=self.device)
+        if self.reward_clip is not None:
+            reward_tensor.clamp_(-self.reward_clip, self.reward_clip)
         done_tensor = torch.tensor([float(done)], dtype=torch.float32, device=self.device)
         self.replay_buffer.push(state, action, reward_tensor, next_state, done_tensor)
         self.n_step_buffer.popleft()

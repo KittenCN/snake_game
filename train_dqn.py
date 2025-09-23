@@ -1,4 +1,4 @@
-﻿"""Training entry-point for a DQN agent that plays snake."""
+"""Training entry-point for a DQN agent that plays snake."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 try:
     from .dqn_agent import DQNAgent, flatten_observation
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-food", type=float, default=5.0, help="Reward granted for eating food")
     parser.add_argument("--reward-death", type=float, default=-2.0, help="Penalty for dying")
     parser.add_argument("--reward-shaping-scale", type=float, default=0.18, help="Scaling factor for distance-based reward shaping")
+    parser.add_argument("--reward-clip", type=float, default=1.0, help="Absolute value for clipping TD rewards during training (<=0 disables)")
     parser.add_argument("--max-idle-steps", type=int, default=90, help="Terminate episode after this many steps without eating (0 disables)")
     parser.add_argument("--idle-penalty", type=float, default=-5.0, help="Additional penalty applied on idle timeout")
     parser.add_argument("--n-step", type=int, default=3, help="Number of steps for multi-step TD returns")
@@ -65,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="models/dqn_snake.pt", help="Where to store the trained model")
     parser.add_argument("--log-dir", type=str, default="runs", help="Directory for training logs")
     parser.add_argument("--render-frequency", type=int, default=0, help="Render ASCII board every N episodes (0 to disable)")
+    parser.add_argument("--lr-decay-factor", type=float, default=0.5, help="Multiplicative decay applied to the learning rate when triggered (<1 enables)")
+    parser.add_argument("--lr-decay-patience", type=int, default=12, help="Episodes with no loss improvement before the learning rate decays")
+    parser.add_argument("--lr-decay-threshold", type=float, default=0.05, help="Relative loss improvement required to reset the patience counter")
+    parser.add_argument("--lr-min", type=float, default=5e-05, help="Lower bound for the adaptive learning rate controller")
+    parser.add_argument("--loss-spike-threshold", type=float, default=1.6, help="Average loss value that immediately triggers a learning rate reduction when exceeded")
+    parser.add_argument("--loss-spike-ratio", type=float, default=1.35, help="Multiplicative increase over the previous loss treated as a spike")
     return parser.parse_args()
 
 
@@ -120,6 +128,60 @@ def evaluate_agent(
     }
 
 
+
+class LossAwareLrController:
+    def __init__(
+        self,
+        agent: DQNAgent,
+        *,
+        decay_factor: float,
+        patience: int,
+        threshold: float,
+        min_lr: float,
+        spike_threshold: float,
+        spike_ratio: float,
+    ) -> None:
+        self.agent = agent
+        self.decay_factor = decay_factor if decay_factor > 0 else 1.0
+        self.min_lr = max(0.0, min_lr)
+        self.spike_threshold = spike_threshold
+        self.spike_ratio = spike_ratio
+        self.prev_loss: Optional[float] = None
+        self.scheduler: ReduceLROnPlateau | None = None
+        if self.decay_factor < 1.0 and patience > 0:
+            self.scheduler = ReduceLROnPlateau(
+                agent.optimizer,
+                mode="min",
+                factor=self.decay_factor,
+                patience=patience,
+                threshold=threshold,
+                threshold_mode="rel",
+                min_lr=self.min_lr,
+            )
+
+    def step(self, loss: Optional[float]) -> float:
+        if loss is None or math.isnan(loss):
+            return self.agent.current_lr()
+        if (
+            self.decay_factor < 1.0
+            and self.spike_threshold > 0.0
+            and self.spike_ratio > 1.0
+            and self.prev_loss is not None
+            and loss >= self.spike_threshold
+            and loss >= self.prev_loss * self.spike_ratio
+        ):
+            before = self.agent.current_lr()
+            after = self.agent.scale_learning_rate(self.decay_factor, self.min_lr)
+            if after < before:
+                print(
+                    f"[lr] Loss spike detected: {self.prev_loss:.4f} -> {loss:.4f}; lr {before:.6g} -> {after:.6g}"
+                )
+        self.prev_loss = loss
+        if self.scheduler is not None:
+            self.scheduler.step(loss)
+        return self.agent.current_lr()
+
+
 def train() -> None:
     args = parse_args()
     rng = set_global_seed(args.seed)
@@ -143,6 +205,7 @@ def train() -> None:
     state_dim = int(np.prod(observation_shape))
     action_dim = len(Action)
     obs_shape = (observation_shape[2], observation_shape[0], observation_shape[1])
+    reward_clip_value = args.reward_clip if args.reward_clip > 0 else None
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +219,7 @@ def train() -> None:
         agent = DQNAgent.load(str(output_path), device=args.device)
         agent.game_config = game_config
         agent.set_n_step(args.n_step)
+        agent.reward_clip = reward_clip_value
         if meta_path.exists():
             try:
                 with meta_path.open("r", encoding="utf-8") as meta_fp:
@@ -184,10 +248,21 @@ def train() -> None:
             epsilon_final=args.epsilon_final,
             epsilon_decay=args.epsilon_decay,
             n_step=args.n_step,
+            reward_clip=reward_clip_value,
             device=args.device,
             game_config=game_config,
             obs_shape=obs_shape,
         )
+
+    lr_controller = LossAwareLrController(
+        agent,
+        decay_factor=args.lr_decay_factor,
+        patience=args.lr_decay_patience,
+        threshold=args.lr_decay_threshold,
+        min_lr=args.lr_min,
+        spike_threshold=args.loss_spike_threshold,
+        spike_ratio=args.loss_spike_ratio,
+    )
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -202,6 +277,7 @@ def train() -> None:
             "epsilon": agent.epsilon,
             "learn_step_counter": agent.learn_step_counter,
             "n_step": agent.n_step,
+            "learning_rate": agent.current_lr(),
         }
         with meta_path.open("w", encoding="utf-8") as meta_fp:
             json.dump(metadata, meta_fp, indent=2)
@@ -255,6 +331,7 @@ def train() -> None:
             "epsilon": agent.epsilon,
             "avg_loss": float(np.mean(losses)) if losses else None,
         }
+        metrics["lr"] = lr_controller.step(metrics["avg_loss"])
 
         if args.render_frequency and episode % args.render_frequency == 0:
             print("Episode", episode)
@@ -275,7 +352,7 @@ def train() -> None:
         if episode % 10 == 0 or episode == start_episode:
             print(
                 f"Episode {episode:5d} | reward={episode_env_reward:7.3f} | score={train_env.score:3d} | steps={train_env.steps:4d} | "
-                f"epsilon={agent.epsilon:.3f} | avg_loss={metrics['avg_loss']} | shaped={episode_shaped_reward:7.3f}"
+                f"epsilon={agent.epsilon:.3f} | avg_loss={metrics['avg_loss']} | lr={metrics['lr']:.6f} | shaped={episode_shaped_reward:7.3f}"
             )
 
     last_episode = start_episode + args.episodes - 1
