@@ -186,7 +186,7 @@ class DQNAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
-        self.optimizer = Adam(self.policy_net.parameters(), lr=lr, weight_decay=1e-5)
+        self.optimizer = Adam(self.policy_net.parameters(), lr=lr, weight_decay=2e-5)
         self.replay_buffer = ReplayBuffer(replay_capacity, self.device)
         self.learn_step_counter = 0
 
