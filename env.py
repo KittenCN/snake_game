@@ -309,3 +309,4 @@ class SnakeGameEnv:
 
 
 __all__ = ["Action", "GameConfig", "SnakeGameEnv"]
+
