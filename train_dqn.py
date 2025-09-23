@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import random
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -26,6 +27,9 @@ except ImportError:
     from env import Action, GameConfig, SnakeGameEnv
 
 
+GridSeed = Optional[int]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a DQN agent to play snake using PyTorch")
     parser.add_argument("--episodes", type=int, default=1_000, help="Number of training episodes in this run")
@@ -34,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=12, help="Grid height")
     parser.add_argument("--initial-length", type=int, default=3, help="Initial snake length")
     parser.add_argument("--allow-wrap", action="store_true", help="Enable wrap-around movement")
-    parser.add_argument("--seed", type=int, default=42, help="Base random seed")
+    parser.add_argument("--seed", type=int, default=None, help="Global seed (omit for fully random training)")
     parser.add_argument("--eval-interval", type=int, default=50, help="Episodes between evaluation runs")
     parser.add_argument("--eval-episodes", type=int, default=5, help="Evaluation episodes per checkpoint")
     parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
@@ -54,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-food", type=float, default=5.0, help="Reward granted for eating food")
     parser.add_argument("--reward-death", type=float, default=-2.0, help="Penalty for dying")
     parser.add_argument("--reward-shaping-scale", type=float, default=0.1, help="Scaling factor for distance-based reward shaping")
+    parser.add_argument("--hunger-penalty", type=float, default=0.001, help="Additional penalty per consecutive step without eating")
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256], help="Hidden layer sizes for the Q-network")
     parser.add_argument("--device", type=str, default=None, help="Override torch device (cpu/cuda)")
     parser.add_argument("--output", type=str, default="models/dqn_snake.pt", help="Where to store the trained model")
@@ -62,26 +67,37 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_global_seed(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    import random
-
-    random.seed(seed % (2**32))
+def set_global_seed(seed: Optional[int]) -> random.Random:
+    rng = random.Random()
+    if seed is None:
+        seed = random.SystemRandom().randrange(2**63)
+        print(f"Using generated seed {seed}")
+    seed32 = seed % (2**32)
+    np.random.seed(seed32)
+    torch.manual_seed(seed32)
+    random.seed(seed32)
+    rng.seed(seed32)
+    return rng
 
 
 def manhattan_distance(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
-def evaluate_agent(agent: DQNAgent, env: SnakeGameEnv, episodes: int) -> Dict[str, float]:
+def evaluate_agent(
+    agent: DQNAgent,
+    env: SnakeGameEnv,
+    episodes: int,
+    rng: Optional[random.Random],
+) -> Dict[str, float]:
     rewards: List[float] = []
     scores: List[int] = []
     lengths: List[int] = []
     original_epsilon = agent.epsilon
     try:
         for _ in range(episodes):
-            env.reset()
+            eval_seed: GridSeed = rng.randint(0, 2**63 - 1) if rng is not None else None
+            env.reset(seed=eval_seed)
             state = flatten_observation(env.as_numpy(), agent.device)
             total_reward = 0.0
             for _ in range(10_000):
@@ -105,20 +121,22 @@ def evaluate_agent(agent: DQNAgent, env: SnakeGameEnv, episodes: int) -> Dict[st
 
 def train() -> None:
     args = parse_args()
-    set_global_seed(args.seed)
+    rng = set_global_seed(args.seed)
 
     game_config = GameConfig(
         width=args.width,
         height=args.height,
         initial_length=args.initial_length,
-        allow_wrap=args.allow_wrap,
         reward_step=args.reward_step,
         reward_food=args.reward_food,
         reward_death=args.reward_death,
-        seed=args.seed,
+        allow_wrap=args.allow_wrap,
+        seed=None,
     )
-    env = SnakeGameEnv(game_config)
-    observation_shape = env.observation_shape()
+
+    train_env = SnakeGameEnv(game_config)
+    eval_env = SnakeGameEnv(game_config)
+    observation_shape = train_env.observation_shape()
     state_dim = int(np.prod(observation_shape))
     action_dim = len(Action)
 
@@ -131,17 +149,8 @@ def train() -> None:
 
     if output_path.exists():
         print(f"Resuming training from {output_path}")
-        agent = DQNAgent.load(
-            str(output_path),
-            device=args.device,
-        )
-        if agent.game_config is not None and asdict(agent.game_config) != asdict(game_config):
-            print("Loaded agent configuration differs from CLI arguments; using configuration from checkpoint.")
-            game_config = agent.game_config
-            env = SnakeGameEnv(game_config)
-            observation_shape = env.observation_shape()
-            state_dim = int(np.prod(observation_shape))
-            action_dim = len(Action)
+        agent = DQNAgent.load(str(output_path), device=args.device)
+        agent.game_config = game_config
         if meta_path.exists():
             try:
                 with meta_path.open("r", encoding="utf-8") as meta_fp:
@@ -190,32 +199,42 @@ def train() -> None:
             json.dump(metadata, meta_fp, indent=2)
 
     for episode in range(start_episode, start_episode + args.episodes):
-        env.reset(seed=args.seed + episode)
-        state = flatten_observation(env.as_numpy(), agent.device)
+        episode_seed: GridSeed = rng.randint(0, 2**63 - 1) if rng is not None else None
+        train_env.reset(seed=episode_seed)
+        state = flatten_observation(train_env.as_numpy(), agent.device)
         episode_env_reward = 0.0
         episode_shaped_reward = 0.0
         losses: List[float] = []
+        steps_since_food = 0
 
         for _ in range(args.max_steps):
-            prev_head = env.snake[0]
-            prev_food = env.food
-            prev_distance = None
-            if args.reward_shaping_scale > 0 and prev_food is not None:
-                prev_distance = manhattan_distance(prev_head, prev_food)
+            previous_food = train_env.food
+            previous_distance = (
+                manhattan_distance(train_env.snake[0], previous_food)
+                if args.reward_shaping_scale > 0 and previous_food is not None
+                else None
+            )
 
             action = agent.select_action(state)
-            obs, reward, done, info = env.step(Action(action))
-            next_state = flatten_observation(env.as_numpy(), agent.device)
+            obs, reward, done, info = train_env.step(Action(action))
+            next_state = flatten_observation(train_env.as_numpy(), agent.device)
 
             shaped_reward = reward
             if (
                 args.reward_shaping_scale > 0
-                and prev_distance is not None
+                and previous_distance is not None
+                and previous_food is not None
                 and info.get("event") != "ate_food"
-                and prev_food is not None
             ):
-                new_distance = manhattan_distance(env.snake[0], prev_food)
-                shaped_reward += args.reward_shaping_scale * (prev_distance - new_distance)
+                new_distance = manhattan_distance(train_env.snake[0], previous_food)
+                shaped_reward += args.reward_shaping_scale * (previous_distance - new_distance)
+
+            if info.get("event") == "ate_food":
+                steps_since_food = 0
+            else:
+                steps_since_food += 1
+                if args.hunger_penalty > 0:
+                    shaped_reward -= args.hunger_penalty * steps_since_food
 
             agent.remember(state, action, shaped_reward, next_state, done)
             loss = agent.learn()
@@ -231,18 +250,18 @@ def train() -> None:
             "episode": episode,
             "reward": episode_env_reward,
             "shaped_reward": episode_shaped_reward,
-            "score": env.score,
-            "steps": env.steps,
+            "score": train_env.score,
+            "steps": train_env.steps,
             "epsilon": agent.epsilon,
             "avg_loss": float(np.mean(losses)) if losses else None,
         }
 
         if args.render_frequency and episode % args.render_frequency == 0:
             print("Episode", episode)
-            print(env.render(to_string=True))
+            print(train_env.render(to_string=True))
 
         if episode % args.eval_interval == 0:
-            eval_stats = evaluate_agent(agent, env, args.eval_episodes)
+            eval_stats = evaluate_agent(agent, eval_env, args.eval_episodes, rng)
             metrics.update({f"eval_{k}": v for k, v in eval_stats.items()})
             avg_reward = eval_stats["avg_reward"]
             if avg_reward > best_reward:
@@ -255,7 +274,7 @@ def train() -> None:
 
         if episode % 10 == 0 or episode == start_episode:
             print(
-                f"Episode {episode:5d} | reward={episode_env_reward:7.3f} | score={env.score:3d} | steps={env.steps:4d} | "
+                f"Episode {episode:5d} | reward={episode_env_reward:7.3f} | score={train_env.score:3d} | steps={train_env.steps:4d} | "
                 f"epsilon={agent.epsilon:.3f} | avg_loss={metrics['avg_loss']} | shaped={episode_shaped_reward:7.3f}"
             )
 
@@ -271,7 +290,3 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
-
-
-
-

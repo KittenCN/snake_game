@@ -45,15 +45,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_env_from_metadata(agent: DQNAgent, seed: Optional[int]) -> SnakeGameEnv:
+def build_env_from_metadata(agent: DQNAgent, seed: int | None) -> SnakeGameEnv:
     if agent.game_config is not None:
         base_config = GameConfig(**asdict(agent.game_config))
     else:
         base_config = GameConfig()
-    if seed is not None:
-        base_config.seed = seed
+    base_config.seed = seed if seed is not None else None
     return SnakeGameEnv(base_config)
-
 
 def run_episode(agent: DQNAgent, env: SnakeGameEnv, delay: float, render: bool) -> dict:
     env.reset()
@@ -152,3 +150,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+

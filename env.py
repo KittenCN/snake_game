@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import random
 from collections import deque
@@ -40,9 +40,9 @@ class GameConfig:
     width: int = 20
     height: int = 20
     initial_length: int = 3
-    reward_step: float = -0.01
-    reward_food: float = 1.0
-    reward_death: float = -1.0
+    reward_step: float = -0.002
+    reward_food: float = 5.0
+    reward_death: float = -2.0
     allow_wrap: bool = False
     seed: Optional[int] = None
 
@@ -306,3 +306,4 @@ class SnakeGameEnv:
 
 
 __all__ = ["Action", "GameConfig", "SnakeGameEnv"]
+
