@@ -69,6 +69,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=0, help="Number of evaluation windows without sufficient improvement before early stop (0 disables)")
     parser.add_argument("--early-stop-delta", type=float, default=0.0, help="Minimum eval reward improvement required to reset the early-stop counter")
     parser.add_argument("--resume-best-on-decline", action="store_true", help="Reload the best checkpoint whenever an evaluation does not improve")
+    parser.add_argument("--resume-decline-threshold", type=float, default=0.0, help="Minimum drop in eval reward before reloading the best checkpoint (0 disables)")
+    parser.add_argument("--resume-decline-cooldown", type=int, default=0, help="Number of evaluation windows to wait before reloading the best checkpoint again (0 disables)")
+    parser.add_argument("--early-stop-min-evals", type=int, default=0, help="Minimum number of evaluation windows before early stopping can trigger")
     return parser.parse_args()
 
 
@@ -202,6 +205,8 @@ def train() -> None:
     patience_counter = 0
     stop_training = False
     final_episode = start_episode - 1
+    eval_counter = 0
+    last_reload_eval = -1
 
     def write_metadata(best_reward_value: Optional[float], episodes_completed: int) -> None:
         metadata = {
@@ -271,6 +276,7 @@ def train() -> None:
             print(train_env.render(to_string=True))
 
         if episode % args.eval_interval == 0:
+            eval_counter += 1
             eval_stats = evaluate_agent(agent, eval_env, args.eval_episodes, rng)
             metrics.update({f"eval_{k}": v for k, v in eval_stats.items()})
             avg_reward = eval_stats["avg_reward"]
@@ -280,9 +286,18 @@ def train() -> None:
                 best_reward = avg_reward
                 best_eval_episode = episode
                 patience_counter = 0
+                last_reload_eval = eval_counter
                 agent.save(str(output_path))
             else:
-                if args.resume_best_on_decline and best_reward != -math.inf and output_path.exists():
+                decline = best_reward - avg_reward if best_reward != -math.inf else 0.0
+                reload_allowed = (
+                    args.resume_best_on_decline
+                    and best_reward != -math.inf
+                    and output_path.exists()
+                )
+                cooldown_ok = args.resume_decline_cooldown <= 0 or last_reload_eval < 0 or (eval_counter - last_reload_eval) >= args.resume_decline_cooldown
+                threshold_ok = args.resume_decline_threshold <= 0.0 or decline >= args.resume_decline_threshold
+                if reload_allowed and cooldown_ok and threshold_ok:
                     try:
                         checkpoint = torch.load(output_path, map_location=agent.device)
                         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
@@ -298,10 +313,11 @@ def train() -> None:
                     except Exception as exc:
                         print(f"Warning: Could not reload best checkpoint: {exc}")
                 if args.early_stop_patience > 0 and best_reward != -math.inf:
-                    patience_counter += 1
-                    if patience_counter >= args.early_stop_patience:
-                        stop_training = True
-                        print(f"Early stopping triggered at episode {episode} (best eval reward {best_reward:.3f})")
+                    if args.early_stop_min_evals <= 0 or eval_counter >= args.early_stop_min_evals:
+                        patience_counter += 1
+                        if patience_counter >= args.early_stop_patience:
+                            stop_training = True
+                            print(f"Early stopping triggered at episode {episode} (best eval reward {best_reward:.3f})")
             write_metadata(best_reward if best_reward != -math.inf else None, episode)
 
         with log_file.open("a", encoding="utf-8") as f:
