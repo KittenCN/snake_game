@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-min-evals", type=int, default=0, help="Minimum number of evaluation windows before early stopping can trigger")
     parser.add_argument("--best-history-limit", type=int, default=0, help="Maximum number of best checkpoints to keep (0 disables history)")
     parser.add_argument("--best-history-dir", type=str, default=None, help="Optional directory to store best checkpoint snapshots")
+    parser.add_argument("--disable-early-stop", action="store_true", help="Disable evaluation-based early stopping")
     return parser.parse_args()
 
 
@@ -257,6 +258,7 @@ def train() -> None:
     final_episode = start_episode - 1
     eval_counter = 0
     last_reload_eval = -1
+    early_stop_enabled = not args.disable_early_stop
 
     def write_metadata(best_reward_value: Optional[float], episodes_completed: int) -> None:
         metadata = {
@@ -392,7 +394,7 @@ def train() -> None:
                         print("Reloaded best checkpoint after evaluation decline.")
                     except Exception as exc:
                         print(f"Warning: Could not reload best checkpoint: {exc}")
-                if args.early_stop_patience > 0 and best_reward != -math.inf:
+                if early_stop_enabled and args.early_stop_patience > 0 and best_reward != -math.inf:
                     if args.early_stop_min_evals <= 0 or eval_counter >= args.early_stop_min_evals:
                         patience_counter += 1
                         if patience_counter >= args.early_stop_patience:
