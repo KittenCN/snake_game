@@ -8,6 +8,7 @@ import math
 import os
 import random
 import time
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -72,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-decline-threshold", type=float, default=0.0, help="Minimum drop in eval reward before reloading the best checkpoint (0 disables)")
     parser.add_argument("--resume-decline-cooldown", type=int, default=0, help="Number of evaluation windows to wait before reloading the best checkpoint again (0 disables)")
     parser.add_argument("--early-stop-min-evals", type=int, default=0, help="Minimum number of evaluation windows before early stopping can trigger")
+    parser.add_argument("--best-history-limit", type=int, default=0, help="Maximum number of best checkpoints to keep (0 disables history)")
+    parser.add_argument("--best-history-dir", type=str, default=None, help="Optional directory to store best checkpoint snapshots")
     return parser.parse_args()
 
 
@@ -155,6 +158,10 @@ def train() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path = output_path.with_suffix(".meta.json")
 
+    best_history_limit = max(0, args.best_history_limit)
+    best_history_dir = Path(args.best_history_dir) if args.best_history_dir else output_path.parent / f"{output_path.stem}_history"
+    best_history: list[dict[str, object]] = []
+
     best_reward = -math.inf
     best_eval_episode: Optional[int] = None
     start_episode = 1
@@ -169,6 +176,23 @@ def train() -> None:
                     previous_meta = json.load(meta_fp)
                 best_reward = previous_meta.get("best_avg_reward", best_reward)
                 best_eval_episode = previous_meta.get("best_eval_episode", best_eval_episode)
+                history_meta = previous_meta.get("best_history")
+                if isinstance(history_meta, list):
+                    for item in history_meta:
+                        if not isinstance(item, dict):
+                            continue
+                        path_value = item.get("path")
+                        reward_value = item.get("reward")
+                        episode_value = item.get("episode")
+                        if path_value is None or reward_value is None:
+                            continue
+                        snapshot_path = Path(path_value)
+                        if snapshot_path.exists():
+                            best_history.append({
+                                "path": str(snapshot_path),
+                                "reward": float(reward_value),
+                                "episode": int(episode_value) if episode_value is not None else None,
+                            })
                 start_episode = max(1, previous_meta.get("episodes_completed", 0) + 1)
                 print(f"Resuming from episode {start_episode} with best avg reward {best_reward}")
             except json.JSONDecodeError:
@@ -196,6 +220,32 @@ def train() -> None:
             obs_shape=obs_shape,
         )
 
+    if best_history_limit <= 0:
+        if best_history:
+            for entry in best_history:
+                path_str = entry.get("path") if isinstance(entry, dict) else None
+                if path_str:
+                    snapshot_path = Path(path_str)
+                    if snapshot_path.exists():
+                        try:
+                            snapshot_path.unlink()
+                        except OSError:
+                            pass
+        best_history = []
+    elif best_history:
+        best_history.sort(key=lambda entry: entry.get("reward", float("-inf")), reverse=True)
+        if best_history_limit > 0 and len(best_history) > best_history_limit:
+            for entry in best_history[best_history_limit:]:
+                path_str = entry.get("path")
+                if path_str:
+                    snapshot_path = Path(path_str)
+                    if snapshot_path.exists():
+                        try:
+                            snapshot_path.unlink()
+                        except OSError:
+                            pass
+            best_history = best_history[:best_history_limit]
+
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"train_log_{int(time.time())}.jsonl"
@@ -217,6 +267,7 @@ def train() -> None:
             "epsilon": agent.epsilon,
             "learn_step_counter": agent.learn_step_counter,
             "best_eval_episode": best_eval_episode,
+            "best_history": best_history,
         }
         with meta_path.open("w", encoding="utf-8") as meta_fp:
             json.dump(metadata, meta_fp, indent=2)
@@ -288,7 +339,34 @@ def train() -> None:
                 patience_counter = 0
                 last_reload_eval = eval_counter
                 agent.save(str(output_path))
-                print(f"New best model at episode {episode} with avg eval reward {best_reward:.3f}; saved to {output_path}")
+                print(f"New best avg reward {best_reward:.3f} at episode {episode}. Saved to {output_path}")
+                if best_history_limit != 0:
+                    try:
+                        best_history_dir.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        pass
+                    snapshot_path = best_history_dir / f"{output_path.stem}_ep{episode}_reward{best_reward:.2f}.pt"
+                    try:
+                        shutil.copy2(output_path, snapshot_path)
+                        best_history.append({
+                            "path": str(snapshot_path),
+                            "reward": float(best_reward),
+                            "episode": episode,
+                        })
+                    except OSError as exc:
+                        print(f"Warning: Could not copy best checkpoint to {snapshot_path}: {exc}")
+                    if best_history_limit > 0:
+                        best_history.sort(key=lambda entry: entry.get("reward", float("-inf")), reverse=True)
+                        while len(best_history) > best_history_limit:
+                            entry = best_history.pop()
+                            path_str = entry.get("path")
+                            if path_str:
+                                old_path = Path(path_str)
+                                if old_path.exists():
+                                    try:
+                                        old_path.unlink()
+                                    except OSError:
+                                        pass
             else:
                 decline = best_reward - avg_reward if best_reward != -math.inf else 0.0
                 reload_allowed = (
@@ -310,6 +388,7 @@ def train() -> None:
                         restored_steps = checkpoint.get("metadata", {}).get("learn_step_counter")
                         if restored_steps is not None:
                             agent.learn_step_counter = int(restored_steps)
+                        last_reload_eval = eval_counter
                         print("Reloaded best checkpoint after evaluation decline.")
                     except Exception as exc:
                         print(f"Warning: Could not reload best checkpoint: {exc}")
