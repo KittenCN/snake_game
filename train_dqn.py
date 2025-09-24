@@ -288,6 +288,7 @@ def train() -> None:
                 patience_counter = 0
                 last_reload_eval = eval_counter
                 agent.save(str(output_path))
+                print(f"New best model at episode {episode} with avg eval reward {best_reward:.3f}; saved to {output_path}")
             else:
                 decline = best_reward - avg_reward if best_reward != -math.inf else 0.0
                 reload_allowed = (
@@ -331,7 +332,7 @@ def train() -> None:
                 if args.save_segment_checkpoints:
                     segment_path = output_path.with_name(f"{output_path.stem}_ep{episode}.pt")
                     agent.save(str(segment_path))
-                    print(f"Saved segment checkpoint to {segment_path}")
+                    print(f"Saved segment checkpoint to {segment_path}, best eval reward {best_reward if best_reward != -math.inf else 'N/A'}")
                 write_metadata(best_reward if best_reward != -math.inf else None, episode)
                 best_display = f"{best_reward:.3f}" if best_reward != -math.inf else "N/A"
                 print(f"Segment complete at episode {episode}. Best eval reward: {best_display}")
