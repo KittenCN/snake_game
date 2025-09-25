@@ -227,7 +227,7 @@ def train() -> None:
                 if stored_path and (stored_metric is None or stored_metric == train_best_metric):
                     train_best_path = Path(stored_path)
                 start_episode = max(1, previous_meta.get("episodes_completed", 0) + 1)
-                print(f"Resuming from episode {start_episode} with best avg reward {best_reward}")
+                print(f"Resuming from episode {start_episode} with best avg reward {best_reward} and best eval value {train_best_value if train_best_enabled else 'N/A'} on episode {train_best_episode if train_best_enabled else 'N/A'}.")
             except json.JSONDecodeError:
                 print(f"Warning: Could not parse metadata file {meta_path}; continuing from defaults.")
     else:
