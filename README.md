@@ -1,59 +1,97 @@
-ï»¿# Snake Game Environment
+# Snake DQN Toolkit / Ì°³ÔÉß DQN ¹¤¾ß¼¯
 
-This package contains a pure-Python implementation of the Snake game with a reinforcement-learning-friendly API.
+## Overview / ÏîÄ¿¸ÅÀÀ
+- **English:** A full reinforcement learning toolkit that pairs a feature-rich Snake environment with a PyTorch Deep Q-Network agent, supporting modern training tricks, advanced observation features, and safe inference.
+- **ÖĞÎÄ£º** ÕâÊÇÒ»¸öÍêÕûµÄÇ¿»¯Ñ§Ï°¹¤¾ß¼¯£¬½áºÏÁË¹¦ÄÜ·á¸»µÄÌ°³ÔÉß»·¾³Óë PyTorch DQN ÖÇÄÜÌå£¬ÄÚÖÃÏÖ´úÑµÁ·¼¼ÇÉ¡¢ÔöÇ¿µÄ¹Û²âÌØÕ÷ÒÔ¼°°²È«ÍÆÀí¹¦ÄÜ¡£
 
-```python
-from snake_game import SnakeGameEnv, Action, GameConfig
+## Core Components / ºËĞÄ×é¼ş
+1. **Environment (`env.py`)
+   - **EN:** Pure-Python Snake simulator with wrap support, idle penalties, safety checks, and numpy-friendly exports.
+   - **ÖĞÎÄ£º** ´¿ Python µÄÌ°³ÔÉß»·¾³£¬Ö§³Ö´©Ç½¡¢¿ÕÏĞ³Í·£¡¢°²È«ĞĞ¶¯¼ì²â¼° numpy ¹Û²âÊä³ö¡£
+2. **Agent (`dqn_agent.py`)
+   - **EN:** Switchable CNN backbones (`--network-version`), dueling + double DQN, prioritized observation encoding, and replay experience buffer.
+   - **ÖĞÎÄ£º** ¿ÉÇĞ»»µÄ CNN Ö÷¸ÉÍøÂç£¨`--network-version`£©¡¢Ë«ÓÅÊÆ DQN¡¢Ç¿»¯µÄ¹Û²â±àÂëÒÔ¼°¾­Ñé»Ø·Å»º´æ¡£
+3. **Training Pipeline (`train_dqn.py`)
+   - **EN:** Segment logging, evaluation checkpoints, optional early stop, train-metric best snapshots, and resume/curriculum utilities.
+   - **ÖĞÎÄ£º** Ö§³Ö·Ö¶ÎÈÕÖ¾¡¢ÆÀ¹À¼ì²éµã¡¢¿ÉÑ¡ÔçÍ£¡¢»ùÓÚÑµÁ·Ö¸±êµÄ×î¼ÑÄ£ĞÍ±£´æ£¬ÒÔ¼°¶ÏµãĞøÑµÓë¿Î³ÌÊ½ÉèÖÃ¡£
+4. **Inference Runner (`play_dqn.py`)
+   - **EN:** GUI / console play, deterministic or safety-checked control, supports custom devices and seeds.
+   - **ÖĞÎÄ£º** GUI »òÃüÁîĞĞÔËĞĞ£¬Ö§³Ö°²È«¿ØÖÆ»ò´¿Ì°ĞÄ²ßÂÔ£¬¿É×Ô¶¨ÒåÉè±¸ÓëËæ»úÖÖ×Ó¡£
 
-env = SnakeGameEnv(GameConfig(width=10, height=10))
-obs = env.reset(seed=123)
+## Installation / °²×°
+```
+pip install -r requirements.txt
+```
+- **EN:** Ensure `torch`, `numpy`, and `tkinter` (for GUI) are available in your environment.
+- **ÖĞÎÄ£º** ÇëÈ·ÈÏÔËĞĞ»·¾³ÖĞÒÑ°²×° `torch`¡¢`numpy` ºÍ `tkinter`£¨GUI Ä£Ê½ĞèÒª£©¡£
 
-for _ in range(100):
-    action = env.sample_action()
-    obs, reward, done, info = env.step(action)
-    if done:
-        break
+## Training Workflow / ÑµÁ·Á÷³Ì
+```
+python -m snake_game.train_dqn \
+  --episodes 2000 \
+  --width 12 --height 12 \
+  --network-version 2 \
+  --train-best-metric reward \
+  --log-dir runs
+```
+- **EN:**
+  - `--network-version`: choose the enhanced residual CNN (`2`) or the legacy CNN (`1`).
+  - `--train-best-*`: toggles training-best checkpoints; model files saved as `*_best_reward.pt` or `*_best_score.pt`.
+  - Evaluations run every `--eval-interval` episodes; best eval snapshot stored at `--output` and mirrored to history if enabled.
+  - Logs append to `runs/train_log_<timestamp>.jsonl` for later analysis.
+- **ÖĞÎÄ£º**
+  - `--network-version`£ºÑ¡ÔñÔöÇ¿²Ğ²î CNN£¨ÖµÎª `2`£©»ò´«Í³ CNN£¨ÖµÎª `1`£©¡£
+  - `--train-best-*`£º¸ù¾İÑµÁ·Ö¸±ê±£´æ×î¼ÑÄ£ĞÍ£¬ÎÄ¼şÃûĞÎÈç `*_best_reward.pt` »ò `*_best_score.pt`¡£
+  - Ã¿¸ô `--eval-interval` ¸ö episode ½øĞĞÆÀ¹À£¬×î¼ÑÆÀ¹ÀÄ£ĞÍ±£´æÔÚ `--output` Ö¸¶¨Â·¾¶£¬²¢¿É¸´ÖÆµ½ÀúÊ·Ä¿Â¼¡£
+  - ÑµÁ·Ö¸±êÊµÊ±Ğ´Èë `runs/train_log_<timestamp>.jsonl` ±ãÓÚºóĞø·ÖÎö¡£
 
-board = env.render(to_string=True)
-print(board)
+### Resuming / »Ö¸´ÑµÁ·
+```
+python -m snake_game.train_dqn --output models/dqn_snake.pt --episodes 500 --resume-best-on-decline
+```
+- **EN:** Metadata (`.meta.json`) restores epsilon, replay progress, best metrics, and train-best checkpoints automatically.
+- **ÖĞÎÄ£º** ÔªÊı¾İÎÄ¼ş£¨`.meta.json`£©»á×Ô¶¯»Ö¸´ epsilon¡¢»Ø·Å½ø¶È¡¢×î¼ÑÆÀ¹ÀÒÔ¼°ÑµÁ·×î¼ÑÄ£ĞÍĞÅÏ¢¡£
+
+## Evaluation & Monitoring / ÆÀ¹ÀÓë¼à¿Ø
+- **EN:** Check `runs/train_log_*.jsonl` for per-episode rewards, shaped rewards, scores, and evaluation summaries.
+- **ÖĞÎÄ£º** Í¨¹ı `runs/train_log_*.jsonl` ²é¿´Ã¿¸ö episode µÄ½±Àø¡¢ËÜĞÎ½±Àø¡¢µÃ·ÖÒÔ¼°ÆÀ¹À½á¹û¡£
+- **EN:** Optional history snapshots live in `{output}_history/` when `--best-history-limit` > 0.
+- **ÖĞÎÄ£º** Èô `--best-history-limit` > 0£¬¿ÉÔÚ `{output}_history/` Ä¿Â¼ÖĞÕÒµ½ÀúÊ·×î¼ÑÄ£ĞÍ¡£
+
+## Inference / ÍÆÀí
+```
+python -m snake_game.play_dqn --model models/dqn_snake.pt --episodes 5
+```
+- **EN:**
+  - GUI mode is default; add `--console --render` for ASCII playback.
+  - Safety fallback avoids immediate collisions; disable via `--disable-safety-check` to evaluate raw policy behaviour.
+  - Use `--device cuda` to run on GPU, or set `--seed` for reproducible runs.
+- **ÖĞÎÄ£º**
+  - Ä¬ÈÏÆô¶¯ GUI£¬Ê¹ÓÃ `--console --render` ÇĞ»»ÎªÎÄ±¾Ä£Ê½¡£
+  - °²È«»ØÍË»úÖÆ¿É±ÜÃâÁ¢¼´×²Ç½»ò×Ô×²£¬¿ÉÍ¨¹ı `--disable-safety-check` ¹Ø±ÕÒÔ¹Û²ìÔ­Ê¼²ßÂÔ¡£
+  - Í¨¹ı `--device cuda` Ê¹ÓÃ GPU£¬`--seed` ±£Ö¤ÍÆÀí¿É¸´ÏÖ¡£
+
+## Development Notes / ¿ª·¢ËµÃ÷
+- **EN:**
+  - Observation builder now augments raw grids with geometry, direction, distance, and danger maps.
+  - Training loop clips gradients, supports soft/hard target updates, and logs per-segment metadata.
+  - Checkpoints store network version ensuring legacy compatibility.
+- **ÖĞÎÄ£º**
+  - ¹Û²â±àÂëÔÚÔ­Ê¼Íø¸ñ»ù´¡ÉÏÔö¼ÓÁË×ø±ê¡¢·½Ïò¡¢¾àÀëÓëÎ£ÏÕÇøÓòÌØÕ÷¡£
+  - ÑµÁ·Ñ­»·°üº¬Ìİ¶È²Ã¼ô£¬Ö§³ÖÈí/Ó²Ä¿±êÍøÂç¸üĞÂ£¬²¢ÔÚÃ¿¸ö½×¶ÎĞ´ÈëÔªÊı¾İ¡£
+  - Ä£ĞÍ¼ì²éµã¼ÇÂ¼ÍøÂç°æ±¾£¬±£Ö¤¾ÉÄ£ĞÍ¿É¼ÌĞøÊ¹ÓÃ¡£
+
+## File Tree / ÎÄ¼ş½á¹¹
+```
+©À©¤©¤ dqn_agent.py       # DQN agent & observation utilities / DQN ÖÇÄÜÌåÓë¹Û²â¹¤¾ß
+©À©¤©¤ train_dqn.py       # Training entry / ÑµÁ·Èë¿Ú
+©À©¤©¤ play_dqn.py        # Inference runner / ÍÆÀí½Å±¾
+©À©¤©¤ env.py             # Snake environment / Ì°³ÔÉß»·¾³
+©À©¤©¤ runs/              # Training logs & metadata / ÑµÁ·ÈÕÖ¾ÓëÔªÊı¾İ
+©À©¤©¤ models/            # Saved checkpoints / Ä£ĞÍ±£´æÄ¿Â¼
+©¸©¤©¤ README.md          # Documentation / ÎÄµµ
 ```
 
-## Key API methods
-
-- `reset(seed: Optional[int]) -> observation`
-- `step(action) -> (observation, reward, done, info)`
-- `legal_actions() -> Tuple[Action, ...]`
-- `sample_action() -> Action`
-- `observation()` to query the current state without stepping
-- `as_numpy()` to obtain an `(H, W, 3)` tensor (requires `numpy`)
-- `render(to_string: bool = False)` for ASCII visualisation
-
-Run a random-agent demo:
-
-```bash
-python -m snake_game
-```
-
-The demo prints the board state after each action; stop the program with `Ctrl+C` when finished.
-
-## PyTorch DQN Agent
-## PyTorch DQN Agent
-
-A Deep Q-Network baseline is provided in `snake_game.dqn_agent`.
-
-Train it with:
-```bash
-python -m snake_game.train_dqn --episodes 1000 --width 12 --height 12
-```
-
-Once trained (default checkpoint `models/dqn_snake.pt`), launch GUI inference with all defaults:
-```bash
-python -m snake_game.play_dqn
-```
-
-Use console rendering instead of the GUI:
-```bash
-python -m snake_game.play_dqn --console --render
-```
-
-Install dependencies such as `torch` and `numpy` before training.
+## License / Ğí¿É
+- **EN:** Specify the intended license here (e.g., MIT).
+- **ÖĞÎÄ£º** ÔÚ´Ë´¦ÌîĞ´ÏîÄ¿µÄĞí¿ÉĞ­Òé£¨ÀıÈç MIT£©¡£

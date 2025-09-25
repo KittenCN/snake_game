@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
+import torch
 
 try:
     from .dqn_agent import DQNAgent, flatten_observation
@@ -40,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cell-size", type=int, default=25, help="GUI cell size in pixels")
     parser.add_argument("--console", action="store_true", help="Run in console (ASCII) mode instead of GUI")
     parser.add_argument("--render", action="store_true", help="Render ASCII board to the console (console mode)")
+    parser.add_argument("--disable-safety-check", action="store_true", help="Disable the safety fallback that avoids immediate collisions during inference")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for the environment")
     parser.add_argument("--device", type=str, default=None, help="Override device for inference (cpu/cuda)")
     return parser.parse_args()
@@ -53,15 +55,29 @@ def build_env_from_metadata(agent: DQNAgent, seed: int | None) -> SnakeGameEnv:
     base_config.seed = seed if seed is not None else None
     return SnakeGameEnv(base_config)
 
-def run_episode(agent: DQNAgent, env: SnakeGameEnv, delay: float, render: bool) -> dict:
+def select_safe_action(agent: DQNAgent, env: SnakeGameEnv, state: torch.Tensor, safety_enabled: bool) -> int:
+    if not safety_enabled:
+        return agent.select_action(state, epsilon_override=0.0)
+    action = agent.select_action(state, epsilon_override=0.0)
+    if env.is_safe_action(action):
+        return action
+    with torch.no_grad():
+        q_values = agent.policy_net(state.unsqueeze(0))
+    for candidate in torch.argsort(q_values[0], descending=True).tolist():
+        if env.is_safe_action(candidate):
+            return candidate
+    return action
+
+
+def run_episode(agent: DQNAgent, env: SnakeGameEnv, delay: float, render: bool, safety_enabled: bool) -> dict:
     env.reset()
-    state = flatten_observation(env.as_numpy(), agent.device)
+    state = flatten_observation(env, agent.device, expected_channels=agent.obs_shape[0])
     total_reward = 0.0
     while True:
-        action = agent.select_action(state, epsilon_override=0.0)
-        obs, reward, done, info = env.step(Action(action))
+        action_idx = select_safe_action(agent, env, state, safety_enabled)
+        obs, reward, done, info = env.step(Action(action_idx))
         total_reward += reward
-        state = flatten_observation(env.as_numpy(), agent.device)
+        state = flatten_observation(env, agent.device, expected_channels=agent.obs_shape[0])
         if render:
             board = env.render(to_string=True)
             print(board)
@@ -83,6 +99,8 @@ def main() -> None:
         return
 
     agent = DQNAgent.load(str(model_path), device=args.device)
+    agent.policy_net.eval()
+    agent.target_net.eval()
     env = build_env_from_metadata(agent, args.seed)
 
     print(f"Loaded model from {model_path.resolve()}")
@@ -92,7 +110,7 @@ def main() -> None:
         stats: List[dict] = []
         for idx in range(1, args.episodes + 1):
             print(f"Episode {idx}")
-            result = run_episode(agent, env, args.delay, args.render)
+            result = run_episode(agent, env, args.delay, args.render, not args.disable_safety_check)
             stats.append(result)
             print(
                 f" -> reward={result['reward']:.3f} score={result['score']} steps={result['steps']}"
@@ -107,10 +125,11 @@ def main() -> None:
     agent.epsilon = 0.0
     results: List[dict] = []
     gui: Optional[SnakeGameGUI] = None
+    safety_enabled = not args.disable_safety_check
 
     def controller(current_env: SnakeGameEnv) -> Action:
-        state_tensor = flatten_observation(current_env.as_numpy(), agent.device)
-        action_idx = agent.select_action(state_tensor, epsilon_override=0.0)
+        state_tensor = flatten_observation(current_env, agent.device, expected_channels=agent.obs_shape[0])
+        action_idx = select_safe_action(agent, current_env, state_tensor, safety_enabled)
         return Action(action_idx)
 
     def on_episode_end(summary: dict) -> None:

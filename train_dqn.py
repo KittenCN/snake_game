@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--best-history-limit", type=int, default=0, help="Maximum number of best checkpoints to keep (0 disables history)")
     parser.add_argument("--best-history-dir", type=str, default=None, help="Optional directory to store best checkpoint snapshots")
     parser.add_argument("--disable-early-stop", action="store_true", help="Disable evaluation-based early stopping")
+    parser.add_argument("--disable-train-best", action="store_true", help="Disable saving checkpoints based on training performance")
+    parser.add_argument("--train-best-metric", type=str, default="reward", choices=["reward", "score"], help="Metric used when saving training-best checkpoints")
+    parser.add_argument("--train-best-delta", type=float, default=5.0, help="Minimum improvement required to refresh the training-best checkpoint")
+    parser.add_argument("--network-version", type=int, choices=[1, 2], default=2, help="Network architecture version (1 legacy CNN, 2 enhanced residual CNN)")
     return parser.parse_args()
 
 
@@ -110,13 +114,13 @@ def evaluate_agent(
         for _ in range(episodes):
             eval_seed: GridSeed = rng.randint(0, 2**32 - 1) if rng is not None else None
             env.reset(seed=eval_seed)
-            state = flatten_observation(env.as_numpy(), agent.device)
+            state = flatten_observation(env, agent.device, expected_channels=agent.obs_shape[0])
             total_reward = 0.0
             for _ in range(10_000):
                 action = agent.select_action(state, epsilon_override=0.0)
                 _, reward, done, _ = env.step(Action(action))
                 total_reward += reward
-                state = flatten_observation(env.as_numpy(), agent.device)
+                state = flatten_observation(env, agent.device, expected_channels=agent.obs_shape[0])
                 if done:
                     break
             rewards.append(total_reward)
@@ -150,10 +154,13 @@ def train() -> None:
 
     train_env = SnakeGameEnv(game_config)
     eval_env = SnakeGameEnv(game_config)
-    observation_shape = train_env.observation_shape()
-    state_dim = int(np.prod(observation_shape))
+    train_env.reset()
+    eval_env.reset()
+    init_expected_channels = 3 if args.network_version == 1 else None
+    initial_state = flatten_observation(train_env, device="cpu", expected_channels=init_expected_channels)
+    obs_shape = tuple(int(dim) for dim in initial_state.shape)
+    state_dim = int(np.prod(obs_shape))
     action_dim = len(Action)
-    obs_shape = (observation_shape[2], observation_shape[0], observation_shape[1])
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,6 +169,13 @@ def train() -> None:
     best_history_limit = max(0, args.best_history_limit)
     best_history_dir = Path(args.best_history_dir) if args.best_history_dir else output_path.parent / f"{output_path.stem}_history"
     best_history: list[dict[str, object]] = []
+
+    train_best_enabled = not args.disable_train_best
+    train_best_metric = args.train_best_metric
+    train_best_delta = args.train_best_delta
+    train_best_value = -math.inf
+    train_best_episode: Optional[int] = None
+    train_best_path = output_path.with_name(f"{output_path.stem}_best_{train_best_metric}.pt")
 
     best_reward = -math.inf
     best_eval_episode: Optional[int] = None
@@ -194,6 +208,19 @@ def train() -> None:
                                 "reward": float(reward_value),
                                 "episode": int(episode_value) if episode_value is not None else None,
                             })
+                stored_metric = previous_meta.get("train_best_metric")
+                if stored_metric and stored_metric not in {"reward", "score"}:
+                    stored_metric = None
+                if stored_metric and stored_metric != train_best_metric:
+                    print("Train-best metric changed from metadata; resetting train-best tracker.")
+                elif stored_metric:
+                    train_best_metric = stored_metric
+                    train_best_value = previous_meta.get("train_best_value", train_best_value)
+                    train_best_episode = previous_meta.get("train_best_episode", train_best_episode)
+                    train_best_path = output_path.with_name(f"{output_path.stem}_best_{train_best_metric}.pt")
+                stored_path = previous_meta.get("train_best_path")
+                if stored_path and (stored_metric is None or stored_metric == train_best_metric):
+                    train_best_path = Path(stored_path)
                 start_episode = max(1, previous_meta.get("episodes_completed", 0) + 1)
                 print(f"Resuming from episode {start_episode} with best avg reward {best_reward}")
             except json.JSONDecodeError:
@@ -219,6 +246,7 @@ def train() -> None:
             device=args.device,
             game_config=game_config,
             obs_shape=obs_shape,
+            network_version=args.network_version,
         )
 
     if best_history_limit <= 0:
@@ -270,6 +298,10 @@ def train() -> None:
             "learn_step_counter": agent.learn_step_counter,
             "best_eval_episode": best_eval_episode,
             "best_history": best_history,
+            "train_best_metric": train_best_metric if train_best_enabled else None,
+            "train_best_value": float(train_best_value) if (train_best_enabled and train_best_value != -math.inf) else None,
+            "train_best_episode": train_best_episode if train_best_enabled else None,
+            "train_best_path": str(train_best_path) if (train_best_enabled and train_best_value != -math.inf) else None,
         }
         with meta_path.open("w", encoding="utf-8") as meta_fp:
             json.dump(metadata, meta_fp, indent=2)
@@ -277,7 +309,7 @@ def train() -> None:
     for episode in range(start_episode, start_episode + args.episodes):
         episode_seed: GridSeed = rng.randint(0, 2**32 - 1) if rng is not None else None
         train_env.reset(seed=episode_seed)
-        state = flatten_observation(train_env.as_numpy(), agent.device)
+        state = flatten_observation(train_env, agent.device, expected_channels=agent.obs_shape[0])
         episode_env_reward = 0.0
         episode_shaped_reward = 0.0
         losses: List[float] = []
@@ -292,7 +324,7 @@ def train() -> None:
 
             action = agent.select_action(state)
             obs, reward, done, info = train_env.step(Action(action))
-            next_state = flatten_observation(train_env.as_numpy(), agent.device)
+            next_state = flatten_observation(train_env, agent.device, expected_channels=agent.obs_shape[0])
 
             shaped_reward = reward
             if (
@@ -323,6 +355,20 @@ def train() -> None:
             "epsilon": agent.epsilon,
             "avg_loss": float(np.mean(losses)) if losses else None,
         }
+
+        if train_best_enabled:
+            metric_value = episode_env_reward if train_best_metric == "reward" else float(train_env.score)
+            if train_best_value == -math.inf or metric_value >= train_best_value + train_best_delta:
+                train_best_value = metric_value
+                train_best_episode = episode
+                try:
+                    train_best_path.parent.mkdir(parents=True, exist_ok=True)
+                    agent.save(str(train_best_path))
+                    metric_display = f"{metric_value:.3f}" if train_best_metric == "reward" else f"{int(metric_value)}"
+                    print(f"New training-best {train_best_metric} {metric_display} at episode {episode}. Saved to {train_best_path}")
+                except Exception as exc:
+                    print(f"Warning: Could not save training-best checkpoint: {exc}")
+            metrics[f"train_best_{train_best_metric}"] = train_best_value if train_best_value != -math.inf else None
 
         if args.render_frequency and episode % args.render_frequency == 0:
             print("Episode", episode)

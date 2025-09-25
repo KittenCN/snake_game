@@ -199,6 +199,10 @@ class SnakeGameEnv:
         return self._steps
 
     @property
+    def steps_since_food(self) -> int:
+        return self._steps_since_food
+
+    @property
     def done(self) -> bool:
         return self._done
 
@@ -207,6 +211,25 @@ class SnakeGameEnv:
 
     def sample_action(self) -> Action:
         return self._rng.choice(self.legal_actions())
+
+    def is_safe_action(self, action: Union[int, Action]) -> bool:
+        candidate = self._sanitize_action(action)
+        move_direction = self._direction if self._is_opposite(candidate) else candidate
+        head_x, head_y = self._snake[0]
+        dx, dy = move_direction.vector
+        nx = head_x + dx
+        ny = head_y + dy
+        if self.config.allow_wrap:
+            nx %= self.config.width
+            ny %= self.config.height
+        else:
+            if self._is_out_of_bounds((nx, ny)):
+                return False
+        target = (nx % self.config.width, ny % self.config.height) if self.config.allow_wrap else (nx, ny)
+        tail = self._snake[-1] if self._snake else None
+        if tail is not None and target == tail and target != self._food:
+            return True
+        return target not in self._occupied
 
     def observation_shape(self) -> Tuple[int, int, int]:
         return (self.config.height, self.config.width, 3)
