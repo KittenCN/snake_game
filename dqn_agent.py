@@ -290,6 +290,7 @@ class DQNAgent:
         game_config: GameConfig | None = None,
         obs_shape: Tuple[int, int, int] | None = None,
         network_version: int = 2,
+        amp_enabled: bool | None = None,
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -312,6 +313,7 @@ class DQNAgent:
         self.device = self._resolve_device(device)
         self.game_config = game_config
         self.network_version = network_version
+        self._configure_amp(amp_enabled)
 
         if obs_shape is None:
             raise ValueError("obs_shape must be provided for convolutional network")
@@ -335,6 +337,20 @@ class DQNAgent:
         self.learn_step_counter = 0
 
         self.loss_fn = nn.SmoothL1Loss()
+
+    def configure_amp(self, enabled: bool | None = None) -> None:
+        self._configure_amp(enabled)
+
+    def _configure_amp(self, enabled: bool | None) -> None:
+        if enabled is None:
+            enabled = self.device.type == "cuda"
+        if enabled and self.device.type != "cuda":
+            enabled = False
+        self.amp_enabled = bool(enabled)
+        if self.amp_enabled:
+            self.grad_scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.grad_scaler = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -373,27 +389,38 @@ class DQNAgent:
             return None
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
 
-        q_values = self.policy_net(states).gather(1, actions.long()).squeeze(1)
+        scaler = self.grad_scaler if (self.amp_enabled and self.grad_scaler is not None) else None
 
-        with torch.no_grad():
-            if self.use_double_dqn:
-                next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
-                next_q_values = self.target_net(next_states).gather(1, next_actions).squeeze(1)
-            else:
-                next_q_values = self.target_net(next_states).max(dim=1).values
+        with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+            q_values = self.policy_net(states).gather(1, actions.long()).squeeze(1)
+            with torch.no_grad():
+                if self.use_double_dqn:
+                    next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
+                    next_q_values = self.target_net(next_states).gather(1, next_actions).squeeze(1)
+                else:
+                    next_q_values = self.target_net(next_states).max(dim=1).values
             targets = rewards.squeeze(1) + self.gamma * (1 - dones.squeeze(1)) * next_q_values
+            targets = targets.to(q_values.dtype)
+            loss = self.loss_fn(q_values, targets)
 
-        loss = self.loss_fn(q_values, targets)
+        loss_value = float(loss.detach().cpu().item())
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=5.0)
-        self.optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=5.0)
+            scaler.step(self.optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=5.0)
+            self.optimizer.step()
 
         self.learn_step_counter += 1
         self._update_target_network()
         self._decay_epsilon()
-        return float(loss.item())
+        return loss_value
 
     def save(self, path: str) -> None:
         torch.save(
@@ -420,6 +447,7 @@ class DQNAgent:
                     "epsilon_final": self.epsilon_final,
                     "epsilon_decay": self.epsilon_decay,
                     "epsilon": self.epsilon,
+                    "amp_enabled": self.amp_enabled,
                     "device": str(self.device),
                     "learn_step_counter": self.learn_step_counter,
                     "obs_shape": self.obs_shape,
@@ -457,6 +485,7 @@ class DQNAgent:
             game_config=GameConfig(**metadata["game_config"]) if metadata.get("game_config") else None,
             obs_shape=obs_shape,
             network_version=metadata.get("network_version", 1),
+            amp_enabled=metadata.get("amp_enabled"),
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(checkpoint["target_state_dict"])

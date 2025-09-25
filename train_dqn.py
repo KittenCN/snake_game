@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--best-history-limit", type=int, default=0, help="Maximum number of best checkpoints to keep (0 disables history)")
     parser.add_argument("--best-history-dir", type=str, default=None, help="Optional directory to store best checkpoint snapshots")
     parser.add_argument("--disable-early-stop", action="store_true", help="Disable evaluation-based early stopping")
+    parser.add_argument("--disable-amp", action="store_true", help="Disable automatic mixed precision on CUDA devices")
     parser.add_argument("--disable-train-best", action="store_true", help="Disable saving checkpoints based on training performance")
     parser.add_argument("--train-best-metric", type=str, default="reward", choices=["reward", "score"], help="Metric used when saving training-best checkpoints")
     parser.add_argument("--train-best-delta", type=float, default=5.0, help="Minimum improvement required to refresh the training-best checkpoint")
@@ -139,6 +140,9 @@ def train() -> None:
     args = parse_args()
     rng = set_global_seed(args.seed)
 
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
     game_config = GameConfig(
         width=args.width,
         height=args.height,
@@ -185,6 +189,7 @@ def train() -> None:
         print(f"Resuming training from {output_path}")
         agent = DQNAgent.load(str(output_path), device=args.device)
         agent.game_config = game_config
+        agent.configure_amp(None if not args.disable_amp else False)
         if meta_path.exists():
             try:
                 with meta_path.open("r", encoding="utf-8") as meta_fp:
@@ -247,6 +252,7 @@ def train() -> None:
             game_config=game_config,
             obs_shape=obs_shape,
             network_version=args.network_version,
+            amp_enabled=None if not args.disable_amp else False,
         )
 
     if best_history_limit <= 0:

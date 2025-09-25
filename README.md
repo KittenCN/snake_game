@@ -1,31 +1,31 @@
-# Snake DQN Toolkit / Ì°³ÔÉß DQN ¹¤¾ß¼¯
+# Snake DQN Toolkit / è´ªåƒè›‡ DQN å·¥å…·é›†
 
-## Overview / ÏîÄ¿¸ÅÀÀ
+## Overview / é¡¹ç›®æ¦‚è§ˆ
 - **English:** A full reinforcement learning toolkit that pairs a feature-rich Snake environment with a PyTorch Deep Q-Network agent, supporting modern training tricks, advanced observation features, and safe inference.
-- **ÖĞÎÄ£º** ÕâÊÇÒ»¸öÍêÕûµÄÇ¿»¯Ñ§Ï°¹¤¾ß¼¯£¬½áºÏÁË¹¦ÄÜ·á¸»µÄÌ°³ÔÉß»·¾³Óë PyTorch DQN ÖÇÄÜÌå£¬ÄÚÖÃÏÖ´úÑµÁ·¼¼ÇÉ¡¢ÔöÇ¿µÄ¹Û²âÌØÕ÷ÒÔ¼°°²È«ÍÆÀí¹¦ÄÜ¡£
+- **ä¸­æ–‡ï¼š** è¿™æ˜¯ä¸€ä¸ªå®Œæ•´çš„å¼ºåŒ–å­¦ä¹ å·¥å…·é›†ï¼Œç»“åˆäº†åŠŸèƒ½ä¸°å¯Œçš„è´ªåƒè›‡ç¯å¢ƒä¸ PyTorch DQN æ™ºèƒ½ä½“ï¼Œå†…ç½®ç°ä»£è®­ç»ƒæŠ€å·§ã€å¢å¼ºçš„è§‚æµ‹ç‰¹å¾ä»¥åŠå®‰å…¨æ¨ç†åŠŸèƒ½ã€‚
 
-## Core Components / ºËĞÄ×é¼ş
+## Core Components / æ ¸å¿ƒç»„ä»¶
 1. **Environment (`env.py`)
    - **EN:** Pure-Python Snake simulator with wrap support, idle penalties, safety checks, and numpy-friendly exports.
-   - **ÖĞÎÄ£º** ´¿ Python µÄÌ°³ÔÉß»·¾³£¬Ö§³Ö´©Ç½¡¢¿ÕÏĞ³Í·£¡¢°²È«ĞĞ¶¯¼ì²â¼° numpy ¹Û²âÊä³ö¡£
+   - **ä¸­æ–‡ï¼š** çº¯ Python çš„è´ªåƒè›‡ç¯å¢ƒï¼Œæ”¯æŒç©¿å¢™ã€ç©ºé—²æƒ©ç½šã€å®‰å…¨è¡ŒåŠ¨æ£€æµ‹åŠ numpy è§‚æµ‹è¾“å‡ºã€‚
 2. **Agent (`dqn_agent.py`)
    - **EN:** Switchable CNN backbones (`--network-version`), dueling + double DQN, prioritized observation encoding, and replay experience buffer.
-   - **ÖĞÎÄ£º** ¿ÉÇĞ»»µÄ CNN Ö÷¸ÉÍøÂç£¨`--network-version`£©¡¢Ë«ÓÅÊÆ DQN¡¢Ç¿»¯µÄ¹Û²â±àÂëÒÔ¼°¾­Ñé»Ø·Å»º´æ¡£
+   - **ä¸­æ–‡ï¼š** å¯åˆ‡æ¢çš„ CNN ä¸»å¹²ç½‘ç»œï¼ˆ`--network-version`ï¼‰ã€åŒä¼˜åŠ¿ DQNã€å¼ºåŒ–çš„è§‚æµ‹ç¼–ç ä»¥åŠç»éªŒå›æ”¾ç¼“å­˜ã€‚
 3. **Training Pipeline (`train_dqn.py`)
    - **EN:** Segment logging, evaluation checkpoints, optional early stop, train-metric best snapshots, and resume/curriculum utilities.
-   - **ÖĞÎÄ£º** Ö§³Ö·Ö¶ÎÈÕÖ¾¡¢ÆÀ¹À¼ì²éµã¡¢¿ÉÑ¡ÔçÍ£¡¢»ùÓÚÑµÁ·Ö¸±êµÄ×î¼ÑÄ£ĞÍ±£´æ£¬ÒÔ¼°¶ÏµãĞøÑµÓë¿Î³ÌÊ½ÉèÖÃ¡£
+   - **ä¸­æ–‡ï¼š** æ”¯æŒåˆ†æ®µæ—¥å¿—ã€è¯„ä¼°æ£€æŸ¥ç‚¹ã€å¯é€‰æ—©åœã€åŸºäºè®­ç»ƒæŒ‡æ ‡çš„æœ€ä½³æ¨¡å‹ä¿å­˜ï¼Œä»¥åŠæ–­ç‚¹ç»­è®­ä¸è¯¾ç¨‹å¼è®¾ç½®ã€‚
 4. **Inference Runner (`play_dqn.py`)
    - **EN:** GUI / console play, deterministic or safety-checked control, supports custom devices and seeds.
-   - **ÖĞÎÄ£º** GUI »òÃüÁîĞĞÔËĞĞ£¬Ö§³Ö°²È«¿ØÖÆ»ò´¿Ì°ĞÄ²ßÂÔ£¬¿É×Ô¶¨ÒåÉè±¸ÓëËæ»úÖÖ×Ó¡£
+   - **ä¸­æ–‡ï¼š** GUI æˆ–å‘½ä»¤è¡Œè¿è¡Œï¼Œæ”¯æŒå®‰å…¨æ§åˆ¶æˆ–çº¯è´ªå¿ƒç­–ç•¥ï¼Œå¯è‡ªå®šä¹‰è®¾å¤‡ä¸éšæœºç§å­ã€‚
 
-## Installation / °²×°
+## Installation / å®‰è£…
 ```
 pip install -r requirements.txt
 ```
 - **EN:** Ensure `torch`, `numpy`, and `tkinter` (for GUI) are available in your environment.
-- **ÖĞÎÄ£º** ÇëÈ·ÈÏÔËĞĞ»·¾³ÖĞÒÑ°²×° `torch`¡¢`numpy` ºÍ `tkinter`£¨GUI Ä£Ê½ĞèÒª£©¡£
+- **ä¸­æ–‡ï¼š** è¯·ç¡®è®¤è¿è¡Œç¯å¢ƒä¸­å·²å®‰è£… `torch`ã€`numpy` å’Œ `tkinter`ï¼ˆGUI æ¨¡å¼éœ€è¦ï¼‰ã€‚
 
-## Training Workflow / ÑµÁ·Á÷³Ì
+## Training Workflow / è®­ç»ƒæµç¨‹
 ```
 python -m snake_game.train_dqn \
   --episodes 2000 \
@@ -38,27 +38,29 @@ python -m snake_game.train_dqn \
   - `--network-version`: choose the enhanced residual CNN (`2`) or the legacy CNN (`1`).
   - `--train-best-*`: toggles training-best checkpoints; model files saved as `*_best_reward.pt` or `*_best_score.pt`.
   - Evaluations run every `--eval-interval` episodes; best eval snapshot stored at `--output` and mirrored to history if enabled.
+  - Automatic mixed precision (AMP) activates on CUDA devices by default; disable with `--disable-amp` for full-precision training.
   - Logs append to `runs/train_log_<timestamp>.jsonl` for later analysis.
-- **ÖĞÎÄ£º**
-  - `--network-version`£ºÑ¡ÔñÔöÇ¿²Ğ²î CNN£¨ÖµÎª `2`£©»ò´«Í³ CNN£¨ÖµÎª `1`£©¡£
-  - `--train-best-*`£º¸ù¾İÑµÁ·Ö¸±ê±£´æ×î¼ÑÄ£ĞÍ£¬ÎÄ¼şÃûĞÎÈç `*_best_reward.pt` »ò `*_best_score.pt`¡£
-  - Ã¿¸ô `--eval-interval` ¸ö episode ½øĞĞÆÀ¹À£¬×î¼ÑÆÀ¹ÀÄ£ĞÍ±£´æÔÚ `--output` Ö¸¶¨Â·¾¶£¬²¢¿É¸´ÖÆµ½ÀúÊ·Ä¿Â¼¡£
-  - ÑµÁ·Ö¸±êÊµÊ±Ğ´Èë `runs/train_log_<timestamp>.jsonl` ±ãÓÚºóĞø·ÖÎö¡£
+- **ä¸­æ–‡ï¼š**
+  - `--network-version`ï¼šé€‰æ‹©å¢å¼ºæ®‹å·® CNNï¼ˆå€¼ä¸º `2`ï¼‰æˆ–ä¼ ç»Ÿ CNNï¼ˆå€¼ä¸º `1`ï¼‰ã€‚
+  - `--train-best-*`ï¼šæ ¹æ®è®­ç»ƒæŒ‡æ ‡ä¿å­˜æœ€ä½³æ¨¡å‹ï¼Œæ–‡ä»¶åå½¢å¦‚ `*_best_reward.pt` æˆ– `*_best_score.pt`ã€‚
+  - æ¯éš” `--eval-interval` ä¸ª episode è¿›è¡Œè¯„ä¼°ï¼Œæœ€ä½³è¯„ä¼°æ¨¡å‹ä¿å­˜åœ¨ `--output` æŒ‡å®šè·¯å¾„ï¼Œå¹¶å¯å¤åˆ¶åˆ°å†å²ç›®å½•ã€‚
+  - æ£€æµ‹åˆ° CUDA æ—¶é»˜è®¤å¼€å¯æ··åˆç²¾åº¦ (AMP)ï¼Œå¯é€šè¿‡ `--disable-amp` å…³é—­ä»¥ä½¿ç”¨å…¨ç²¾åº¦è®­ç»ƒã€‚
+  - è®­ç»ƒæŒ‡æ ‡å®æ—¶å†™å…¥ `runs/train_log_<timestamp>.jsonl` ä¾¿äºåç»­åˆ†æã€‚
 
-### Resuming / »Ö¸´ÑµÁ·
+### Resuming / æ¢å¤è®­ç»ƒ
 ```
 python -m snake_game.train_dqn --output models/dqn_snake.pt --episodes 500 --resume-best-on-decline
 ```
 - **EN:** Metadata (`.meta.json`) restores epsilon, replay progress, best metrics, and train-best checkpoints automatically.
-- **ÖĞÎÄ£º** ÔªÊı¾İÎÄ¼ş£¨`.meta.json`£©»á×Ô¶¯»Ö¸´ epsilon¡¢»Ø·Å½ø¶È¡¢×î¼ÑÆÀ¹ÀÒÔ¼°ÑµÁ·×î¼ÑÄ£ĞÍĞÅÏ¢¡£
+- **ä¸­æ–‡ï¼š** å…ƒæ•°æ®æ–‡ä»¶ï¼ˆ`.meta.json`ï¼‰ä¼šè‡ªåŠ¨æ¢å¤ epsilonã€å›æ”¾è¿›åº¦ã€æœ€ä½³è¯„ä¼°ä»¥åŠè®­ç»ƒæœ€ä½³æ¨¡å‹ä¿¡æ¯ã€‚
 
-## Evaluation & Monitoring / ÆÀ¹ÀÓë¼à¿Ø
+## Evaluation & Monitoring / è¯„ä¼°ä¸ç›‘æ§
 - **EN:** Check `runs/train_log_*.jsonl` for per-episode rewards, shaped rewards, scores, and evaluation summaries.
-- **ÖĞÎÄ£º** Í¨¹ı `runs/train_log_*.jsonl` ²é¿´Ã¿¸ö episode µÄ½±Àø¡¢ËÜĞÎ½±Àø¡¢µÃ·ÖÒÔ¼°ÆÀ¹À½á¹û¡£
+- **ä¸­æ–‡ï¼š** é€šè¿‡ `runs/train_log_*.jsonl` æŸ¥çœ‹æ¯ä¸ª episode çš„å¥–åŠ±ã€å¡‘å½¢å¥–åŠ±ã€å¾—åˆ†ä»¥åŠè¯„ä¼°ç»“æœã€‚
 - **EN:** Optional history snapshots live in `{output}_history/` when `--best-history-limit` > 0.
-- **ÖĞÎÄ£º** Èô `--best-history-limit` > 0£¬¿ÉÔÚ `{output}_history/` Ä¿Â¼ÖĞÕÒµ½ÀúÊ·×î¼ÑÄ£ĞÍ¡£
+- **ä¸­æ–‡ï¼š** è‹¥ `--best-history-limit` > 0ï¼Œå¯åœ¨ `{output}_history/` ç›®å½•ä¸­æ‰¾åˆ°å†å²æœ€ä½³æ¨¡å‹ã€‚
 
-## Inference / ÍÆÀí
+## Inference / æ¨ç†
 ```
 python -m snake_game.play_dqn --model models/dqn_snake.pt --episodes 5
 ```
@@ -66,32 +68,32 @@ python -m snake_game.play_dqn --model models/dqn_snake.pt --episodes 5
   - GUI mode is default; add `--console --render` for ASCII playback.
   - Safety fallback avoids immediate collisions; disable via `--disable-safety-check` to evaluate raw policy behaviour.
   - Use `--device cuda` to run on GPU, or set `--seed` for reproducible runs.
-- **ÖĞÎÄ£º**
-  - Ä¬ÈÏÆô¶¯ GUI£¬Ê¹ÓÃ `--console --render` ÇĞ»»ÎªÎÄ±¾Ä£Ê½¡£
-  - °²È«»ØÍË»úÖÆ¿É±ÜÃâÁ¢¼´×²Ç½»ò×Ô×²£¬¿ÉÍ¨¹ı `--disable-safety-check` ¹Ø±ÕÒÔ¹Û²ìÔ­Ê¼²ßÂÔ¡£
-  - Í¨¹ı `--device cuda` Ê¹ÓÃ GPU£¬`--seed` ±£Ö¤ÍÆÀí¿É¸´ÏÖ¡£
+- **ä¸­æ–‡ï¼š**
+  - é»˜è®¤å¯åŠ¨ GUIï¼Œä½¿ç”¨ `--console --render` åˆ‡æ¢ä¸ºæ–‡æœ¬æ¨¡å¼ã€‚
+  - å®‰å…¨å›é€€æœºåˆ¶å¯é¿å…ç«‹å³æ’å¢™æˆ–è‡ªæ’ï¼Œå¯é€šè¿‡ `--disable-safety-check` å…³é—­ä»¥è§‚å¯ŸåŸå§‹ç­–ç•¥ã€‚
+  - é€šè¿‡ `--device cuda` ä½¿ç”¨ GPUï¼Œ`--seed` ä¿è¯æ¨ç†å¯å¤ç°ã€‚
 
-## Development Notes / ¿ª·¢ËµÃ÷
+## Development Notes / å¼€å‘è¯´æ˜
 - **EN:**
   - Observation builder now augments raw grids with geometry, direction, distance, and danger maps.
   - Training loop clips gradients, supports soft/hard target updates, and logs per-segment metadata.
   - Checkpoints store network version ensuring legacy compatibility.
-- **ÖĞÎÄ£º**
-  - ¹Û²â±àÂëÔÚÔ­Ê¼Íø¸ñ»ù´¡ÉÏÔö¼ÓÁË×ø±ê¡¢·½Ïò¡¢¾àÀëÓëÎ£ÏÕÇøÓòÌØÕ÷¡£
-  - ÑµÁ·Ñ­»·°üº¬Ìİ¶È²Ã¼ô£¬Ö§³ÖÈí/Ó²Ä¿±êÍøÂç¸üĞÂ£¬²¢ÔÚÃ¿¸ö½×¶ÎĞ´ÈëÔªÊı¾İ¡£
-  - Ä£ĞÍ¼ì²éµã¼ÇÂ¼ÍøÂç°æ±¾£¬±£Ö¤¾ÉÄ£ĞÍ¿É¼ÌĞøÊ¹ÓÃ¡£
+- **ä¸­æ–‡ï¼š**
+  - è§‚æµ‹ç¼–ç åœ¨åŸå§‹ç½‘æ ¼åŸºç¡€ä¸Šå¢åŠ äº†åæ ‡ã€æ–¹å‘ã€è·ç¦»ä¸å±é™©åŒºåŸŸç‰¹å¾ã€‚
+  - è®­ç»ƒå¾ªç¯åŒ…å«æ¢¯åº¦è£å‰ªï¼Œæ”¯æŒè½¯/ç¡¬ç›®æ ‡ç½‘ç»œæ›´æ–°ï¼Œå¹¶åœ¨æ¯ä¸ªé˜¶æ®µå†™å…¥å…ƒæ•°æ®ã€‚
+  - æ¨¡å‹æ£€æŸ¥ç‚¹è®°å½•ç½‘ç»œç‰ˆæœ¬ï¼Œä¿è¯æ—§æ¨¡å‹å¯ç»§ç»­ä½¿ç”¨ã€‚
 
-## File Tree / ÎÄ¼ş½á¹¹
+## File Tree / æ–‡ä»¶ç»“æ„
 ```
-©À©¤©¤ dqn_agent.py       # DQN agent & observation utilities / DQN ÖÇÄÜÌåÓë¹Û²â¹¤¾ß
-©À©¤©¤ train_dqn.py       # Training entry / ÑµÁ·Èë¿Ú
-©À©¤©¤ play_dqn.py        # Inference runner / ÍÆÀí½Å±¾
-©À©¤©¤ env.py             # Snake environment / Ì°³ÔÉß»·¾³
-©À©¤©¤ runs/              # Training logs & metadata / ÑµÁ·ÈÕÖ¾ÓëÔªÊı¾İ
-©À©¤©¤ models/            # Saved checkpoints / Ä£ĞÍ±£´æÄ¿Â¼
-©¸©¤©¤ README.md          # Documentation / ÎÄµµ
+â”œâ”€â”€ dqn_agent.py       # DQN agent & observation utilities / DQN æ™ºèƒ½ä½“ä¸è§‚æµ‹å·¥å…·
+â”œâ”€â”€ train_dqn.py       # Training entry / è®­ç»ƒå…¥å£
+â”œâ”€â”€ play_dqn.py        # Inference runner / æ¨ç†è„šæœ¬
+â”œâ”€â”€ env.py             # Snake environment / è´ªåƒè›‡ç¯å¢ƒ
+â”œâ”€â”€ runs/              # Training logs & metadata / è®­ç»ƒæ—¥å¿—ä¸å…ƒæ•°æ®
+â”œâ”€â”€ models/            # Saved checkpoints / æ¨¡å‹ä¿å­˜ç›®å½•
+â””â”€â”€ README.md          # Documentation / æ–‡æ¡£
 ```
 
-## License / Ğí¿É
+## License / è®¸å¯
 - **EN:** Specify the intended license here (e.g., MIT).
-- **ÖĞÎÄ£º** ÔÚ´Ë´¦ÌîĞ´ÏîÄ¿µÄĞí¿ÉĞ­Òé£¨ÀıÈç MIT£©¡£
+- **ä¸­æ–‡ï¼š** åœ¨æ­¤å¤„å¡«å†™é¡¹ç›®çš„è®¸å¯åè®®ï¼ˆä¾‹å¦‚ MITï¼‰ã€‚
