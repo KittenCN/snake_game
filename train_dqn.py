@@ -432,7 +432,7 @@ def train() -> None:
                 threshold_ok = args.resume_decline_threshold <= 0.0 or decline >= args.resume_decline_threshold
                 if reload_allowed and cooldown_ok and threshold_ok:
                     try:
-                        checkpoint = torch.load(output_path, map_location=agent.device)
+                        checkpoint = torch.load(output_path, map_location=agent.device, weights_only=True)
                         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
                         agent.target_net.load_state_dict(checkpoint["target_state_dict"])
                         agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
