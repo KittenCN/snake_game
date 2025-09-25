@@ -348,7 +348,7 @@ class DQNAgent:
             enabled = False
         self.amp_enabled = bool(enabled)
         if self.amp_enabled:
-            self.grad_scaler = torch.cuda.amp.GradScaler()
+            self.grad_scaler = torch.amp.GradScaler()
         else:
             self.grad_scaler = None
 
