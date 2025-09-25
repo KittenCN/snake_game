@@ -391,7 +391,7 @@ class DQNAgent:
 
         scaler = self.grad_scaler if (self.amp_enabled and self.grad_scaler is not None) else None
 
-        with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+        with torch.amp.autocast(enabled=self.amp_enabled):
             q_values = self.policy_net(states).gather(1, actions.long()).squeeze(1)
             with torch.no_grad():
                 if self.use_double_dqn:
