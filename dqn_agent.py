@@ -82,8 +82,11 @@ class ReplayBuffer:
         self._next_action_masks: torch.Tensor | None = None
         self._priorities = torch.zeros(self.capacity, dtype=torch.float32, device="cpu")
         self._tree_capacity = 1 << (self.capacity - 1).bit_length()
+        # The tree is tiny compared with observation storage. Float64 prevents
+        # probability-mass rounding from crossing into padded leaves when the
+        # configured capacity is not a power of two.
         self._priority_tree = torch.zeros(
-            self._tree_capacity * 2, dtype=torch.float32, device="cpu"
+            self._tree_capacity * 2, dtype=torch.float64, device="cpu"
         )
         self._max_priority = 1.0
 
@@ -122,16 +125,64 @@ class ReplayBuffer:
         return torch.as_tensor(value, dtype=dtype, device="cpu").reshape(())
 
     def _set_priority(self, index: int, priority: float) -> None:
-        """Update one proportional-PER leaf and its O(log capacity) sum path."""
+        """Update one leaf and rebuild its ancestors without cumulative drift."""
+        if not math.isfinite(float(priority)):
+            raise ValueError("replay priority must be finite")
         raw_priority = max(abs(float(priority)), self.priority_epsilon)
         self._priorities[index] = raw_priority
+        raw_priority = float(self._priorities[index])
         self._max_priority = max(self._max_priority, raw_priority)
         scaled_priority = 1.0 if self.alpha == 0.0 else raw_priority**self.alpha
         tree_index = self._tree_capacity + index
-        delta = scaled_priority - float(self._priority_tree[tree_index])
+        self._priority_tree[tree_index] = scaled_priority
+        tree_index //= 2
         while tree_index:
-            self._priority_tree[tree_index] += delta
+            self._priority_tree[tree_index] = (
+                self._priority_tree[tree_index * 2]
+                + self._priority_tree[tree_index * 2 + 1]
+            )
             tree_index //= 2
+
+    def _set_priority_batch(
+        self, indices: torch.Tensor, priorities: torch.Tensor
+    ) -> None:
+        """Update sampled priorities with vectorized work at each tree level."""
+        # Sampling is with replacement. Collapse duplicate indices first so a
+        # leaf is written once; duplicate transitions have the same TD target,
+        # and keeping the largest error is the conservative PER choice.
+        if indices.numel() == 0:
+            return
+        if not bool(torch.isfinite(priorities).all()):
+            raise ValueError("replay priorities must be finite")
+        priorities = priorities.abs()
+        unique_indices, inverse = torch.unique(
+            indices, sorted=False, return_inverse=True
+        )
+        unique_priorities = torch.zeros(
+            unique_indices.numel(), dtype=torch.float32, device="cpu"
+        )
+        unique_priorities.scatter_reduce_(
+            0, inverse, priorities, reduce="amax", include_self=False
+        )
+        unique_priorities = unique_priorities.add(self.priority_epsilon)
+        self._priorities[unique_indices] = unique_priorities
+        self._max_priority = max(
+            self._max_priority, float(unique_priorities.max().item())
+        )
+
+        scaled = (
+            torch.ones_like(unique_priorities, dtype=torch.float64)
+            if self.alpha == 0.0
+            else unique_priorities.to(torch.float64).pow(self.alpha)
+        )
+        tree_indices = self._tree_capacity + unique_indices
+        self._priority_tree[tree_indices] = scaled
+        while int(tree_indices[0]) > 1:
+            parents = torch.unique(tree_indices // 2)
+            self._priority_tree[parents] = (
+                self._priority_tree[parents * 2] + self._priority_tree[parents * 2 + 1]
+            )
+            tree_indices = parents
 
     def push(
         self,
@@ -209,15 +260,29 @@ class ReplayBuffer:
         # Stratified proportional sampling keeps work O(batch * log capacity),
         # instead of rescanning all 50k+ priorities for every gradient update.
         masses = (
-            torch.arange(batch_size, dtype=torch.float32) + torch.rand(batch_size)
+            torch.arange(batch_size, dtype=torch.float64)
+            + torch.rand(batch_size, dtype=torch.float64)
         ) * (total_priority / batch_size)
+        # Guard the half-open sampling interval even if a future RNG/backend
+        # rounds the final stratified mass up to the root sum.
+        upper_bound = torch.nextafter(
+            torch.tensor(total_priority, dtype=torch.float64),
+            torch.tensor(-math.inf, dtype=torch.float64),
+        )
+        masses.clamp_max_(upper_bound)
         tree_indices = torch.ones(batch_size, dtype=torch.long)
         while int(tree_indices[0]) < self._tree_capacity:
             left = tree_indices * 2
             left_sums = self._priority_tree[left]
-            go_right = masses >= left_sums
+            right_sums = self._priority_tree[left + 1]
+            go_right = (masses >= left_sums) & (right_sums > 0.0)
             masses = torch.where(go_right, masses - left_sums, masses)
             tree_indices = left + go_right.to(torch.long)
+            selected_sums = torch.where(go_right, right_sums, left_sums)
+            selected_upper_bounds = torch.nextafter(
+                selected_sums, torch.full_like(selected_sums, -math.inf)
+            )
+            masses = torch.minimum(masses, selected_upper_bounds)
         indices_cpu = tree_indices - self._tree_capacity
         if bool((indices_cpu >= self._size).any()):
             raise RuntimeError("priority tree selected an uninitialized replay slot")
@@ -249,7 +314,9 @@ class ReplayBuffer:
             discounts=self._discounts[indices_cpu].to(
                 self.device, non_blocking=non_blocking
             ),
-            weights=weights.to(self.device, non_blocking=non_blocking),
+            weights=weights.to(
+                self.device, dtype=torch.float32, non_blocking=non_blocking
+            ),
             indices=indices_cpu,
             next_action_masks=masks,
         )
@@ -267,8 +334,7 @@ class ReplayBuffer:
             raise ValueError("indices and priorities must have the same length")
         if bool((indices_cpu < 0).any()) or bool((indices_cpu >= self._size).any()):
             raise IndexError("replay priority index out of range")
-        for index, priority in zip(indices_cpu.tolist(), priorities_cpu.tolist()):
-            self._set_priority(index, abs(priority) + self.priority_epsilon)
+        self._set_priority_batch(indices_cpu, priorities_cpu)
 
 
 class BaselineConvDuelingQNetwork(nn.Module):

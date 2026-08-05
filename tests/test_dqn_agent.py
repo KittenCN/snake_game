@@ -155,6 +155,64 @@ def test_priority_tree_tracks_ring_overwrites_without_sampling_empty_slots() -> 
         assert int(replay.sample(1).indices.item()) < 3
 
 
+def test_priority_tree_rebuilds_ancestors_without_update_drift() -> None:
+    replay = ReplayBuffer(100, torch.device("cpu"), action_dim=3, alpha=0.6)
+    state = torch.zeros((1, 1, 1))
+    for _ in range(33):
+        replay.push(state, 0, 0.0, state, False)
+
+    indices = torch.arange(64) % 33
+    for step in range(100):
+        priorities = torch.linspace(0.01, 10.0, 64).roll(step % 64)
+        replay.update_priorities(indices, priorities)
+
+    expected = replay._priorities[:33].to(torch.float64).pow(replay.alpha).sum()
+    assert replay._priority_tree.dtype == torch.float64
+    assert replay._priority_tree[1] == pytest.approx(expected.item(), abs=1e-12)
+    assert replay._priority_tree[1] == pytest.approx(
+        (replay._priority_tree[2] + replay._priority_tree[3]).item(), abs=1e-12
+    )
+
+
+def test_priority_sampling_clamps_mass_below_padded_tree_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay = ReplayBuffer(127, torch.device("cpu"), action_dim=3, alpha=0.6)
+    state = torch.zeros((1, 1, 1))
+    for _ in range(127):
+        replay.push(state, 0, 0.0, state, False)
+    replay.update_priorities(torch.arange(127), torch.linspace(0.01, 20.0, 127))
+
+    def upper_boundary_rand(
+        *size: int, dtype: torch.dtype, **_: object
+    ) -> torch.Tensor:
+        return torch.ones(size, dtype=dtype)
+
+    monkeypatch.setattr(torch, "rand", upper_boundary_rand)
+    batch = replay.sample(32)
+    assert bool((batch.indices < len(replay)).all())
+    assert torch.isfinite(batch.weights).all()
+
+
+def test_priority_batch_uses_largest_absolute_duplicate_and_allows_empty() -> None:
+    replay = ReplayBuffer(4, torch.device("cpu"), action_dim=2)
+    state = torch.zeros((1, 1, 1))
+    replay.push(state, 0, 0.0, state, False)
+    replay.update_priorities([0, 0], [-10.0, 2.0])
+    assert replay._priorities[0] == pytest.approx(10.0 + replay.priority_epsilon)
+    root_before = replay._priority_tree[1].item()
+    replay.update_priorities([], [])
+    assert replay._priority_tree[1].item() == root_before
+
+
+def test_priority_tree_rejects_non_finite_updates() -> None:
+    replay = ReplayBuffer(4, torch.device("cpu"), action_dim=2)
+    state = torch.zeros((1, 1, 1))
+    replay.push(state, 0, 0.0, state, False)
+    with pytest.raises(ValueError, match="finite"):
+        replay.update_priorities([0], [float("nan")])
+
+
 def test_double_dqn_target_masks_illegal_actions() -> None:
     agent = make_agent(
         gamma=1.0,
