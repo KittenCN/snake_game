@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snake-dqn-toolkit"
+version = "0.3.0"
+description = "A reproducible DQN training toolkit for Snake"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24,<3",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
+
+[project.scripts]
+snake-train = "snake_game.train_dqn:train"
+snake-play = "snake_game.play_dqn:main"
+snake-analyze = "snake_game.analyze_training:main"
+snake-gui = "snake_game.gui:main"
+
+[tool.setuptools]
+packages = ["snake_game"]
+package-dir = {snake_game = "."}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

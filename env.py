@@ -1,10 +1,13 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import random
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    import numpy
 
 
 GridPosition = Tuple[int, int]
@@ -33,6 +36,40 @@ class Action(IntEnum):
         return tuple(cls)
 
 
+class RelativeAction(IntEnum):
+    """Actions expressed relative to the snake's current heading."""
+
+    STRAIGHT = 0
+    LEFT = 1
+    RIGHT = 2
+
+
+def relative_to_absolute(
+    direction: Union[int, Action], relative_action: Union[int, RelativeAction]
+) -> Action:
+    """Convert a relative action into an absolute board direction."""
+
+    try:
+        absolute_direction = (
+            direction if isinstance(direction, Action) else Action(direction)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid direction: {direction}") from exc
+    try:
+        relative = (
+            relative_action
+            if isinstance(relative_action, RelativeAction)
+            else RelativeAction(relative_action)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid relative action: {relative_action}") from exc
+
+    if relative is RelativeAction.STRAIGHT:
+        return absolute_direction
+    turn = -1 if relative is RelativeAction.LEFT else 1
+    return Action((int(absolute_direction) + turn) % len(Action))
+
+
 @dataclass
 class GameConfig:
     """Configuration options for the snake environment."""
@@ -47,16 +84,22 @@ class GameConfig:
     seed: Optional[int] = None
     max_idle_steps: int = 0
     idle_penalty: float = -1.0
+    idle_growth_per_food: int = 2
+    max_episode_steps: int = 0
 
     def validate(self) -> None:
         if self.width <= 2 or self.height <= 2:
             raise ValueError("Grid must be at least 3x3 to allow movement.")
-        if not (1 <= self.initial_length < min(self.width, self.height)):
+        if not (1 <= self.initial_length < self.width):
             raise ValueError(
-                "initial_length must be at least 1 and smaller than the grid dimensions."
+                "initial_length must be at least 1 and smaller than the grid width."
             )
         if self.max_idle_steps < 0:
             raise ValueError("max_idle_steps must be non-negative")
+        if self.idle_growth_per_food < 0:
+            raise ValueError("idle_growth_per_food must be non-negative")
+        if self.max_episode_steps < 0:
+            raise ValueError("max_episode_steps must be non-negative")
 
 
 class SnakeGameEnv:
@@ -90,8 +133,6 @@ class SnakeGameEnv:
         """Reset the environment and return the initial observation."""
         if seed is not None:
             self._rng.seed(seed)
-        elif self.config.seed is not None:
-            self._rng.seed(self.config.seed)
 
         self._snake.clear()
         self._occupied.clear()
@@ -101,7 +142,9 @@ class SnakeGameEnv:
         self._direction = Action.RIGHT
         self._steps_since_food = 0
 
-        start_x = self.config.width // 2
+        # Shift right only when a long configured body would otherwise start
+        # outside the board; ordinary games retain the traditional centre start.
+        start_x = max(self.config.width // 2, self.config.initial_length - 1)
         start_y = self.config.height // 2
         for offset in range(self.config.initial_length):
             segment = (start_x - offset, start_y)
@@ -109,22 +152,29 @@ class SnakeGameEnv:
             self._occupied.add(segment)
 
         self._spawn_food()
+        self.validate_state_invariants()
         return self._observation()
 
-    def step(self, action: Union[int, Action]) -> Tuple[Dict[str, object], float, bool, Dict[str, object]]:
+    def step(
+        self, action: Union[int, Action]
+    ) -> Tuple[Dict[str, object], float, bool, Dict[str, object]]:
         """Advance the environment by one step of the given action."""
         if self._done:
             raise RuntimeError("Episode finished. Call reset() before stepping again.")
 
-        action = self._sanitize_action(action)
-        if not self._is_opposite(action):
-            self._direction = action
+        requested_action = self._sanitize_action(action)
+        if not self._is_opposite(requested_action):
+            self._direction = requested_action
+        executed_action = self._direction
 
-        next_head = self._next_head_position(self._direction)
+        next_head = self._next_head_position(executed_action)
         self._steps += 1
 
         reward = self.config.reward_step
-        info: Dict[str, object] = {}
+        info: Dict[str, object] = {
+            "requested_action": requested_action,
+            "executed_action": executed_action,
+        }
 
         if not self.config.allow_wrap and self._is_out_of_bounds(next_head):
             self._done = True
@@ -138,13 +188,20 @@ class SnakeGameEnv:
                 next_head[1] % self.config.height,
             )
 
-        if next_head in self._occupied and next_head != self._snake[-1]:
+        grew = next_head == self._food
+        tail = self._snake[-1]
+        can_enter_vacating_tail = not grew and next_head == tail
+        if next_head in self._occupied and not can_enter_vacating_tail:
             self._done = True
             reward = self.config.reward_death
             info["event"] = "hit_self"
             return self._observation(), reward, self._done, info
 
-        grew = next_head == self._food
+        if not grew:
+            removed_tail = self._snake.pop()
+            self._occupied.remove(removed_tail)
+            self._steps_since_food += 1
+
         self._snake.appendleft(next_head)
         self._occupied.add(next_head)
 
@@ -154,16 +211,8 @@ class SnakeGameEnv:
             info["event"] = "ate_food"
             self._spawn_food()
             self._steps_since_food = 0
-        else:
-            tail = self._snake.pop()
-            if tail in self._occupied:
-                self._occupied.remove(tail)
-            else:
-                # Rare desync guard: rebuild occupied cells to the current snake body.
-                self._occupied = set(self._snake)
-            self._steps_since_food += 1
 
-        if self.config.max_idle_steps > 0 and self._steps_since_food >= self.config.max_idle_steps:
+        if self.idle_limit > 0 and self._steps_since_food >= self.idle_limit:
             self._done = True
             reward += self.config.idle_penalty
             info["event"] = "idle_timeout"
@@ -172,6 +221,13 @@ class SnakeGameEnv:
         if self._food is None:
             self._done = True
             info["event"] = "win"
+        elif (
+            self.config.max_episode_steps > 0
+            and self._steps >= self.config.max_episode_steps
+        ):
+            self._done = True
+            info["event"] = "time_limit"
+            info["truncated"] = True
 
         return self._observation(), reward, self._done, info
 
@@ -203,14 +259,40 @@ class SnakeGameEnv:
         return self._steps_since_food
 
     @property
+    def idle_limit(self) -> int:
+        if self.config.max_idle_steps <= 0:
+            return 0
+        return (
+            self.config.max_idle_steps + self._score * self.config.idle_growth_per_food
+        )
+
+    @property
     def done(self) -> bool:
         return self._done
 
     def legal_actions(self) -> Tuple[Action, ...]:
-        return tuple(action for action in Action if action != self._OPPOSITE[self._direction])
+        return tuple(
+            action for action in Action if action != self._OPPOSITE[self._direction]
+        )
 
     def sample_action(self) -> Action:
         return self._rng.choice(self.legal_actions())
+
+    def step_relative(
+        self, action: Union[int, RelativeAction]
+    ) -> Tuple[Dict[str, object], float, bool, Dict[str, object]]:
+        """Advance one step using a relative straight/left/right action."""
+
+        try:
+            relative = (
+                action if isinstance(action, RelativeAction) else RelativeAction(action)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid relative action: {action}") from exc
+        absolute = relative_to_absolute(self._direction, relative)
+        observation, reward, done, info = self.step(absolute)
+        info["requested_relative_action"] = relative
+        return observation, reward, done, info
 
     def is_safe_action(self, action: Union[int, Action]) -> bool:
         candidate = self._sanitize_action(action)
@@ -225,7 +307,11 @@ class SnakeGameEnv:
         else:
             if self._is_out_of_bounds((nx, ny)):
                 return False
-        target = (nx % self.config.width, ny % self.config.height) if self.config.allow_wrap else (nx, ny)
+        target = (
+            (nx % self.config.width, ny % self.config.height)
+            if self.config.allow_wrap
+            else (nx, ny)
+        )
         tail = self._snake[-1] if self._snake else None
         if tail is not None and target == tail and target != self._food:
             return True
@@ -234,7 +320,7 @@ class SnakeGameEnv:
     def observation_shape(self) -> Tuple[int, int, int]:
         return (self.config.height, self.config.width, 3)
 
-    def as_numpy(self) -> "numpy.ndarray":  # type: ignore[name-defined]
+    def as_numpy(self) -> "numpy.ndarray":
         try:
             import numpy as np
         except ImportError as exc:  # pragma: no cover
@@ -282,6 +368,29 @@ class SnakeGameEnv:
     def observation(self) -> Dict[str, object]:
         return self._observation()
 
+    def validate_state_invariants(self) -> None:
+        """Raise ``RuntimeError`` when the internal board state is inconsistent."""
+
+        snake_cells = list(self._snake)
+        snake_set = set(snake_cells)
+        errors: List[str] = []
+        if not snake_cells:
+            errors.append("snake is empty")
+        if len(snake_cells) != len(snake_set):
+            errors.append("snake contains duplicate cells")
+        if snake_set != self._occupied:
+            errors.append("occupied cells do not match snake cells")
+        out_of_bounds = [cell for cell in snake_cells if self._is_out_of_bounds(cell)]
+        if out_of_bounds:
+            errors.append(f"snake contains out-of-bounds cells: {out_of_bounds}")
+        if self._food is not None:
+            if self._is_out_of_bounds(self._food):
+                errors.append(f"food is out of bounds: {self._food}")
+            if self._food in snake_set:
+                errors.append(f"food overlaps snake: {self._food}")
+        if errors:
+            raise RuntimeError("Invalid snake environment state: " + "; ".join(errors))
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -296,6 +405,8 @@ class SnakeGameEnv:
             "width": self.config.width,
             "height": self.config.height,
             "steps_since_food": self._steps_since_food,
+            "idle_limit": self.idle_limit,
+            "max_episode_steps": self.config.max_episode_steps,
         }
 
     def _spawn_food(self) -> None:
@@ -331,5 +442,10 @@ class SnakeGameEnv:
         return not (0 <= x < self.config.width and 0 <= y < self.config.height)
 
 
-__all__ = ["Action", "GameConfig", "SnakeGameEnv"]
-
+__all__ = [
+    "Action",
+    "RelativeAction",
+    "relative_to_absolute",
+    "GameConfig",
+    "SnakeGameEnv",
+]

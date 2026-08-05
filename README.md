@@ -1,99 +1,165 @@
-# Snake DQN Toolkit / 贪吃蛇 DQN 工具集
+# Snake DQN Toolkit / 贪吃蛇 DQN 训练工具集
 
-## Overview / 项目概览
-- **English:** A full reinforcement learning toolkit that pairs a feature-rich Snake environment with a PyTorch Deep Q-Network agent, supporting modern training tricks, advanced observation features, and safe inference.
-- **中文：** 这是一个完整的强化学习工具集，结合了功能丰富的贪吃蛇环境与 PyTorch DQN 智能体，内置现代训练技巧、增强的观测特征以及安全推理功能。
+这是一个基于 PyTorch 的贪吃蛇强化学习项目，包含游戏环境、DQN 训练、固定种子评估、
+断点恢复、GUI/控制台推理和 JSONL 训练诊断工具。
 
-## Core Components / 核心组件
-1. **Environment (`env.py`)
-   - **EN:** Pure-Python Snake simulator with wrap support, idle penalties, safety checks, and numpy-friendly exports.
-   - **中文：** 纯 Python 的贪吃蛇环境，支持穿墙、空闲惩罚、安全行动检测及 numpy 观测输出。
-2. **Agent (`dqn_agent.py`)
-   - **EN:** Switchable CNN backbones (`--network-version`), dueling + double DQN, prioritized observation encoding, and replay experience buffer.
-   - **中文：** 可切换的 CNN 主干网络（`--network-version`）、双优势 DQN、强化的观测编码以及经验回放缓存。
-3. **Training Pipeline (`train_dqn.py`)
-   - **EN:** Segment logging, evaluation checkpoints, optional early stop, train-metric best snapshots, and resume/curriculum utilities.
-   - **中文：** 支持分段日志、评估检查点、可选早停、基于训练指标的最佳模型保存，以及断点续训与课程式设置。
-4. **Inference Runner (`play_dqn.py`)
-   - **EN:** GUI / console play, deterministic or safety-checked control, supports custom devices and seeds.
-   - **中文：** GUI 或命令行运行，支持安全控制或纯贪心策略，可自定义设备与随机种子。
+当前训练主线是 checkpoint `network_version=3`。旧版 v1/v2 权重仍可加载和播放，但新训练
+不会再把旧的 best 权重当成 latest 状态静默恢复。
 
-## Installation / 安装
-```
-pip install -r requirements.txt
-```
-- **EN:** Ensure `torch`, `numpy`, and `tkinter` (for GUI) are available in your environment.
-- **中文：** 请确认运行环境中已安装 `torch`、`numpy` 和 `tkinter`（GUI 模式需要）。
+## 本次平台期诊断
 
-## Training Workflow / 训练流程
-```
-python -m snake_game.train_dqn \
-  --episodes 2000 \
-  --width 12 --height 12 \
-  --network-version 2 \
-  --train-best-metric reward \
-  --log-dir runs
-```
-- **EN:**
-  - `--network-version`: choose the enhanced residual CNN (`2`) or the legacy CNN (`1`).
-  - `--train-best-*`: toggles training-best checkpoints; model files saved as `*_best_reward.pt` or `*_best_score.pt`.
-  - Evaluations run every `--eval-interval` episodes; best eval snapshot stored at `--output` and mirrored to history if enabled.
-  - Automatic mixed precision (AMP) activates on CUDA devices by default; disable with `--disable-amp` for full-precision training.
-  - Logs append to `runs/train_log_<timestamp>.jsonl` for later analysis.
-- **中文：**
-  - `--network-version`：选择增强残差 CNN（值为 `2`）或传统 CNN（值为 `1`）。
-  - `--train-best-*`：根据训练指标保存最佳模型，文件名形如 `*_best_reward.pt` 或 `*_best_score.pt`。
-  - 每隔 `--eval-interval` 个 episode 进行评估，最佳评估模型保存在 `--output` 指定路径，并可复制到历史目录。
-  - 检测到 CUDA 时默认开启混合精度 (AMP)，可通过 `--disable-amp` 关闭以使用全精度训练。
-  - 训练指标实时写入 `runs/train_log_<timestamp>.jsonl` 便于后续分析。
+仓库中现有 61,508 条训练记录表明，最近 5,000 回合平均分约为 19.44，最近 1,000 回合
+相对前一窗口没有提升；epsilon 在第 272 回合已经到达 0.01。长期继续原循环无法可靠改善。
 
-### Resuming / 恢复训练
-```
-python -m snake_game.train_dqn --output models/dqn_snake.pt --episodes 500 --resume-best-on-decline
-```
-- **EN:** Metadata (`.meta.json`) restores epsilon, replay progress, best metrics, and train-best checkpoints automatically.
-- **中文：** 元数据文件（`.meta.json`）会自动恢复 epsilon、回放进度、最佳评估以及训练最佳模型信息。
+定位到的根因不是单纯“网络不够大”，而是多项问题叠加：
 
-## Evaluation & Monitoring / 评估与监控
-- **EN:** Check `runs/train_log_*.jsonl` for per-episode rewards, shaped rewards, scores, and evaluation summaries.
-- **中文：** 通过 `runs/train_log_*.jsonl` 查看每个 episode 的奖励、塑形奖励、得分以及评估结果。
-- **EN:** Optional history snapshots live in `{output}_history/` when `--best-history-limit` > 0.
-- **中文：** 若 `--best-history-limit` > 0，可在 `{output}_history/` 目录中找到历史最佳模型。
+- 头进入即将腾空的尾格时，旧环境会把新头从 `_occupied` 删除，污染长蛇状态；
+- 反向绝对动作实际执行为直行，却以反向动作标签写入 replay；
+- epsilon 约 1,500 次更新后就降至 0.01；
+- v2 行为和评估期间 Dropout/BatchNorm 仍处于训练模式；
+- soft target update 不同步 BatchNorm buffers；
+- `resume_best_on_decline` 形成周期性旧模型回滚；
+- best/latest checkpoint 混用，外部 metadata 与实际权重版本已经不一致；
+- replay 由大量常驻 CUDA tensor 组成，v2 默认容量的裸数据需要数 GiB；
+- 观测缺少尾部和身体顺序，不同长蛇状态可能得到同一输入；
+- 固定 idle 上限和 500 步硬截断会切断表现最好的长蛇轨迹。
 
-## Inference / 推理
-```
-python -m snake_game.play_dqn --model models/dqn_snake.pt --episodes 5
-```
-- **EN:**
-  - GUI mode is default; add `--console --render` for ASCII playback.
-  - Safety fallback avoids immediate collisions; disable via `--disable-safety-check` to evaluate raw policy behaviour.
-  - Use `--device cuda` to run on GPU, or set `--seed` for reproducible runs.
-- **中文：**
-  - 默认启动 GUI，使用 `--console --render` 切换为文本模式。
-  - 安全回退机制可避免立即撞墙或自撞，可通过 `--disable-safety-check` 关闭以观察原始策略。
-  - 通过 `--device cuda` 使用 GPU，`--seed` 保证推理可复现。
+详细证据和验收标准见 [docs/TRAINING_OPTIMIZATION.md](docs/TRAINING_OPTIMIZATION.md)。
 
-## Development Notes / 开发说明
-- **EN:**
-  - Observation builder now augments raw grids with geometry, direction, distance, and danger maps.
-  - Training loop clips gradients, supports soft/hard target updates, and logs per-segment metadata.
-  - Checkpoints store network version ensuring legacy compatibility.
-- **中文：**
-  - 观测编码在原始网格基础上增加了坐标、方向、距离与危险区域特征。
-  - 训练循环包含梯度裁剪，支持软/硬目标网络更新，并在每个阶段写入元数据。
-  - 模型检查点记录网络版本，保证旧模型可继续使用。
+## v3 改进
 
-## File Tree / 文件结构
-```
-├── dqn_agent.py       # DQN agent & observation utilities / DQN 智能体与观测工具
-├── train_dqn.py       # Training entry / 训练入口
-├── play_dqn.py        # Inference runner / 推理脚本
-├── env.py             # Snake environment / 贪吃蛇环境
-├── runs/              # Training logs & metadata / 训练日志与元数据
-├── models/            # Saved checkpoints / 模型保存目录
-└── README.md          # Documentation / 文档
+- 三个相对动作：直行、左转、右转，消除反向动作别名；
+- 观测增加 tail mask、从头到尾的 body-order channel 和有限时域进度；
+- 使用 GroupNorm residual CNN，无 BatchNorm running stats 和 Dropout；
+- 3×3 spatial head 保留空间布局，不再只做全局平均池化；
+- CPU float16 预分配 ring replay，采样时才传入训练设备；
+- 基于 sum-tree 的 O(log N) Prioritized Experience Replay、importance weights 和 3-step return；
+- epsilon 按真实行为步数线性衰减，默认 250,000 步从 1.0 到 0.05；
+- resume 因 replay 不落盘而显式将 epsilon 回热到默认 0.25；
+- potential-based shaping 同时考虑食物距离、可达空间和尾部连通；
+- idle 预算随已吃食物数量增长，默认 `90 + 2 * score`；
+- 训练截断会以 terminal transition 写入 replay，不再跨 reset bootstrap；
+- 固定评估 seed suite，记录均值、标准差、中位数、P10/P90 与终止原因；
+- 默认使用确定性后端算法；可用 `--allow-nondeterministic` 显式换取吞吐；
+- `latest` 与 `best_eval` 分离、原子保存，并用 SHA-256 将 latest、best 及 sidecar 串成可验证身份；
+- 保存 optimizer、AMP scaler、Python/NumPy/Torch RNG 和探索进度；
+- replay 不写入 checkpoint，metadata 会明确标记 `replay_restored=false`。
+
+## 安装
+
+推荐 Python 3.10–3.12：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
 ```
 
-## License / 许可
-- **EN:** Specify the intended license here (e.g., MIT).
-- **中文：** 在此处填写项目的许可协议（例如 MIT）。
+只运行程序可安装 `requirements.txt`；开发和测试使用 `requirements-dev.txt`。
+
+## 开始新的 v3 训练
+
+```powershell
+python train_dqn.py `
+  --episodes 10000 `
+  --width 12 --height 12 `
+  --device cuda
+```
+
+关键默认输出：
+
+- `models/dqn_snake_v3_latest.pt`：每次评估/检查点更新，可用于恢复；
+- `models/dqn_snake_v3_best.pt`：只在固定评估集的原始策略平均分提升时更新（不使用安全回退）；
+- 对应 `.meta.json`：记录 checkpoint SHA-256、episode、架构和训练配置；
+- `runs/train_log_<timestamp>.jsonl`：逐回合指标与评估分布。
+
+若机器没有 CUDA，省略 `--device cuda`，程序会自动使用 CPU。
+
+## 恢复训练
+
+默认情况下，只要 `models/dqn_snake_v3_latest.pt` 存在，同一命令会从 latest 恢复：
+
+```powershell
+python train_dqn.py --episodes 5000
+```
+
+也可显式指定：
+
+```powershell
+python train_dqn.py `
+  --resume-from models/dqn_snake_v3_latest.pt `
+  --episodes 5000
+```
+
+使用 `--fresh` 强制开始新模型。若目标路径已有文件，程序会拒绝混写；确认要替换这些精确
+输出时需同时使用 `--overwrite-fresh-output`。恢复时会校验 sidecar SHA-256、完整环境配置、
+固定评估种子/规模以及 best 文件身份，避免再次出现“旧 best 权重 + 新 episode metadata”的
+伪恢复。要有意改变评估基线时使用 `--reset-best-evaluation`。
+
+旧 v1/v2 checkpoint 仅建议用于推理。如果确实需要作为 warm start，必须显式传入
+`--resume-from`、`--ignore-resume-metadata`，并为 `--latest-output`、`--output` 指定不含
+`v3` 的独立文件名。若奖励、wrap、idle 或时域等环境配置也变化，还必须显式使用
+`--allow-environment-change`；这样仍会沿用旧观测和四动作网络，不能获得 v3 的观测与架构优势。
+
+## 推理
+
+GUI：
+
+```powershell
+python play_dqn.py --model models/dqn_snake_v3_best.pt --episodes 5
+```
+
+控制台：
+
+```powershell
+python play_dqn.py `
+  --model models/dqn_snake_v3_best.pt `
+  --console --render --episodes 5 --seed 42
+```
+
+默认安全回退会避开立即碰撞；`--disable-safety-check` 用于评估原始策略。固定 seed 现在会
+产生可复现但连续不同的多局序列，不再每局重播完全相同的食物顺序。
+
+## 分析训练日志
+
+```powershell
+python analyze_training.py "runs/train_log_*.jsonl"
+python analyze_training.py "runs/train_log_*.jsonl" --json
+```
+
+工具会报告全局及最近 100/1,000/5,000 回合指标、best/last evaluation、epsilon floor、
+loss、终止事件和分数/蛇长分桶。平台期判断是诊断启发式，不是统计学证明。
+
+## 测试
+
+```powershell
+python -m pytest -q
+python -m ruff check .
+```
+
+测试覆盖环境状态不变量、尾格移动、随机多 seed、相对动作、动态 idle、seed 序列、PER、
+n-step、epsilon、action mask、target buffer 同步、旧 checkpoint、tail/body-order 观测、
+固定评估、有限时域、checkpoint 身份校验、防止 fresh 混写和短训练闭环。GitHub Actions
+会运行同样的 pytest 门槛。
+
+## 文件结构
+
+```text
+env.py                         游戏环境与相对动作
+dqn_agent.py                   v1/v2/v3 网络、replay 与 DQN agent
+train_dqn.py                   训练、评估、latest/best checkpoint
+play_dqn.py                    GUI/控制台模型推理
+analyze_training.py            JSONL 日志诊断
+gui.py / cli.py / __main__.py  人工与随机策略入口
+tests/                         回归和训练管线测试
+docs/TRAINING_OPTIMIZATION.md  平台期证据与架构方案
+HISTORY.md                     变更历史
+```
+
+`models/`、`runs/` 与 Python 缓存不会提交到 Git。默认不会清理或覆盖已有本地模型和日志；
+只有显式 `--overwrite-fresh-output` 会删除两个指定输出及其 sidecar。v3 使用新的默认文件名。
+
+## License
+
+仓库目前尚未声明开源许可证；在许可证明确前，请勿假定拥有再分发授权。
