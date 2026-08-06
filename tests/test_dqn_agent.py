@@ -384,3 +384,23 @@ def test_checkpoint_is_atomic_and_restores_exploration_state(tmp_path: Path) -> 
     assert loaded.behavior_steps == 3
     assert loaded.epsilon == pytest.approx(agent.epsilon)
     assert loaded.replay_restored is False
+
+
+def test_checkpoint_uses_portable_numpy_rng_state_and_restores_sequence(
+    tmp_path: Path,
+) -> None:
+    agent = make_agent()
+    path = tmp_path / "portable_rng.pt"
+    np.random.seed(12345)
+    agent.save(str(path))
+    expected = np.random.random(8)
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    serialized_state = checkpoint["rng_state"]["numpy"]["state"]
+    assert isinstance(serialized_state, list)
+    assert serialized_state
+    assert all(type(value) is int for value in serialized_state)
+
+    np.random.seed(999)
+    DQNAgent.load(str(path), device="cpu")
+    assert np.array_equal(np.random.random(8), expected)
