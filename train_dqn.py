@@ -18,9 +18,10 @@ import sys
 import tempfile
 import time
 from collections import Counter, deque
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -37,6 +38,18 @@ except ImportError:
 
 CHECKPOINT_FORMAT = 3
 V3_OBSERVATION_CHANNELS = 20
+
+
+def _same_artifact(first: Path, second: Path) -> bool:
+    """Compare future paths and existing hard links as the same artifact."""
+    if first.resolve() == second.resolve():
+        return True
+    if first.exists() and second.exists():
+        try:
+            return first.samefile(second)
+        except OSError:
+            return False
+    return False
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -128,8 +141,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--network-version", type=int, choices=[1, 2, 3], default=3)
     parser.add_argument("--output", default="models/dqn_snake_v3_best.pt")
     parser.add_argument("--latest-output", default="models/dqn_snake_v3_latest.pt")
-    parser.add_argument("--resume-from", default=None)
-    parser.add_argument(
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume-from", default=None)
+    initialization.add_argument(
+        "--warm-start-from",
+        default=None,
+        help="Initialize a fresh run from policy weights in an existing checkpoint",
+    )
+    initialization.add_argument(
         "--fresh", action="store_true", help="Ignore an existing latest checkpoint"
     )
     parser.add_argument(
@@ -148,9 +167,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Explicitly allow a missing or mismatched resume sidecar",
     )
     parser.add_argument(
+        "--ignore-warm-start-metadata",
+        action="store_true",
+        help=(
+            "Explicitly allow a missing, invalid, or mismatched warm-start source "
+            "sidecar (for intentional legacy sources only)"
+        ),
+    )
+    parser.add_argument(
         "--allow-environment-change",
         action="store_true",
-        help="Allow an intentional MDP/config change while warm-starting weights",
+        help="Allow an intentional MDP/config change while resuming full state",
     )
     parser.add_argument(
         "--allow-seed-change",
@@ -186,8 +213,49 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("num-envs and rollout-steps must be positive")
     if args.updates_per_collection < 0:
         parser.error("updates-per-collection must be non-negative")
-    if Path(args.output).resolve() == Path(args.latest_output).resolve():
-        parser.error("--output and --latest-output must be different paths")
+    output_artifacts = (
+        ("--output", Path(args.output)),
+        ("--output sidecar", sidecar_path(Path(args.output))),
+        ("--latest-output", Path(args.latest_output)),
+        ("--latest-output sidecar", sidecar_path(Path(args.latest_output))),
+    )
+    for index, (first_label, first_path) in enumerate(output_artifacts):
+        for second_label, second_path in output_artifacts[index + 1 :]:
+            if _same_artifact(first_path, second_path):
+                parser.error(
+                    f"{first_label} and {second_label} must be distinct artifacts"
+                )
+    explicit_source = args.warm_start_from or args.resume_from
+    if explicit_source is not None and not Path(explicit_source).is_file():
+        parser.error(f"Checkpoint not found: {explicit_source}")
+    if args.warm_start_from is not None:
+        source = Path(args.warm_start_from).resolve()
+        source_artifacts = (
+            ("--warm-start-from", source),
+            ("warm-start sidecar", sidecar_path(source)),
+        )
+        for source_label, source_path in source_artifacts:
+            for output_label, output_path in output_artifacts:
+                if _same_artifact(source_path, output_path):
+                    parser.error(
+                        f"{source_label} must differ from {output_label} to preserve "
+                        "the source checkpoint and metadata"
+                    )
+        resume_only = {
+            "--reset-best-evaluation",
+            "--ignore-resume-metadata",
+            "--allow-environment-change",
+            "--allow-seed-change",
+            "--resume-epsilon",
+        }
+        invalid_options = sorted(resume_only.intersection(args._provided_options))
+        if invalid_options:
+            parser.error(
+                "Warm start does not accept resume-only options: "
+                + ", ".join(invalid_options)
+            )
+    elif "--ignore-warm-start-metadata" in args._provided_options:
+        parser.error("--ignore-warm-start-metadata requires --warm-start-from")
     if args.resume_best_on_decline:
         print(
             "Warning: --resume-best-on-decline is retired; no model rollback will occur."
@@ -462,6 +530,7 @@ def save_checkpoint(
     checkpoint_role: str,
     best_checkpoint_path: Path | None = None,
     episodes_started: int | None = None,
+    warm_start_provenance: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     agent.save(str(path))
@@ -503,6 +572,7 @@ def save_checkpoint(
         "game_config": asdict(agent.game_config) if agent.game_config else None,
         "effective_agent_config": effective_agent_config(agent),
         "train_args": vars(train_args),
+        "warm_start_provenance": warm_start_provenance,
     }
     _atomic_json(sidecar_path(path), payload)
 
@@ -514,7 +584,7 @@ def load_resume_metadata(path: Path, *, ignore_mismatch: bool) -> dict[str, Any]
             return {}
         raise RuntimeError(
             f"Resume metadata is missing: {meta_path}. Use --ignore-resume-metadata "
-            "only for an intentional legacy warm start."
+            "only for an intentional legacy resume."
         )
     with meta_path.open("r", encoding="utf-8-sig") as stream:
         metadata = json.load(stream)
@@ -524,9 +594,75 @@ def load_resume_metadata(path: Path, *, ignore_mismatch: bool) -> dict[str, Any]
         message = f"Checkpoint/metadata mismatch for {path}: expected SHA-256 {expected}, got {actual}."
         if not ignore_mismatch:
             raise RuntimeError(message + " Refusing a silent stale-best resume.")
-        print("Warning:", message, "Treating it as a legacy warm start.")
+        print("Warning:", message, "Treating it as a legacy resume.")
         return {}
     return metadata
+
+
+def load_warm_start_metadata(
+    path: Path, *, ignore_mismatch: bool
+) -> tuple[dict[str, Any], bool, str]:
+    """Load and authenticate source metadata without applying resume semantics."""
+    actual = _sha256(path)
+    meta_path = sidecar_path(path)
+    if not meta_path.exists():
+        if ignore_mismatch:
+            print(
+                "Warning: warm-start source metadata is missing:",
+                meta_path,
+                "Continuing only because --ignore-warm-start-metadata was supplied.",
+            )
+            return {}, False, actual
+        raise RuntimeError(
+            f"Warm-start source metadata is missing: {meta_path}. "
+            "Use --ignore-warm-start-metadata only for an intentional legacy source."
+        )
+    try:
+        with meta_path.open("r", encoding="utf-8-sig") as stream:
+            metadata = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        if ignore_mismatch:
+            print(
+                f"Warning: warm-start source metadata is unreadable ({meta_path}: {exc}). "
+                "Continuing only because --ignore-warm-start-metadata was supplied."
+            )
+            return {}, False, actual
+        raise RuntimeError(
+            f"Warm-start source metadata is unreadable: {meta_path}: {exc}"
+        ) from exc
+
+    if not isinstance(metadata, dict):
+        message = (
+            f"Warm-start source metadata must be a JSON object: {meta_path}; "
+            f"got {type(metadata).__name__}."
+        )
+        if not ignore_mismatch:
+            raise RuntimeError(message)
+        print(
+            "Warning:",
+            message,
+            "Continuing only because --ignore-warm-start-metadata was supplied.",
+        )
+        return {}, False, actual
+
+    expected = metadata.get("checkpoint_sha256")
+    if expected != actual:
+        message = (
+            f"Warm-start checkpoint/metadata mismatch for {path}: expected SHA-256 "
+            f"{expected}, got {actual}."
+        )
+        if not ignore_mismatch:
+            raise RuntimeError(
+                message + " Refusing an unauthenticated source; use "
+                "--ignore-warm-start-metadata only when this is intentional."
+            )
+        print(
+            "Warning:",
+            message,
+            "Continuing only because --ignore-warm-start-metadata was supplied.",
+        )
+        return metadata, False, actual
+    return metadata, True, actual
 
 
 def validate_resume_identity(metadata: dict[str, Any], agent: DQNAgent) -> None:
@@ -649,7 +785,7 @@ def validate_resume_environment(
         raise RuntimeError(
             "Resume environment/MDP differs from the checkpoint: "
             + detail
-            + ". Use --allow-environment-change only for an intentional warm start or curriculum."
+            + ". Use --allow-environment-change only for an intentional legacy resume."
         )
     print("Warning: intentionally changing resume environment:", detail)
 
@@ -715,7 +851,7 @@ def validate_resume_best(
 
 
 def _resume_path(args: argparse.Namespace) -> Path | None:
-    if args.fresh:
+    if args.fresh or args.warm_start_from:
         return None
     if args.resume_from:
         path = Path(args.resume_from)
@@ -724,6 +860,57 @@ def _resume_path(args: argparse.Namespace) -> Path | None:
         return path
     latest = Path(args.latest_output)
     return latest if latest.exists() else None
+
+
+def _validate_output_network_identity(
+    network_version: int, output_path: Path, latest_path: Path
+) -> None:
+    if network_version < 3 and any(
+        "v3" in path.name.lower() for path in (output_path, latest_path)
+    ):
+        raise RuntimeError(
+            "A legacy v1/v2 run must use explicit non-v3 --latest-output and "
+            "--output paths so it cannot masquerade as a v3 checkpoint."
+        )
+
+
+def _new_agent(
+    args: argparse.Namespace,
+    game_config: GameConfig,
+    train_env: SnakeGameEnv,
+) -> DQNAgent:
+    initial_channels = 3 if args.network_version == 1 else None
+    initial_state = flatten_observation(
+        train_env, device="cpu", expected_channels=initial_channels
+    )
+    obs_shape = tuple(int(value) for value in initial_state.shape)
+    return DQNAgent(
+        state_dim=int(np.prod(obs_shape)),
+        action_dim=len(RelativeAction) if args.network_version >= 3 else len(Action),
+        hidden_sizes=tuple(args.hidden),
+        lr=args.lr,
+        gamma=args.gamma,
+        batch_size=args.batch_size,
+        replay_capacity=args.replay_capacity,
+        min_replay_size=args.min_replay,
+        target_update_interval=args.target_update,
+        target_update_tau=args.target_update_tau,
+        hard_update_interval=args.hard_update_interval,
+        use_double_dqn=not args.disable_double_dqn,
+        use_dueling=not args.disable_dueling,
+        epsilon_start=args.epsilon_start,
+        epsilon_final=args.epsilon_final,
+        epsilon_decay_steps=args.epsilon_decay_steps,
+        n_step=args.n_step,
+        per_alpha=args.per_alpha,
+        per_beta_start=args.per_beta_start,
+        per_beta_frames=args.per_beta_frames,
+        device=args.device,
+        game_config=game_config,
+        obs_shape=obs_shape,
+        network_version=args.network_version,
+        amp_enabled=False if args.disable_amp else None,
+    )
 
 
 def _prepare_fresh_outputs(args: argparse.Namespace, resume_path: Path | None) -> None:
@@ -808,13 +995,19 @@ def train(args: argparse.Namespace | None = None) -> None:
     step_limit = episode_step_limit(game_config, args.max_steps)
 
     resume_path = _resume_path(args)
-    _prepare_fresh_outputs(args, resume_path)
     output_path = Path(args.output)
     latest_path = Path(args.latest_output)
+    if resume_path is None:
+        _validate_output_network_identity(
+            args.network_version, output_path, latest_path
+        )
+    if not args.warm_start_from:
+        _prepare_fresh_outputs(args, resume_path)
     start_episode = 1
     episodes_started = 0
     best_eval_score = -math.inf
     best_eval_episode: int | None = None
+    warm_start_provenance: dict[str, Any] | None = None
     if resume_path is not None:
         metadata = load_resume_metadata(
             resume_path, ignore_mismatch=args.ignore_resume_metadata
@@ -827,14 +1020,9 @@ def train(args: argparse.Namespace | None = None) -> None:
             agent, game_config, allow_change=args.allow_environment_change
         )
         validate_v3_contract(agent)
-        if agent.network_version < 3 and (
-            args.latest_output == "models/dqn_snake_v3_latest.pt"
-            or args.output == "models/dqn_snake_v3_best.pt"
-        ):
-            raise RuntimeError(
-                "A legacy v1/v2 warm start must use explicit non-v3 --latest-output and "
-                "--output paths so it cannot masquerade as a v3 checkpoint."
-            )
+        _validate_output_network_identity(
+            agent.network_version, output_path, latest_path
+        )
         agent.game_config = game_config
         agent.configure_amp(False if args.disable_amp else None)
         agent.configure_replay_pin_memory()
@@ -847,6 +1035,7 @@ def train(args: argparse.Namespace | None = None) -> None:
                 f"checkpoint shape {tuple(agent.obs_shape)}. Start a fresh v3 run for a new board size."
             )
         if metadata:
+            warm_start_provenance = metadata.get("warm_start_provenance")
             episodes_completed = int(metadata.get("episodes_completed", 0))
             start_episode = episodes_completed + 1
             episodes_started = int(metadata.get("episodes_started", episodes_completed))
@@ -862,40 +1051,39 @@ def train(args: argparse.Namespace | None = None) -> None:
             f"epsilon is {agent.epsilon:.3f}."
         )
     else:
-        initial_channels = 3 if args.network_version == 1 else None
-        initial_state = flatten_observation(
-            train_env, device="cpu", expected_channels=initial_channels
-        )
-        obs_shape = tuple(int(value) for value in initial_state.shape)
-        agent = DQNAgent(
-            state_dim=int(np.prod(obs_shape)),
-            action_dim=len(RelativeAction)
-            if args.network_version >= 3
-            else len(Action),
-            hidden_sizes=tuple(args.hidden),
-            lr=args.lr,
-            gamma=args.gamma,
-            batch_size=args.batch_size,
-            replay_capacity=args.replay_capacity,
-            min_replay_size=args.min_replay,
-            target_update_interval=args.target_update,
-            target_update_tau=args.target_update_tau,
-            hard_update_interval=args.hard_update_interval,
-            use_double_dqn=not args.disable_double_dqn,
-            use_dueling=not args.disable_dueling,
-            epsilon_start=args.epsilon_start,
-            epsilon_final=args.epsilon_final,
-            epsilon_decay_steps=args.epsilon_decay_steps,
-            n_step=args.n_step,
-            per_alpha=args.per_alpha,
-            per_beta_start=args.per_beta_start,
-            per_beta_frames=args.per_beta_frames,
-            device=args.device,
-            game_config=game_config,
-            obs_shape=obs_shape,
-            network_version=args.network_version,
-            amp_enabled=False if args.disable_amp else None,
-        )
+        agent = _new_agent(args, game_config, train_env)
+        if args.warm_start_from:
+            source = Path(args.warm_start_from)
+            (
+                source_metadata,
+                source_sidecar_verified,
+                source_checkpoint_sha256,
+            ) = load_warm_start_metadata(
+                source, ignore_mismatch=args.ignore_warm_start_metadata
+            )
+            embedded_metadata = agent.load_policy_weights(
+                str(source), expected_sha256=source_checkpoint_sha256
+            )
+            embedded_obs_shape = embedded_metadata.get("obs_shape")
+            warm_start_provenance = {
+                "source_path": str(source.resolve()),
+                "checkpoint_sha256": source_checkpoint_sha256,
+                "sidecar_role": source_metadata.get("checkpoint_role"),
+                "sidecar_episode": source_metadata.get("episodes_completed"),
+                "embedded_network_version": embedded_metadata.get("network_version"),
+                "embedded_obs_shape": (
+                    list(embedded_obs_shape) if embedded_obs_shape is not None else None
+                ),
+                "source_sidecar_verified": source_sidecar_verified,
+            }
+            # Preserve existing destinations until source authentication and policy
+            # compatibility have both succeeded.
+            _prepare_fresh_outputs(args, None)
+            print(
+                f"Warm-started policy weights from {source.resolve()}; target is "
+                "synchronized from that policy, while optimizer, scaler, replay, "
+                "epsilon, counters, seeds, best identity, and outputs are fresh."
+            )
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -950,6 +1138,7 @@ def train(args: argparse.Namespace | None = None) -> None:
                     "start_episode": start_episode,
                     "episodes_started": episodes_started,
                     "resume_path": str(resume_path) if resume_path else None,
+                    "warm_start_provenance": warm_start_provenance,
                     "network_version": agent.network_version,
                     "action_dim": agent.action_dim,
                     "obs_shape": list(agent.obs_shape),
@@ -1094,8 +1283,10 @@ def train(args: argparse.Namespace | None = None) -> None:
                 learn_metrics.append(result)
         update_seconds = max(time.perf_counter() - updates_started, 1e-12)
 
-        def metric_mean(name: str) -> float | None:
-            values = [item[name] for item in learn_metrics if name in item]
+        def metric_mean(
+            name: str, metrics: list[dict[str, float]] = learn_metrics
+        ) -> float | None:
+            values = [item[name] for item in metrics if name in item]
             return float(statistics.mean(values)) if values else None
 
         sampling_seconds = sum(
@@ -1168,6 +1359,7 @@ def train(args: argparse.Namespace | None = None) -> None:
                     checkpoint_role="best_eval",
                     best_checkpoint_path=output_path,
                     episodes_started=episodes_started,
+                    warm_start_provenance=warm_start_provenance,
                 )
                 print(
                     f"New best fixed-suite score {best_eval_score:.3f} at episode "
@@ -1199,6 +1391,7 @@ def train(args: argparse.Namespace | None = None) -> None:
                 checkpoint_role="latest",
                 best_checkpoint_path=output_path,
                 episodes_started=episodes_started,
+                warm_start_provenance=warm_start_provenance,
             )
             while next_checkpoint_episode <= episodes_completed:
                 next_checkpoint_episode += args.checkpoint_interval
@@ -1242,6 +1435,7 @@ def train(args: argparse.Namespace | None = None) -> None:
         checkpoint_role="latest",
         best_checkpoint_path=output_path,
         episodes_started=episodes_started,
+        warm_start_provenance=warm_start_provenance,
     )
     print(
         f"Training complete. Latest: {latest_path}; "

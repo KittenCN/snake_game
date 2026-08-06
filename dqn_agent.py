@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import math
 import os
 import random
@@ -10,7 +12,7 @@ import time
 import warnings
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any, Deque, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Deque, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -1104,6 +1106,120 @@ class DQNAgent:
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
+
+    def load_policy_weights(
+        self, path: str, *, expected_sha256: str | None = None
+    ) -> dict[str, Any]:
+        """Load only compatible policy weights from a training checkpoint.
+
+        This is intentionally distinct from :meth:`load`: warm starts retain all
+        runtime and optimization state belonging to this agent.  Checkpoint data
+        is validated in full before either network is modified.
+        """
+        with open(path, "rb") as stream:
+            checkpoint_bytes = stream.read()
+        actual_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                "warm-start checkpoint changed after metadata validation: "
+                f"expected SHA-256 {expected_sha256}, got {actual_sha256}"
+            )
+        checkpoint_stream = io.BytesIO(checkpoint_bytes)
+        try:
+            checkpoint = torch.load(
+                checkpoint_stream, map_location="cpu", weights_only=True
+            )
+        except TypeError:  # PyTorch < 2.0 compatibility
+            checkpoint_stream.seek(0)
+            checkpoint = torch.load(checkpoint_stream, map_location="cpu")
+
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(  # noqa: TRY004 - checkpoint incompatibility contract
+                "policy checkpoint must contain a mapping"
+            )
+        metadata = checkpoint.get("metadata")
+        if not isinstance(metadata, dict):
+            raise RuntimeError(  # noqa: TRY004 - checkpoint incompatibility contract
+                "policy checkpoint is missing mapping metadata"
+            )
+        policy_state = checkpoint.get("policy_state_dict")
+        if not isinstance(policy_state, dict):
+            raise RuntimeError(  # noqa: TRY004 - checkpoint incompatibility contract
+                "policy checkpoint is missing policy_state_dict"
+            )
+
+        incompatibilities: list[str] = []
+        source_network_version = metadata.get("network_version")
+        if source_network_version != self.network_version:
+            incompatibilities.append(
+                "network_version "
+                f"{source_network_version!r} != {self.network_version!r}"
+            )
+        source_action_dim = metadata.get("action_dim")
+        if source_action_dim != self.action_dim:
+            incompatibilities.append(
+                f"action_dim {source_action_dim!r} != {self.action_dim!r}"
+            )
+        source_hidden_sizes = metadata.get("hidden_sizes")
+        if not isinstance(source_hidden_sizes, (list, tuple)):
+            incompatibilities.append("hidden_sizes is missing or invalid")
+        elif tuple(source_hidden_sizes) != self.hidden_sizes:
+            incompatibilities.append(
+                f"hidden_sizes {tuple(source_hidden_sizes)!r} != {self.hidden_sizes!r}"
+            )
+        source_obs_shape = metadata.get("obs_shape")
+        if (
+            not isinstance(source_obs_shape, (list, tuple))
+            or len(source_obs_shape) != 3
+        ):
+            incompatibilities.append("obs_shape is missing or invalid")
+        elif source_obs_shape[0] != self.obs_shape[0]:
+            incompatibilities.append(
+                f"obs channels {source_obs_shape[0]!r} != {self.obs_shape[0]!r}"
+            )
+
+        current_state = self.policy_net.state_dict()
+        source_keys = set(policy_state)
+        current_keys = set(current_state)
+        missing_keys = sorted(current_keys - source_keys)
+        unexpected_keys = sorted(source_keys - current_keys)
+        if missing_keys:
+            incompatibilities.append(f"missing state_dict keys: {missing_keys}")
+        if unexpected_keys:
+            incompatibilities.append(f"unexpected state_dict keys: {unexpected_keys}")
+        for key in sorted(current_keys & source_keys):
+            source_value = policy_state[key]
+            current_value = current_state[key]
+            if not isinstance(source_value, torch.Tensor):
+                incompatibilities.append(f"state_dict[{key!r}] is not a tensor")
+                continue
+            if source_value.shape != current_value.shape:
+                incompatibilities.append(
+                    f"state_dict[{key!r}] shape {tuple(source_value.shape)!r} "
+                    f"!= {tuple(current_value.shape)!r}"
+                )
+            if source_value.dtype != current_value.dtype:
+                incompatibilities.append(
+                    f"state_dict[{key!r}] dtype {source_value.dtype} "
+                    f"!= {current_value.dtype}"
+                )
+            if source_value.layout != current_value.layout:
+                incompatibilities.append(
+                    f"state_dict[{key!r}] layout {source_value.layout} "
+                    f"!= {current_value.layout}"
+                )
+
+        if incompatibilities:
+            raise RuntimeError(
+                "incompatible policy checkpoint: " + "; ".join(incompatibilities)
+            )
+
+        # Strict loading cannot encounter a structural mismatch after the checks
+        # above, so no incompatible checkpoint can partially modify this agent.
+        self.policy_net.load_state_dict(policy_state, strict=True)
+        self.target_net.load_state_dict(self.policy_net.state_dict(), strict=True)
+        self.target_net.eval()
+        return dict(metadata)
 
     @classmethod
     def load(cls, path: str, *, device: str | torch.device | None = None) -> "DQNAgent":

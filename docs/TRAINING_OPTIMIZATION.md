@@ -102,6 +102,23 @@ collection JSONL 记录可用于定位瓶颈：
 隐藏层、学习率、折扣、batch、replay 容量/门槛、n-step、PER、target 与 epsilon 配置。若显式传入的
 值与 checkpoint 不一致，训练会拒绝静默变更，需改为 fresh run。
 
+## 权重迁移与课程阶段
+
+普通 `--resume-from` 用于延续同一训练身份，因此必须保留 checkpoint 绑定的网络、optimizer、
+batch、replay 和环境契约。课程训练或吞吐基准需要改变地图、batch、学习率或 replay 时，应改用
+`--warm-start-from SOURCE.pt`：新 agent 先按当前 CLI 完整创建，再只加载 source 的 policy 权重并
+重新同步 target。optimizer、AMP scaler、replay、n-step、epsilon、计数、seed 流与 best 阈值均从
+零开始，旧训练的退化状态不会冒充新阶段的可恢复进度。
+
+迁移前默认校验 source sidecar 与 checkpoint SHA-256；新输出不得覆盖 source。v3 的 3x3 adaptive
+pool 允许观测高宽变化，但 network version、action dimension、观测通道、hidden sizes 以及每个
+state-dict tensor 的 key/shape/dtype 必须完全兼容。新 latest/best sidecar 保存 warm-start provenance，
+后续普通 resume 继续携带该来源。`--ignore-warm-start-metadata` 只为人工确认过的 legacy source
+提供显式逃生口，不放宽权重结构检查。
+
+推荐每个课程阶段使用独立输出，例如 `6x6 -> 8x8 -> 10x10 -> 12x12`，并以上一阶段固定评估的
+best checkpoint 作为下一阶段 source；不要从 latest 迁移，也不要跨尺寸携带 replay。
+
 ## 验收门槛
 
 - 环境不变量通过针对性的尾随测试和随机多 seed 运行。

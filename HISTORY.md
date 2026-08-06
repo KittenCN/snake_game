@@ -1,5 +1,11 @@
 # History
 
+## 0.4.1 - 2026-08-06
+
+- Added SHA-validated policy-only warm starts for changing board and training configuration without restoring optimizer, replay, counters or best identity.
+- Added strict source/output separation, architecture compatibility checks and persistent warm-start provenance.
+- Documented curriculum-stage weight transfer and the difference between resume and warm start.
+
 ## 0.4.0 - 2026-08-06
 
 - Added batched persistent-environment collection with configurable rollout and update scheduling.

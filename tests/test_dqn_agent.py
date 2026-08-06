@@ -484,6 +484,155 @@ def test_checkpoint_is_atomic_and_restores_exploration_state(tmp_path: Path) -> 
     assert loaded.pin_memory is False
 
 
+def test_policy_warm_start_migrates_weights_only_across_board_sizes(
+    tmp_path: Path,
+) -> None:
+    source = make_agent(epsilon_start=0.99, lr=1e-3, n_step=2)
+    for parameter in source.policy_net.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    source.optimizer.step()
+    with torch.no_grad():
+        for index, value in enumerate(source.policy_net.state_dict().values()):
+            if value.is_floating_point():
+                value.fill_((index + 1) / 100.0)
+    source.epsilon = 0.02
+    source.behavior_steps = 123
+    source.learn_step_counter = 45
+    path = tmp_path / "warm-source.pt"
+    source.save(str(path))
+
+    target = make_agent(
+        state_dim=20 * 18 * 16,
+        obs_shape=(20, 18, 16),
+        epsilon_start=0.73,
+        lr=7e-4,
+        n_step=5,
+    )
+    observation = torch.zeros(target.obs_shape)
+    target.replay_buffer.push(observation, 0, 1.0, observation, False)
+    target.remember(observation, 1, 2.0, observation, False, stream_id=9)
+    random.seed(993)
+    np.random.seed(994)
+    torch.manual_seed(995)
+    python_rng_before = random.getstate()
+    numpy_rng_before = np.random.get_state()
+    torch_rng_before = torch.get_rng_state().clone()
+
+    metadata = target.load_policy_weights(str(path))
+
+    source_state = source.policy_net.state_dict()
+    target_state = target.policy_net.state_dict()
+    synced_target_state = target.target_net.state_dict()
+    assert metadata["obs_shape"] == source.obs_shape
+    assert target.obs_shape == (20, 18, 16)
+    assert source_state.keys() == target_state.keys()
+    for key, source_value in source_state.items():
+        assert torch.equal(target_state[key], source_value)
+        assert torch.equal(synced_target_state[key], source_value)
+    assert target.target_net.training is False
+    assert target.optimizer.state_dict()["state"] == {}
+    assert target.optimizer.param_groups[0]["lr"] == pytest.approx(7e-4)
+    assert len(target.replay_buffer) == 1
+    assert len(target._n_step_buffers[9]) == 1
+    assert target.epsilon == pytest.approx(0.73)
+    assert target.behavior_steps == 0
+    assert target.learn_step_counter == 0
+    assert random.getstate() == python_rng_before
+    numpy_rng_after = np.random.get_state()
+    assert numpy_rng_after[0] == numpy_rng_before[0]
+    assert np.array_equal(numpy_rng_after[1], numpy_rng_before[1])
+    assert numpy_rng_after[2:] == numpy_rng_before[2:]
+    assert torch.equal(torch.get_rng_state(), torch_rng_before)
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "incompatible_value", "error_match"),
+    [
+        ("network_version", 2, "network_version"),
+        ("action_dim", 5, "action_dim"),
+        ("hidden_sizes", (64,), "hidden_sizes"),
+        ("obs_shape", (19, 12, 12), "obs channels"),
+    ],
+)
+def test_policy_warm_start_rejects_incompatible_metadata_without_modification(
+    tmp_path: Path,
+    metadata_key: str,
+    incompatible_value: object,
+    error_match: str,
+) -> None:
+    source = make_agent()
+    source_path = tmp_path / "source.pt"
+    source.save(str(source_path))
+    checkpoint = torch.load(source_path, map_location="cpu", weights_only=True)
+    checkpoint["metadata"][metadata_key] = incompatible_value
+    incompatible_path = tmp_path / f"incompatible-{metadata_key}.pt"
+    torch.save(checkpoint, incompatible_path)
+    target = make_agent()
+    before = {
+        key: value.clone() for key, value in target.policy_net.state_dict().items()
+    }
+
+    with pytest.raises(RuntimeError, match=error_match):
+        target.load_policy_weights(str(incompatible_path))
+
+    for key, value in target.policy_net.state_dict().items():
+        assert torch.equal(value, before[key])
+
+
+@pytest.mark.parametrize("corruption", ["shape", "dtype"])
+def test_policy_warm_start_validates_all_tensors_before_modifying_policy(
+    tmp_path: Path, corruption: str
+) -> None:
+    source = make_agent()
+    source_path = tmp_path / "source.pt"
+    source.save(str(source_path))
+    checkpoint = torch.load(source_path, map_location="cpu", weights_only=True)
+    keys = sorted(checkpoint["policy_state_dict"])
+    checkpoint["policy_state_dict"][keys[0]] = torch.full_like(
+        checkpoint["policy_state_dict"][keys[0]], 99
+    )
+    incompatible_key = keys[-1]
+    incompatible_tensor = checkpoint["policy_state_dict"][incompatible_key]
+    if corruption == "shape":
+        checkpoint["policy_state_dict"][incompatible_key] = (
+            incompatible_tensor.flatten()[:1]
+        )
+    else:
+        checkpoint["policy_state_dict"][incompatible_key] = incompatible_tensor.to(
+            torch.float64
+        )
+    incompatible_path = tmp_path / f"incompatible-{corruption}.pt"
+    torch.save(checkpoint, incompatible_path)
+    target = make_agent()
+    before = {
+        key: value.clone() for key, value in target.policy_net.state_dict().items()
+    }
+
+    with pytest.raises(RuntimeError, match=corruption):
+        target.load_policy_weights(str(incompatible_path))
+
+    for key, value in target.policy_net.state_dict().items():
+        assert torch.equal(value, before[key])
+
+
+def test_policy_warm_start_rejects_source_changed_after_hash_validation(
+    tmp_path: Path,
+) -> None:
+    source = make_agent()
+    source_path = tmp_path / "source.pt"
+    source.save(str(source_path))
+    target = make_agent()
+    before = {
+        key: value.clone() for key, value in target.policy_net.state_dict().items()
+    }
+
+    with pytest.raises(RuntimeError, match="changed after metadata validation"):
+        target.load_policy_weights(str(source_path), expected_sha256="0" * 64)
+
+    for key, value in target.policy_net.state_dict().items():
+        assert torch.equal(value, before[key])
+
+
 def test_checkpoint_uses_portable_numpy_rng_state_and_restores_sequence(
     tmp_path: Path,
 ) -> None:

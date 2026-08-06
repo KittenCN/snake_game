@@ -143,7 +143,30 @@ in-flight seed 不会在恢复时重放；恢复会从已记录的 `episodes_sta
 网络与 replay 相关的 checkpoint 绑定超参数仍遵循既有恢复校验：显式传入且与 checkpoint 不一致时
 会拒绝静默变更，需开始新训练。
 
-旧 v1/v2 checkpoint 仅建议用于推理。如果确实需要作为 warm start，必须显式传入
+## 仅迁移网络权重
+
+当需要保留已学策略、同时更换地图尺寸、batch、学习率或 replay 配置时，使用
+`--warm-start-from`，不要使用普通 `--resume-from`：
+
+```bash
+python3 train_dqn.py \
+  --warm-start-from models/dqn_snake_parallel_best.pt \
+  --width 6 --height 6 \
+  --num-envs 64 --rollout-steps 4 --updates-per-collection 32 \
+  --batch-size 512 --min-replay 10000 --replay-capacity 100000 \
+  --device cuda --allow-nondeterministic \
+  --output models/dqn_snake_curriculum_6x6_best.pt \
+  --latest-output models/dqn_snake_curriculum_6x6_latest.pt
+```
+
+warm start 只迁移 `policy_net` 权重，并用其重新同步 target；optimizer、AMP scaler、replay、
+n-step 队列、epsilon、行为/学习计数、训练 seed 流以及 best 评估身份都从新配置重新开始。源
+checkpoint 默认必须带有 SHA-256 匹配的 sidecar，且源文件不能与新 best/latest 输出同名；
+`--ignore-warm-start-metadata` 只用于经过人工确认的旧 checkpoint。网络版本、动作空间、观测
+通道和隐藏层必须兼容，但 v3 网络允许地图高宽变化。新 sidecar 会持续记录迁移来源、SHA-256、
+源回合和源观测形状。
+
+旧 v1/v2 checkpoint 仅建议用于推理。如果确实需要作为完整状态的 legacy resume，必须显式传入
 `--resume-from`、`--ignore-resume-metadata`，并为 `--latest-output`、`--output` 指定不含
 `v3` 的独立文件名。若奖励、wrap、idle 或时域等环境配置也变化，还必须显式使用
 `--allow-environment-change`；这样仍会沿用旧观测和四动作网络，不能获得 v3 的观测与架构优势。
