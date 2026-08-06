@@ -1,5 +1,12 @@
 # History
 
+## 0.4.0 - 2026-08-06
+
+- Added batched persistent-environment collection with configurable rollout and update scheduling.
+- Added reusable CUDA pinned staging, non-blocking host-to-device transfers, batched observation/topology processing, and batched action selection.
+- Added collection-level throughput and timing diagnostics for environment steps, updates, sampling, GPU host waits, encoding, and action selection.
+- Documented Ubuntu foreground/nohup CUDA operation, workload-dependent tuning, and parallel resume semantics.
+
 ## 0.3.0 - 2026-08-05
 
 - Fixed the tail-cell occupancy corruption and added environment invariant tests.

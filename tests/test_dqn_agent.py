@@ -45,6 +45,16 @@ class FixedQ(nn.Module):
         return self.values.unsqueeze(0).expand(states.shape[0], -1)
 
 
+class CountingFixedQ(FixedQ):
+    def __init__(self, values: list[float]) -> None:
+        super().__init__(values)
+        self.forward_calls = 0
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        self.forward_calls += 1
+        return super().forward(states)
+
+
 def test_v3_is_default_and_repeated_greedy_inference_is_deterministic() -> None:
     agent = make_agent()
     assert isinstance(agent.policy_net, SpatialGroupNormDuelingQNetwork)
@@ -99,6 +109,32 @@ def test_epsilon_decays_linearly_on_behavior_actions_only() -> None:
         assert agent.epsilon == pytest.approx(expected)
 
 
+def test_select_actions_batches_one_forward_and_counts_each_behavior_step() -> None:
+    agent = make_agent(epsilon_start=1.0, epsilon_final=0.0, epsilon_decay_steps=8)
+    network = CountingFixedQ([1.0, 4.0, 3.0, 2.0])
+    agent.policy_net = network
+    states = torch.zeros((4, *agent.obs_shape))
+    masks = [[True, False, True, False]] * 4
+
+    actions = agent.select_actions(states, action_masks=masks)
+
+    assert len(actions) == 4
+    assert set(actions) <= {0, 2}
+    assert network.forward_calls == 1
+    assert agent.behavior_steps == 4
+    assert agent.epsilon == pytest.approx(0.5)
+
+
+def test_select_actions_accepts_nhwc_numpy_batch() -> None:
+    agent = make_agent()
+    agent.policy_net = FixedQ([1.0, 2.0, 3.0, 4.0])
+    states = np.zeros((3, 12, 12, 20), dtype=np.float32)
+
+    actions = agent.select_actions(states, epsilon_override=0.0)
+
+    assert actions == [3, 3, 3]
+
+
 def test_n_step_terminal_flush_emits_all_prefixes() -> None:
     agent = make_agent(gamma=0.5, n_step=3)
     states = [torch.full(agent.obs_shape, float(index)) for index in range(4)]
@@ -124,6 +160,35 @@ def test_n_step_terminal_flush_emits_all_prefixes() -> None:
     assert agent.replay_buffer._dones[:3].tolist() == [1.0, 1.0, 1.0]
 
 
+def test_parallel_n_step_streams_do_not_mix_transitions() -> None:
+    agent = make_agent(gamma=0.5, n_step=2)
+    state = torch.zeros(agent.obs_shape)
+    mask = [True, True, False, False]
+
+    agent.remember(state, 0, 1.0, state, False, mask, stream_id=0)
+    agent.remember(state, 1, 10.0, state, False, mask, stream_id=1)
+    agent.remember(state, 0, 2.0, state, True, mask, stream_id=0)
+    agent.remember(state, 1, 20.0, state, True, mask, stream_id=1)
+
+    assert len(agent.replay_buffer) == 4
+    assert agent.replay_buffer._rewards is not None
+    assert agent.replay_buffer._rewards[:4].tolist() == pytest.approx(
+        [2.0, 2.0, 20.0, 20.0]
+    )
+    assert 1 not in agent._n_step_buffers
+
+
+def test_n_step_queue_snapshots_reusable_encoder_views() -> None:
+    agent = make_agent(n_step=2)
+    reusable = torch.full(agent.obs_shape, 1.0)
+    agent.remember(reusable, 0, 0.0, reusable, False)
+    reusable.fill_(9.0)
+    agent.remember(reusable, 0, 0.0, reusable, True)
+
+    assert agent.replay_buffer._states is not None
+    assert torch.all(agent.replay_buffer._states[0] == 1.0)
+
+
 def test_prioritized_replay_is_cpu_float16_and_samples_high_priority() -> None:
     replay = ReplayBuffer(8, torch.device("cpu"), action_dim=4, alpha=1.0)
     for index in range(4):
@@ -142,6 +207,26 @@ def test_prioritized_replay_is_cpu_float16_and_samples_high_priority() -> None:
     assert batch.discounts.shape == (3,)
     expected_sum = replay._priorities[:4].pow(replay.alpha).sum()
     assert replay._priority_tree[1] == pytest.approx(expected_sum.item())
+
+
+def test_pinned_replay_staging_failure_warns_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay = ReplayBuffer(8, torch.device("cuda"), action_dim=2, pin_memory=True)
+    original_empty = torch.empty
+
+    def fail_pinned_empty(*args: object, **kwargs: object) -> torch.Tensor:
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("pin allocator unavailable")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_pinned_empty)
+    with pytest.warns(RuntimeWarning, match="falling back"):
+        staging = replay._staging_tensor("states", torch.zeros((4, 3)), 2)
+
+    assert replay.pin_memory is False
+    assert staging.device.type == "cpu"
+    assert not staging.is_pinned()
 
 
 def test_priority_tree_tracks_ring_overwrites_without_sampling_empty_slots() -> None:
@@ -240,7 +325,17 @@ def test_double_dqn_target_masks_illegal_actions() -> None:
 
     assert metrics is not None
     assert metrics["td_error"] == pytest.approx(10.0)
-    assert set(metrics) >= {"loss", "td_error", "grad_norm", "q_mean"}
+    assert set(metrics) >= {
+        "loss",
+        "td_error",
+        "grad_norm",
+        "q_mean",
+        "sampling_seconds",
+        "gpu_wait_seconds",
+        "pin_memory",
+    }
+    assert metrics["sampling_seconds"] >= 0.0
+    assert metrics["gpu_wait_seconds"] == 0.0
 
 
 def test_soft_target_update_synchronizes_batchnorm_buffers() -> None:
@@ -384,6 +479,9 @@ def test_checkpoint_is_atomic_and_restores_exploration_state(tmp_path: Path) -> 
     assert loaded.behavior_steps == 3
     assert loaded.epsilon == pytest.approx(agent.epsilon)
     assert loaded.replay_restored is False
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    assert checkpoint["metadata"]["pin_memory"] is False
+    assert loaded.pin_memory is False
 
 
 def test_checkpoint_uses_portable_numpy_rng_state_and_restores_sequence(

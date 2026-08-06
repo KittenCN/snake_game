@@ -6,6 +6,8 @@ import math
 import os
 import random
 import tempfile
+import time
+import warnings
 from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Sequence, Tuple, TYPE_CHECKING, Union
@@ -61,6 +63,7 @@ class ReplayBuffer:
         action_dim: int | None = None,
         alpha: float = 0.6,
         priority_epsilon: float = 1e-5,
+        pin_memory: bool = False,
     ) -> None:
         if capacity <= 0:
             raise ValueError("replay capacity must be positive")
@@ -71,6 +74,7 @@ class ReplayBuffer:
         self.action_dim = action_dim
         self.alpha = float(alpha)
         self.priority_epsilon = float(priority_epsilon)
+        self.pin_memory = bool(pin_memory and device.type == "cuda")
         self._size = 0
         self._position = 0
         self._states: torch.Tensor | None = None
@@ -89,6 +93,8 @@ class ReplayBuffer:
             self._tree_capacity * 2, dtype=torch.float64, device="cpu"
         )
         self._max_priority = 1.0
+        self._staging: dict[str, torch.Tensor] = {}
+        self._pin_memory_warning_emitted = False
 
     def __len__(self) -> int:
         return self._size
@@ -117,6 +123,48 @@ class ReplayBuffer:
             self._next_action_masks = torch.ones(
                 (self.capacity, mask_dim), dtype=torch.bool, device="cpu"
             )
+
+    def _staging_tensor(
+        self, name: str, source: torch.Tensor, batch_size: int
+    ) -> torch.Tensor:
+        """Gather into reusable pinned storage so H2D can actually be asynchronous."""
+        shape = (batch_size, *source.shape[1:])
+        staging = self._staging.get(name)
+        if (
+            staging is None
+            or tuple(staging.shape) != shape
+            or staging.dtype != source.dtype
+        ):
+            try:
+                staging = torch.empty(
+                    shape,
+                    dtype=source.dtype,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
+            except RuntimeError as exc:
+                if not self._pin_memory_warning_emitted:
+                    warnings.warn(
+                        f"pinned replay staging allocation failed; falling back to "
+                        f"pageable CPU memory: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    self._pin_memory_warning_emitted = True
+                self.pin_memory = False
+                self._staging.clear()
+                staging = torch.empty(shape, dtype=source.dtype, device="cpu")
+            self._staging[name] = staging
+        return staging
+
+    def _gather(
+        self, name: str, source: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.pin_memory:
+            return source[indices]
+        staging = self._staging_tensor(name, source, int(indices.numel()))
+        torch.index_select(source, 0, indices, out=staging)
+        return staging
 
     @staticmethod
     def _cpu_scalar(
@@ -291,27 +339,29 @@ class ReplayBuffer:
         weights = (self._size * sample_probabilities).pow(-max(0.0, float(beta)))
         weights = weights / weights.max().clamp_min(1e-12)
 
-        non_blocking = self.device.type == "cuda"
+        non_blocking = self.device.type == "cuda" and self.pin_memory
         masks = None
         if self._next_action_masks is not None:
-            masks = self._next_action_masks[indices_cpu].to(
-                self.device, non_blocking=non_blocking
-            )
+            masks = self._gather(
+                "next_action_masks", self._next_action_masks, indices_cpu
+            ).to(self.device, non_blocking=non_blocking)
         return ReplayBatch(
-            states=self._states[indices_cpu].to(
+            states=self._gather("states", self._states, indices_cpu).to(
                 self.device, dtype=torch.float32, non_blocking=non_blocking
             ),
-            actions=self._actions[indices_cpu].to(
+            actions=self._gather("actions", self._actions, indices_cpu).to(
                 self.device, non_blocking=non_blocking
             ),
-            rewards=self._rewards[indices_cpu].to(
+            rewards=self._gather("rewards", self._rewards, indices_cpu).to(
                 self.device, non_blocking=non_blocking
             ),
-            next_states=self._next_states[indices_cpu].to(
+            next_states=self._gather("next_states", self._next_states, indices_cpu).to(
                 self.device, dtype=torch.float32, non_blocking=non_blocking
             ),
-            dones=self._dones[indices_cpu].to(self.device, non_blocking=non_blocking),
-            discounts=self._discounts[indices_cpu].to(
+            dones=self._gather("dones", self._dones, indices_cpu).to(
+                self.device, non_blocking=non_blocking
+            ),
+            discounts=self._gather("discounts", self._discounts, indices_cpu).to(
                 self.device, non_blocking=non_blocking
             ),
             weights=weights.to(
@@ -662,6 +712,7 @@ class DQNAgent:
         obs_shape: Tuple[int, int, int] | None = None,
         network_version: int = 3,
         amp_enabled: bool | None = None,
+        pin_memory: bool | None = None,
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -693,6 +744,9 @@ class DQNAgent:
         self.per_beta_frames = max(1, int(per_beta_frames))
         self.per_priority_epsilon = float(per_priority_epsilon)
         self.device = self._resolve_device(device)
+        self.pin_memory = (
+            self.device.type == "cuda" if pin_memory is None else bool(pin_memory)
+        ) and self.device.type == "cuda"
         self.game_config = game_config
         self.network_version = network_version
         self._configure_amp(amp_enabled)
@@ -726,15 +780,36 @@ class DQNAgent:
             action_dim=action_dim,
             alpha=self.per_alpha,
             priority_epsilon=self.per_priority_epsilon,
+            pin_memory=self.pin_memory,
         )
+        self._n_step_buffers: dict[
+            int,
+            Deque[
+                tuple[
+                    torch.Tensor,
+                    int,
+                    float,
+                    torch.Tensor,
+                    bool,
+                    torch.Tensor | None,
+                ]
+            ],
+        ] = {}
         self._n_step_buffer: Deque[
             tuple[torch.Tensor, int, float, torch.Tensor, bool, torch.Tensor | None]
-        ] = deque()
+        ] = self._n_step_buffers.setdefault(0, deque())
         self.replay_restored = False
         self.learn_step_counter = 0
 
     def configure_amp(self, enabled: bool | None = None) -> None:
         self._configure_amp(enabled)
+
+    def configure_replay_pin_memory(self, enabled: bool | None = None) -> None:
+        """Configure pinned sample staging; existing replay observations stay intact."""
+        requested = self.device.type == "cuda" if enabled is None else bool(enabled)
+        self.pin_memory = requested and self.device.type == "cuda"
+        self.replay_buffer.pin_memory = self.pin_memory
+        self.replay_buffer._staging.clear()
 
     def _configure_amp(self, enabled: bool | None) -> None:
         if enabled is None:
@@ -760,28 +835,50 @@ class DQNAgent:
         epsilon_override: float | None = None,
         action_mask: torch.Tensor | Sequence[bool] | None = None,
     ) -> int:
+        return self.select_actions(
+            state,
+            epsilon_override=epsilon_override,
+            action_masks=action_mask,
+        )[0]
+
+    def select_actions(
+        self,
+        states: Sequence[np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor,
+        *,
+        epsilon_override: float | None = None,
+        action_masks: (
+            torch.Tensor | Sequence[bool] | Sequence[Sequence[bool]] | None
+        ) = None,
+    ) -> list[int]:
+        """Select actions for an environment batch with exactly one network forward."""
+        state_tensor = self._ensure_batch_tensor(states)
+        batch_size = int(state_tensor.shape[0])
+        legal_masks = self._normalize_action_masks(action_masks, batch_size)
+        legal_masks_cpu = legal_masks.to(device="cpu")
         epsilon = self.epsilon if epsilon_override is None else epsilon_override
-        legal_mask = self._normalize_action_mask(action_mask)
-        legal_actions = torch.nonzero(legal_mask, as_tuple=False).flatten()
-        if epsilon > 0.0 and random.random() < epsilon:
-            chosen = int(legal_actions[random.randrange(legal_actions.numel())].item())
-        else:
-            state_tensor = self._ensure_tensor(state).unsqueeze(0)
-            was_training = self.policy_net.training
-            self.policy_net.eval()
-            try:
-                with torch.no_grad():
-                    q_values = self.policy_net(state_tensor)
-                    q_values = q_values.masked_fill(
-                        ~legal_mask.unsqueeze(0), -torch.inf
+        was_training = self.policy_net.training
+        self.policy_net.eval()
+        try:
+            with torch.no_grad():
+                q_values = self.policy_net(state_tensor)
+                q_values = q_values.masked_fill(~legal_masks, -torch.inf)
+            actions = q_values.argmax(dim=1).tolist()
+        finally:
+            self.policy_net.train(was_training)
+
+        if epsilon > 0.0:
+            for index in range(batch_size):
+                if random.random() < epsilon:
+                    legal_actions = torch.nonzero(
+                        legal_masks_cpu[index], as_tuple=False
+                    ).flatten()
+                    actions[index] = int(
+                        legal_actions[random.randrange(legal_actions.numel())].item()
                     )
-                chosen = int(q_values.argmax(dim=1).item())
-            finally:
-                self.policy_net.train(was_training)
         if epsilon_override is None:
-            self.behavior_steps += 1
+            self.behavior_steps += batch_size
             self._update_epsilon()
-        return chosen
+        return [int(action) for action in actions]
 
     def remember(
         self,
@@ -791,16 +888,18 @@ class DQNAgent:
         next_state: np.ndarray | torch.Tensor,
         done: bool | float | torch.Tensor,
         next_action_mask: torch.Tensor | Sequence[bool] | None = None,
+        *,
+        stream_id: int = 0,
     ) -> None:
-        state_t = self._ensure_tensor(state)
-        next_state_t = self._ensure_tensor(next_state)
+        state_t = self._ensure_cpu_observation(state)
+        next_state_t = self._ensure_cpu_observation(next_state)
         action_value = int(torch.as_tensor(action).reshape(()).item())
         reward_value = float(torch.as_tensor(reward).reshape(()).item())
         done_value = bool(torch.as_tensor(done).reshape(()).item())
         mask_t: torch.Tensor | None = None
         if next_action_mask is not None:
             raw_mask = torch.as_tensor(
-                next_action_mask, dtype=torch.bool, device=self.device
+                next_action_mask, dtype=torch.bool, device="cpu"
             ).flatten()
             if raw_mask.numel() != self.action_dim:
                 raise ValueError(
@@ -814,21 +913,25 @@ class DQNAgent:
                     )
                 raw_mask = torch.ones_like(raw_mask)
             mask_t = raw_mask.detach()
-        self._n_step_buffer.append(
+        stream_id = int(stream_id)
+        stream_buffer = self._n_step_buffers.setdefault(stream_id, deque())
+        stream_buffer.append(
             (state_t, action_value, reward_value, next_state_t, done_value, mask_t)
         )
         if done_value:
-            while self._n_step_buffer:
-                self._emit_n_step_transition()
-        elif len(self._n_step_buffer) >= self.n_step:
-            self._emit_n_step_transition()
+            while stream_buffer:
+                self._emit_n_step_transition(stream_id)
+        elif len(stream_buffer) >= self.n_step:
+            self._emit_n_step_transition(stream_id)
 
     def learn(self) -> dict[str, float] | None:
         if len(self.replay_buffer) < max(self.batch_size, self.min_replay_size):
             return None
         beta_progress = min(1.0, self.learn_step_counter / self.per_beta_frames)
         beta = self.per_beta_start + beta_progress * (1.0 - self.per_beta_start)
+        sampling_started = time.perf_counter()
         batch = self.replay_buffer.sample(self.batch_size, beta=beta)
+        sampling_seconds = time.perf_counter() - sampling_started
 
         scaler = (
             self.grad_scaler
@@ -891,18 +994,34 @@ class DQNAgent:
             )
             self.optimizer.step()
 
+        # PER already requires TD errors on the host. Measure this existing
+        # synchronization point rather than adding torch.cuda.synchronize().
+        gpu_wait_started = time.perf_counter()
+        td_errors_cpu = td_errors.detach().abs().to(device="cpu", dtype=torch.float32)
+        loss_value = float(loss.detach().cpu().item())
+        td_error_value = float(td_errors_cpu.mean().item())
+        grad_norm_value = float(torch.as_tensor(grad_norm).detach().cpu().item())
+        q_mean_value = float(q_values.detach().mean().cpu().item())
+        gpu_wait_seconds = (
+            time.perf_counter() - gpu_wait_started
+            if self.device.type == "cuda"
+            else 0.0
+        )
         self.replay_buffer.update_priorities(
             batch.indices,
-            td_errors.detach().abs().to(device="cpu", dtype=torch.float32),
+            td_errors_cpu,
         )
         self.learn_step_counter += 1
         self._update_target_network()
         return {
-            "loss": float(loss.detach().cpu().item()),
-            "td_error": float(td_errors.detach().abs().mean().cpu().item()),
-            "grad_norm": float(torch.as_tensor(grad_norm).detach().cpu().item()),
-            "q_mean": float(q_values.detach().mean().cpu().item()),
+            "loss": loss_value,
+            "td_error": td_error_value,
+            "grad_norm": grad_norm_value,
+            "q_mean": q_mean_value,
             "per_beta": float(beta),
+            "sampling_seconds": sampling_seconds,
+            "gpu_wait_seconds": gpu_wait_seconds,
+            "pin_memory": float(self.replay_buffer.pin_memory),
         }
 
     def save(self, path: str) -> None:
@@ -961,6 +1080,7 @@ class DQNAgent:
                 "replay_size": len(self.replay_buffer),
                 "replay_restored": False,
                 "amp_enabled": self.amp_enabled,
+                "pin_memory": self.replay_buffer.pin_memory,
                 "device": str(self.device),
                 "learn_step_counter": self.learn_step_counter,
                 "obs_shape": self.obs_shape,
@@ -1039,6 +1159,9 @@ class DQNAgent:
             obs_shape=obs_shape,
             network_version=metadata.get("network_version", 1),
             amp_enabled=metadata.get("amp_enabled"),
+            # Pinned memory is a runtime/device property and replay is not
+            # restored. Explicit device migration therefore auto-configures it.
+            pin_memory=(None if device is not None else metadata.get("pin_memory")),
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(
@@ -1119,15 +1242,37 @@ class DQNAgent:
             raise ValueError("action_mask must contain at least one legal action")
         return mask
 
-    def _emit_n_step_transition(self) -> None:
-        if not self._n_step_buffer:
+    def _normalize_action_masks(
+        self,
+        action_masks: torch.Tensor | Sequence[bool] | Sequence[Sequence[bool]] | None,
+        batch_size: int,
+    ) -> torch.Tensor:
+        if action_masks is None:
+            return torch.ones(
+                (batch_size, self.action_dim), dtype=torch.bool, device=self.device
+            )
+        masks = torch.as_tensor(action_masks, dtype=torch.bool, device=self.device)
+        if masks.dim() == 1 and batch_size == 1:
+            masks = masks.unsqueeze(0)
+        if tuple(masks.shape) != (batch_size, self.action_dim):
+            raise ValueError(
+                "action_masks must have shape "
+                f"({batch_size}, {self.action_dim}); got {tuple(masks.shape)}"
+            )
+        if not bool(masks.any(dim=1).all()):
+            raise ValueError("each action mask must contain at least one legal action")
+        return masks
+
+    def _emit_n_step_transition(self, stream_id: int = 0) -> None:
+        stream_buffer = self._n_step_buffers.get(stream_id)
+        if not stream_buffer:
             return
         accumulated_reward = 0.0
         steps = 0
-        final_next_state = self._n_step_buffer[0][3]
+        final_next_state = stream_buffer[0][3]
         final_done = False
-        final_mask = self._n_step_buffer[0][5]
-        for _, _, reward, next_state, done, next_mask in list(self._n_step_buffer)[
+        final_mask = stream_buffer[0][5]
+        for _, _, reward, next_state, done, next_mask in list(stream_buffer)[
             : self.n_step
         ]:
             accumulated_reward += (self.gamma**steps) * reward
@@ -1137,7 +1282,7 @@ class DQNAgent:
             final_mask = next_mask
             if done:
                 break
-        state, action, _, _, _, _ = self._n_step_buffer[0]
+        state, action, _, _, _, _ = stream_buffer[0]
         self.replay_buffer.push(
             state,
             action,
@@ -1147,7 +1292,9 @@ class DQNAgent:
             discount=self.gamma**steps,
             next_action_mask=final_mask,
         )
-        self._n_step_buffer.popleft()
+        stream_buffer.popleft()
+        if not stream_buffer and stream_id != 0:
+            del self._n_step_buffers[stream_id]
 
     @staticmethod
     def _restore_rng_state(rng_state: Any) -> None:
@@ -1192,6 +1339,111 @@ class DQNAgent:
         elif tensor.dim() == 3 and tensor.shape[-1] == self.obs_shape[0]:
             tensor = tensor.permute(2, 0, 1)
         return tensor
+
+    def _ensure_cpu_observation(self, value: np.ndarray | torch.Tensor) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().to(device="cpu", dtype=torch.float32)
+        else:
+            tensor = torch.from_numpy(value).to(dtype=torch.float32)
+        if tensor.dim() == 1:
+            tensor = tensor.view(self.obs_shape)
+        elif tensor.dim() == 3 and tensor.shape[-1] == self.obs_shape[0]:
+            tensor = tensor.permute(2, 0, 1)
+        if tuple(tensor.shape) != tuple(self.obs_shape):
+            raise ValueError(
+                f"observation must have shape {self.obs_shape}; got {tuple(tensor.shape)}"
+            )
+        # Callers commonly pass views into a reusable batched encoder.  The
+        # n-step queue must own a snapshot because that staging view is
+        # overwritten on the next environment tick.
+        return tensor.contiguous().clone()
+
+    def _ensure_batch_tensor(
+        self,
+        values: Sequence[np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(values, torch.Tensor) and values.device.type != "cpu":
+            device_batch = values.detach()
+            if device_batch.dim() == 1:
+                device_batch = device_batch.view(1, *self.obs_shape)
+            elif device_batch.dim() == 2 and device_batch.shape[1] == self.state_dim:
+                device_batch = device_batch.view(-1, *self.obs_shape)
+            elif device_batch.dim() == 3:
+                if tuple(device_batch.shape) == tuple(self.obs_shape):
+                    device_batch = device_batch.unsqueeze(0)
+                elif device_batch.shape[-1] == self.obs_shape[0] and tuple(
+                    device_batch.shape[:2]
+                ) == tuple(self.obs_shape[1:]):
+                    device_batch = device_batch.permute(2, 0, 1).unsqueeze(0)
+            elif device_batch.dim() == 4 and tuple(device_batch.shape[1:]) != tuple(
+                self.obs_shape
+            ):
+                if device_batch.shape[-1] == self.obs_shape[0] and tuple(
+                    device_batch.shape[1:3]
+                ) == tuple(self.obs_shape[1:]):
+                    device_batch = device_batch.permute(0, 3, 1, 2)
+            if device_batch.dim() != 4 or tuple(device_batch.shape[1:]) != tuple(
+                self.obs_shape
+            ):
+                raise ValueError(
+                    f"batched observations must have shape (N, {self.obs_shape}); "
+                    f"got {tuple(values.shape)}"
+                )
+            return device_batch.to(self.device, dtype=torch.float32).contiguous()
+        if isinstance(values, (np.ndarray, torch.Tensor)):
+            raw = (
+                values.detach()
+                if isinstance(values, torch.Tensor)
+                else torch.from_numpy(values)
+            )
+            if raw.dim() in (1, 3):
+                observations = [self._ensure_cpu_observation(raw)]
+                batch_cpu = torch.stack(observations)
+            elif raw.dim() == 2 and raw.shape[1] == self.state_dim:
+                batch_cpu = raw.to(device="cpu", dtype=torch.float32).view(
+                    -1, *self.obs_shape
+                )
+            elif raw.dim() == 4:
+                batch_cpu = raw.to(device="cpu", dtype=torch.float32)
+                if tuple(batch_cpu.shape[1:]) != tuple(self.obs_shape):
+                    if batch_cpu.shape[-1] == self.obs_shape[0] and tuple(
+                        batch_cpu.shape[1:3]
+                    ) == tuple(self.obs_shape[1:]):
+                        batch_cpu = batch_cpu.permute(0, 3, 1, 2)
+                    else:
+                        raise ValueError(
+                            f"batched observations must have shape (N, {self.obs_shape}); "
+                            f"got {tuple(raw.shape)}"
+                        )
+            else:
+                raise ValueError(
+                    f"unsupported batched observation shape {tuple(raw.shape)}"
+                )
+            batch_cpu = batch_cpu.contiguous()
+        else:
+            if not values:
+                raise ValueError("states batch must not be empty")
+            batch_cpu = torch.stack(
+                [self._ensure_cpu_observation(value) for value in values]
+            )
+        if int(batch_cpu.shape[0]) <= 0:
+            raise ValueError("states batch must not be empty")
+        non_blocking = False
+        if self.pin_memory and not batch_cpu.is_pinned():
+            try:
+                batch_cpu = batch_cpu.pin_memory()
+            except RuntimeError as exc:
+                warnings.warn(
+                    f"pinned action batch allocation failed; using pageable memory: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.configure_replay_pin_memory(False)
+            else:
+                non_blocking = True
+        elif batch_cpu.is_pinned():
+            non_blocking = self.device.type == "cuda"
+        return batch_cpu.to(self.device, dtype=torch.float32, non_blocking=non_blocking)
 
 
 def flatten_observation(

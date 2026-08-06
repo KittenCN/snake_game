@@ -44,6 +44,8 @@
 - `latest` 与 `best_eval` 分离、原子保存，并用 SHA-256 将 latest、best 及 sidecar 串成可验证身份；
 - 保存 optimizer、AMP scaler、Python/NumPy/Torch RNG 和探索进度；
 - replay 不写入 checkpoint，metadata 会明确标记 `replay_restored=false`。
+- 支持多环境批量采集、批量观测编码/动作前向，以及 CUDA pinned staging 与 non-blocking H2D；
+  具体的吞吐分解和 Ubuntu 运行方式见下文及 [docs/TRAINING_OPTIMIZATION.md](docs/TRAINING_OPTIMIZATION.md)。
 
 ## 安装
 
@@ -76,6 +78,44 @@ python train_dqn.py `
 
 若机器没有 CUDA，省略 `--device cuda`，程序会自动使用 CPU。
 
+## CUDA 批量训练与 Ubuntu 运行
+
+训练默认保持单环境兼容行为：`--num-envs 1`、`--rollout-steps 1`、
+`--updates-per-collection 0`。在 CUDA 设备上，观测编码和 replay 采样会使用可用的 pinned CPU
+staging，并以 non-blocking H2D 传输完整 batch；策略网络会对活动环境的状态执行一次批量动作前向。
+这旨在减少小批量传输和逐状态前向的开销，但实际吞吐与 GPU 利用率取决于显卡、CPU、棋盘大小、
+batch 以及环境负载，应以 JSONL collection 指标实测为准。
+
+Ubuntu 前台起步配置（在项目根目录执行）：
+
+```bash
+mkdir -p runs
+PYTHONUNBUFFERED=1 python3 train_dqn.py \
+  --episodes 100000 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 32 \
+  --batch-size 256 --min-replay 10000 --replay-capacity 100000 \
+  --device cuda --allow-nondeterministic
+```
+
+Ubuntu 脱离 SSH 会话运行时，保留实时日志并由 `nohup` 接管：
+
+```bash
+mkdir -p runs
+nohup env PYTHONUNBUFFERED=1 python3 train_dqn.py \
+  --episodes 100000 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 32 \
+  --batch-size 256 --min-replay 10000 --replay-capacity 100000 \
+  --device cuda --allow-nondeterministic \
+  > runs/train_cuda_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+`--num-envs` 是持久训练环境数，`--rollout-steps` 是每轮更新前每个活动环境收集的步数；一次
+collection 的 transition 数约为 `active_envs * rollout_steps`（尾段活动环境减少时会更少）。
+`--updates-per-collection` 显式指定每个 collection 的梯度更新次数，从而直接控制更新/数据比。
+值为 `0` 的自动模式保留旧的 `--train-frequency` / `--gradient-steps` 比例；在很大的环境数下它可能
+变得计算密集，应先观察指标再调整。更完整的架构、调优和字段说明见
+[训练优化说明](docs/TRAINING_OPTIMIZATION.md)。
+
 ## 恢复训练
 
 默认情况下，只要 `models/dqn_snake_v3_latest.pt` 存在，同一命令会从 latest 恢复：
@@ -96,6 +136,12 @@ python train_dqn.py `
 输出时需同时使用 `--overwrite-fresh-output`。恢复时会校验 sidecar SHA-256、完整环境配置、
 固定评估种子/规模以及 best 文件身份，避免再次出现“旧 best 权重 + 新 episode metadata”的
 伪恢复。要有意改变评估基线时使用 `--reset-best-evaluation`。
+
+`--episodes` 表示本次调用要完成的回合数，而非要启动的环境数。多环境运行若被中断，尚未完成的
+in-flight seed 不会在恢复时重放；恢复会从已记录的 `episodes_started` 之后继续分配 seed。可以在
+恢复时调整运行时调度参数（例如 `--num-envs`、`--rollout-steps`、`--updates-per-collection`），但
+网络与 replay 相关的 checkpoint 绑定超参数仍遵循既有恢复校验：显式传入且与 checkpoint 不一致时
+会拒绝静默变更，需开始新训练。
 
 旧 v1/v2 checkpoint 仅建议用于推理。如果确实需要作为 warm start，必须显式传入
 `--resume-from`、`--ignore-resume-metadata`，并为 `--latest-output`、`--output` 指定不含

@@ -67,6 +67,19 @@ def test_output_paths_must_be_distinct() -> None:
         parse_args(["--output", "same.pt", "--latest-output", "same.pt"])
 
 
+def test_parallel_collection_defaults_and_validation() -> None:
+    args = parse_args([])
+    assert args.num_envs == 1
+    assert args.rollout_steps == 1
+    assert args.updates_per_collection == 0
+    with pytest.raises(SystemExit):
+        parse_args(["--num-envs", "0"])
+    with pytest.raises(SystemExit):
+        parse_args(["--rollout-steps", "0"])
+    with pytest.raises(SystemExit):
+        parse_args(["--updates-per-collection", "-1"])
+
+
 def test_resume_seed_change_requires_explicit_permission() -> None:
     args = parse_args(["--seed", "9"])
     with pytest.raises(RuntimeError, match="seed changed"):
@@ -208,6 +221,7 @@ def test_short_training_creates_distinct_latest_and_best(tmp_path: Path) -> None
     assert latest_meta["best_checkpoint_sha256"] == best_meta["checkpoint_sha256"]
     assert latest_meta["effective_agent_config"]["lr"] == [0.001]
     assert latest_meta["episodes_completed"] == 4
+    assert latest_meta["episodes_started"] == 4
     assert list(logs.glob("train_log_*.jsonl"))
 
     resume_args = parse_args(
@@ -306,3 +320,114 @@ def test_short_training_creates_distinct_latest_and_best(tmp_path: Path) -> None
     )
     with pytest.raises(RuntimeError, match="environment/MDP"):
         train(drift_args)
+
+
+def test_parallel_training_batches_environments_and_logs_throughput(
+    tmp_path: Path,
+) -> None:
+    best = tmp_path / "parallel_best.pt"
+    latest = tmp_path / "parallel_latest.pt"
+    logs = tmp_path / "parallel_logs"
+    args = parse_args(
+        [
+            "--episodes",
+            "5",
+            "--num-envs",
+            "3",
+            "--rollout-steps",
+            "2",
+            "--updates-per-collection",
+            "2",
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "3",
+            "--eval-interval",
+            "5",
+            "--eval-episodes",
+            "2",
+            "--checkpoint-interval",
+            "5",
+            "--batch-size",
+            "2",
+            "--min-replay",
+            "2",
+            "--replay-capacity",
+            "64",
+            "--hidden",
+            "16",
+            "--output",
+            str(best),
+            "--latest-output",
+            str(latest),
+            "--log-dir",
+            str(logs),
+            "--device",
+            "cpu",
+            "--disable-amp",
+        ]
+    )
+    train(args)
+
+    metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    assert metadata["episodes_completed"] == 5
+    assert metadata["episodes_started"] == 5
+    assert metadata["train_args"]["num_envs"] == 3
+
+    log_path = next(logs.glob("train_log_*.jsonl"))
+    records = [json.loads(line) for line in log_path.read_text("utf-8").splitlines()]
+    episodes = [record for record in records if record["record_type"] == "episode"]
+    collections = [
+        record for record in records if record["record_type"] == "collection"
+    ]
+    assert len(episodes) == 5
+    assert {record["seed_index"] for record in episodes} == {1, 2, 3, 4, 5}
+    assert any(record["collection_transitions"] > 1 for record in collections)
+    assert any(record["collection_updates"] > 0 for record in collections)
+    for key in (
+        "env_steps_per_second",
+        "updates_per_second",
+        "sampling_seconds",
+        "gpu_wait_seconds",
+    ):
+        assert all(key in record for record in collections)
+
+    resume_args = parse_args(
+        [
+            "--episodes",
+            "2",
+            "--num-envs",
+            "2",
+            "--rollout-steps",
+            "2",
+            "--updates-per-collection",
+            "1",
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "3",
+            "--eval-episodes",
+            "2",
+            "--checkpoint-interval",
+            "1",
+            "--resume-from",
+            str(latest),
+            "--output",
+            str(best),
+            "--latest-output",
+            str(latest),
+            "--log-dir",
+            str(logs),
+            "--device",
+            "cpu",
+            "--disable-amp",
+        ]
+    )
+    train(resume_args)
+    resumed = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    assert resumed["episodes_completed"] == 7
+    assert resumed["episodes_started"] == 7

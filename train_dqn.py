@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 from collections import Counter, deque
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -26,9 +26,11 @@ import numpy as np
 import torch
 
 try:
+    from .batch_processing import BatchObservationEncoder, batch_state_potentials
     from .dqn_agent import DQNAgent, flatten_observation
     from .env import Action, GameConfig, RelativeAction, SnakeGameEnv
 except ImportError:
+    from batch_processing import BatchObservationEncoder, batch_state_potentials
     from dqn_agent import DQNAgent, flatten_observation
     from env import Action, GameConfig, RelativeAction, SnakeGameEnv
 
@@ -82,6 +84,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--train-frequency", type=int, default=1)
     parser.add_argument("--gradient-steps", type=int, default=1)
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Number of persistent training environments collected in parallel",
+    )
+    parser.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=1,
+        help="Environment steps collected per active environment before each update phase",
+    )
+    parser.add_argument(
+        "--updates-per-collection",
+        type=int,
+        default=0,
+        help=(
+            "Gradient updates after each collection; 0 preserves the configured "
+            "train-frequency/gradient-steps update-to-transition ratio"
+        ),
+    )
     parser.add_argument("--reward-step", type=float, default=-0.003)
     parser.add_argument("--reward-food", type=float, default=5.0)
     parser.add_argument("--reward-death", type=float, default=-5.0)
@@ -159,6 +182,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("eval-interval and checkpoint-interval must be positive")
     if args.train_frequency <= 0 or args.gradient_steps <= 0:
         parser.error("train-frequency and gradient-steps must be positive")
+    if args.num_envs <= 0 or args.rollout_steps <= 0:
+        parser.error("num-envs and rollout-steps must be positive")
+    if args.updates_per_collection < 0:
+        parser.error("updates-per-collection must be non-negative")
     if Path(args.output).resolve() == Path(args.latest_output).resolve():
         parser.error("--output and --latest-output must be different paths")
     if args.resume_best_on_decline:
@@ -285,39 +312,46 @@ def evaluate_agent(
     seeds: Sequence[int],
     max_steps: int,
 ) -> dict[str, Any]:
-    rewards: list[float] = []
-    scores: list[int] = []
-    steps_taken: list[int] = []
+    environments = [SnakeGameEnv(game_config) for _ in seeds]
+    for env, seed in zip(environments, seeds, strict=True):
+        env.reset(seed=int(seed))
+    encoder = BatchObservationEncoder(
+        game_config.width,
+        game_config.height,
+        max_batch_size=len(environments),
+        channels=agent.obs_shape[0],
+        pin_memory=agent.device.type == "cuda",
+    )
+    rewards = [0.0] * len(environments)
     events: Counter[str] = Counter()
     truncated_count = 0
-    for seed in seeds:
-        env = SnakeGameEnv(game_config)
-        env.reset(seed=int(seed))
-        state = flatten_observation(
-            env, agent.device, expected_channels=agent.obs_shape[0]
+    active = list(range(len(environments)))
+    while active:
+        active_envs = [environments[index] for index in active]
+        states = encoder.encode(active_envs)
+        chosen_actions = agent.select_actions(
+            states,
+            epsilon_override=0.0,
+            action_masks=[action_mask(agent, env) for env in active_envs],
         )
-        total_reward = 0.0
-        terminal_event = "truncated"
-        for _ in range(max_steps):
-            chosen = agent.select_action(
-                state, epsilon_override=0.0, action_mask=action_mask(agent, env)
-            )
+        survivors: list[int] = []
+        for index, env, chosen in zip(active, active_envs, chosen_actions, strict=True):
             _, reward, done, info = step_agent_action(agent, env, chosen)
-            total_reward += reward
-            state = flatten_observation(
-                env, agent.device, expected_channels=agent.obs_shape[0]
-            )
-            if done:
-                terminal_event = str(info.get("event", "terminated"))
-                if bool(info.get("truncated")):
+            rewards[index] += reward
+            external_truncation = not done and env.steps >= max_steps
+            if done or external_truncation:
+                terminal_event = (
+                    str(info.get("event", "terminated")) if done else "truncated"
+                )
+                if external_truncation or bool(info.get("truncated")):
                     truncated_count += 1
-                break
-        else:
-            truncated_count += 1
-        rewards.append(total_reward)
-        scores.append(env.score)
-        steps_taken.append(env.steps)
-        events[terminal_event] += 1
+                events[terminal_event] += 1
+            else:
+                survivors.append(index)
+        active = survivors
+
+    scores = [env.score for env in environments]
+    steps_taken = [env.steps for env in environments]
 
     def distribution(values: Sequence[float | int]) -> dict[str, float]:
         array = np.asarray(values, dtype=np.float64)
@@ -427,6 +461,7 @@ def save_checkpoint(
     train_args: argparse.Namespace,
     checkpoint_role: str,
     best_checkpoint_path: Path | None = None,
+    episodes_started: int | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     agent.save(str(path))
@@ -448,6 +483,7 @@ def save_checkpoint(
         "checkpoint_path": str(path.resolve()),
         "checkpoint_sha256": checkpoint_sha256,
         "episodes_completed": episode,
+        "episodes_started": episode if episodes_started is None else episodes_started,
         "run_seed": run_seed,
         "best_eval_score": best_eval_score,
         "best_eval_episode": best_eval_episode,
@@ -723,6 +759,25 @@ def _reheat_exploration(agent: DQNAgent, minimum: float) -> None:
     agent.epsilon = target
 
 
+@dataclass
+class _TrainingSlot:
+    stream_id: int
+    env: SnakeGameEnv
+    seed_index: int = 0
+    total_env_reward: float = 0.0
+    total_shaped_reward: float = 0.0
+    started_at: float = 0.0
+    active: bool = False
+
+    def reset(self, *, run_seed: int, seed_index: int) -> None:
+        self.seed_index = seed_index
+        self.env.reset(seed=deterministic_episode_seed(run_seed, seed_index))
+        self.total_env_reward = 0.0
+        self.total_shaped_reward = 0.0
+        self.started_at = time.perf_counter()
+        self.active = True
+
+
 def train(args: argparse.Namespace | None = None) -> None:
     args = args or parse_args()
     set_global_seed(args.seed)
@@ -757,6 +812,7 @@ def train(args: argparse.Namespace | None = None) -> None:
     output_path = Path(args.output)
     latest_path = Path(args.latest_output)
     start_episode = 1
+    episodes_started = 0
     best_eval_score = -math.inf
     best_eval_episode: int | None = None
     if resume_path is not None:
@@ -781,6 +837,7 @@ def train(args: argparse.Namespace | None = None) -> None:
             )
         agent.game_config = game_config
         agent.configure_amp(False if args.disable_amp else None)
+        agent.configure_replay_pin_memory()
         resume_state = flatten_observation(
             train_env, agent.device, expected_channels=agent.obs_shape[0]
         )
@@ -790,7 +847,9 @@ def train(args: argparse.Namespace | None = None) -> None:
                 f"checkpoint shape {tuple(agent.obs_shape)}. Start a fresh v3 run for a new board size."
             )
         if metadata:
-            start_episode = int(metadata.get("episodes_completed", 0)) + 1
+            episodes_completed = int(metadata.get("episodes_completed", 0))
+            start_episode = episodes_completed + 1
+            episodes_started = int(metadata.get("episodes_started", episodes_completed))
             best_eval_score, best_eval_episode = validate_resume_best(
                 metadata,
                 args,
@@ -845,7 +904,42 @@ def train(args: argparse.Namespace | None = None) -> None:
     rolling_scores: deque[int] = deque(maxlen=100)
     no_improvement_evals = 0
     early_stop_reference_score = best_eval_score
-    final_episode = start_episode - 1
+    episodes_completed = start_episode - 1
+    final_episode = episodes_completed
+    initial_completed = episodes_completed
+    episodes_launched_this_run = 0
+    next_seed_index = episodes_started + 1
+    next_eval_episode = (
+        (episodes_completed // args.eval_interval) + 1
+    ) * args.eval_interval
+    next_checkpoint_episode = (
+        (episodes_completed // args.checkpoint_interval) + 1
+    ) * args.checkpoint_interval
+
+    slots = [
+        _TrainingSlot(stream_id=index, env=SnakeGameEnv(game_config))
+        for index in range(min(args.num_envs, args.episodes))
+    ]
+    for slot in slots:
+        slot.reset(run_seed=args.seed, seed_index=next_seed_index)
+        next_seed_index += 1
+        episodes_started += 1
+        episodes_launched_this_run += 1
+
+    current_encoder = BatchObservationEncoder(
+        game_config.width,
+        game_config.height,
+        max_batch_size=len(slots),
+        channels=agent.obs_shape[0],
+        pin_memory=agent.device.type == "cuda",
+    )
+    next_encoder = BatchObservationEncoder(
+        game_config.width,
+        game_config.height,
+        max_batch_size=len(slots),
+        channels=agent.obs_shape[0],
+        pin_memory=agent.device.type == "cuda",
+    )
 
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(
@@ -854,11 +948,13 @@ def train(args: argparse.Namespace | None = None) -> None:
                     "record_type": "run_start",
                     "seed": args.seed,
                     "start_episode": start_episode,
+                    "episodes_started": episodes_started,
                     "resume_path": str(resume_path) if resume_path else None,
                     "network_version": agent.network_version,
                     "action_dim": agent.action_dim,
                     "obs_shape": list(agent.obs_shape),
                     "step_limit": step_limit,
+                    "observation_pinned": current_encoder.is_pinned,
                     "eval_seeds": eval_seeds,
                     "args": vars(args),
                 }
@@ -866,76 +962,164 @@ def train(args: argparse.Namespace | None = None) -> None:
             + "\n"
         )
 
-    for episode in range(start_episode, start_episode + args.episodes):
-        train_env.reset(seed=deterministic_episode_seed(args.seed, episode))
-        state = flatten_observation(
-            train_env, agent.device, expected_channels=agent.obs_shape[0]
-        )
-        total_env_reward = 0.0
-        total_shaped_reward = 0.0
-        learn_metrics: list[dict[str, float]] = []
-        terminal_event = "truncated"
-        terminated = False
-        truncated = False
-        episode_started = time.perf_counter()
+    stop_requested = False
+    collection_index = 0
+    while episodes_completed < initial_completed + args.episodes and not stop_requested:
+        collection_index += 1
+        collection_started = time.perf_counter()
+        behavior_steps_before = agent.behavior_steps
+        collection_transitions = 0
+        encoding_seconds = 0.0
+        action_selection_seconds = 0.0
+        completed_summaries: list[dict[str, Any]] = []
 
-        for step_index in range(step_limit):
-            previous_potential = (
-                state_potential(train_env) if args.reward_shaping_scale > 0 else 0.0
-            )
-            chosen = agent.select_action(
-                state, action_mask=action_mask(agent, train_env)
-            )
-            _, env_reward, env_done, info = step_agent_action(agent, train_env, chosen)
-            next_state = flatten_observation(
-                train_env, agent.device, expected_channels=agent.obs_shape[0]
-            )
-            truncated = bool(info.get("truncated")) or (
-                not env_done and step_index + 1 >= step_limit
-            )
-            replay_done = env_done or truncated
-            shaped_reward = env_reward + potential_shaping(
-                previous_potential,
-                train_env,
-                gamma=agent.gamma,
-                scale=args.reward_shaping_scale,
-                terminal=replay_done,
-            )
-            agent.remember(
-                state,
-                chosen,
-                shaped_reward,
-                next_state,
-                replay_done,
-                next_action_mask=action_mask(agent, train_env),
-            )
-            if agent.behavior_steps % args.train_frequency == 0:
-                for _ in range(args.gradient_steps):
-                    result = agent.learn()
-                    if result is not None:
-                        learn_metrics.append(result)
-            state = next_state
-            total_env_reward += env_reward
-            total_shaped_reward += shaped_reward
-            if env_done:
-                terminated = not truncated
-                terminal_event = str(info.get("event", "terminated"))
+        for _ in range(args.rollout_steps):
+            active_slots = [slot for slot in slots if slot.active]
+            if not active_slots:
                 break
+            active_envs = [slot.env for slot in active_slots]
+            encode_started = time.perf_counter()
+            states = current_encoder.encode(active_envs)
+            encoding_seconds += time.perf_counter() - encode_started
+            previous_potentials = (
+                batch_state_potentials(active_envs)
+                if args.reward_shaping_scale > 0
+                else np.zeros(len(active_envs), dtype=np.float64)
+            )
+            selection_started = time.perf_counter()
+            chosen_actions = agent.select_actions(
+                states,
+                action_masks=[action_mask(agent, env) for env in active_envs],
+            )
+            action_selection_seconds += time.perf_counter() - selection_started
 
-        rolling_scores.append(train_env.score)
+            step_results: list[tuple[float, bool, bool, dict[str, object]]] = []
+            for slot, chosen in zip(active_slots, chosen_actions, strict=True):
+                _, env_reward, env_done, info = step_agent_action(
+                    agent, slot.env, chosen
+                )
+                truncated = bool(info.get("truncated")) or (
+                    not env_done and slot.env.steps >= step_limit
+                )
+                step_results.append((env_reward, env_done, env_done or truncated, info))
+
+            encode_started = time.perf_counter()
+            next_states = next_encoder.encode(active_envs)
+            encoding_seconds += time.perf_counter() - encode_started
+            next_potentials = (
+                batch_state_potentials(active_envs)
+                if args.reward_shaping_scale > 0
+                else np.zeros(len(active_envs), dtype=np.float64)
+            )
+
+            for batch_index, (slot, chosen, result) in enumerate(
+                zip(active_slots, chosen_actions, step_results, strict=True)
+            ):
+                env_reward, env_done, replay_done, info = result
+                if replay_done:
+                    next_potential = 0.0
+                else:
+                    next_potential = float(next_potentials[batch_index])
+                shaped_reward = env_reward + args.reward_shaping_scale * (
+                    agent.gamma * next_potential
+                    - float(previous_potentials[batch_index])
+                )
+                agent.remember(
+                    states[batch_index],
+                    chosen,
+                    shaped_reward,
+                    next_states[batch_index],
+                    replay_done,
+                    next_action_mask=action_mask(agent, slot.env),
+                    stream_id=slot.stream_id,
+                )
+                collection_transitions += 1
+                slot.total_env_reward += env_reward
+                slot.total_shaped_reward += shaped_reward
+
+                if not replay_done:
+                    continue
+                truncated = bool(info.get("truncated")) or not env_done
+                terminal_event = (
+                    str(info.get("event", "terminated")) if env_done else "truncated"
+                )
+                episodes_completed += 1
+                final_episode = episodes_completed
+                rolling_scores.append(slot.env.score)
+                completed_summaries.append(
+                    {
+                        "record_type": "episode",
+                        "episode": episodes_completed,
+                        "seed_index": slot.seed_index,
+                        "environment_stream": slot.stream_id,
+                        "reward": slot.total_env_reward,
+                        "shaped_reward": slot.total_shaped_reward,
+                        "score": slot.env.score,
+                        "snake_length": len(slot.env.snake),
+                        "steps": slot.env.steps,
+                        "rolling_score_100": float(statistics.mean(rolling_scores)),
+                        "terminal_event": terminal_event,
+                        "terminated": env_done and not truncated,
+                        "truncated": truncated,
+                        "duration_seconds": time.perf_counter() - slot.started_at,
+                        "render": (
+                            slot.env.render(to_string=True)
+                            if args.render_frequency
+                            and episodes_completed % args.render_frequency == 0
+                            else None
+                        ),
+                    }
+                )
+                if episodes_launched_this_run < args.episodes:
+                    slot.reset(run_seed=args.seed, seed_index=next_seed_index)
+                    next_seed_index += 1
+                    episodes_started += 1
+                    episodes_launched_this_run += 1
+                else:
+                    slot.active = False
+
+        collection_seconds = max(time.perf_counter() - collection_started, 1e-12)
+        if args.updates_per_collection > 0:
+            update_attempts = args.updates_per_collection
+        else:
+            update_attempts = (
+                (agent.behavior_steps // args.train_frequency)
+                - (behavior_steps_before // args.train_frequency)
+            ) * args.gradient_steps
+        learn_metrics: list[dict[str, float]] = []
+        updates_started = time.perf_counter()
+        for _ in range(update_attempts):
+            result = agent.learn()
+            if result is not None:
+                learn_metrics.append(result)
+        update_seconds = max(time.perf_counter() - updates_started, 1e-12)
 
         def metric_mean(name: str) -> float | None:
             values = [item[name] for item in learn_metrics if name in item]
             return float(statistics.mean(values)) if values else None
 
-        metrics: dict[str, Any] = {
-            "record_type": "episode",
-            "episode": episode,
-            "reward": total_env_reward,
-            "shaped_reward": total_shaped_reward,
-            "score": train_env.score,
-            "snake_length": len(train_env.snake),
-            "steps": train_env.steps,
+        sampling_seconds = sum(
+            item.get("sampling_seconds", 0.0) for item in learn_metrics
+        )
+        gpu_wait_seconds = sum(
+            item.get("gpu_wait_seconds", 0.0) for item in learn_metrics
+        )
+        collection_metrics: dict[str, Any] = {
+            "record_type": "collection",
+            "collection": collection_index,
+            "episodes_completed": episodes_completed,
+            "episodes_started": episodes_started,
+            "collection_transitions": collection_transitions,
+            "collection_update_attempts": update_attempts,
+            "collection_updates": len(learn_metrics),
+            "env_steps_per_second": collection_transitions / collection_seconds,
+            "updates_per_second": len(learn_metrics) / update_seconds,
+            "sampling_seconds": sampling_seconds,
+            "gpu_wait_seconds": gpu_wait_seconds,
+            "encoding_seconds": encoding_seconds,
+            "action_selection_seconds": action_selection_seconds,
+            "collection_seconds": collection_seconds,
+            "update_seconds": update_seconds,
             "epsilon": agent.epsilon,
             "behavior_steps": agent.behavior_steps,
             "learn_step_counter": agent.learn_step_counter,
@@ -944,16 +1128,20 @@ def train(args: argparse.Namespace | None = None) -> None:
             "avg_td_error": metric_mean("td_error"),
             "avg_grad_norm": metric_mean("grad_norm"),
             "avg_q_mean": metric_mean("q_mean"),
-            "rolling_score_100": float(statistics.mean(rolling_scores)),
-            "terminal_event": terminal_event,
-            "terminated": terminated,
-            "truncated": truncated,
-            "duration_seconds": time.perf_counter() - episode_started,
         }
+        for metrics in completed_summaries:
+            metrics.update(
+                {
+                    key: value
+                    for key, value in collection_metrics.items()
+                    if key not in {"record_type", "collection"}
+                }
+            )
 
-        should_evaluate = episode % args.eval_interval == 0
+        should_evaluate = episodes_completed >= next_eval_episode
         if should_evaluate:
             evaluation = evaluate_agent(agent, game_config, eval_seeds, step_limit)
+            metrics = completed_summaries[-1]
             for group in ("reward", "score", "steps"):
                 for name, value in evaluation[group].items():
                     metrics[f"eval_{group}_{name}"] = value
@@ -968,20 +1156,22 @@ def train(args: argparse.Namespace | None = None) -> None:
             )
             if improved:
                 best_eval_score = average_score
-                best_eval_episode = episode
+                best_eval_episode = episodes_completed
                 save_checkpoint(
                     agent,
                     output_path,
-                    episode=episode,
+                    episode=episodes_completed,
                     run_seed=args.seed,
                     best_eval_score=best_eval_score,
                     best_eval_episode=best_eval_episode,
                     train_args=args,
                     checkpoint_role="best_eval",
                     best_checkpoint_path=output_path,
+                    episodes_started=episodes_started,
                 )
                 print(
-                    f"New best fixed-suite score {best_eval_score:.3f} at episode {episode}; "
+                    f"New best fixed-suite score {best_eval_score:.3f} at episode "
+                    f"{episodes_completed}; "
                     f"saved {output_path}."
                 )
             if significant_improvement:
@@ -991,25 +1181,15 @@ def train(args: argparse.Namespace | None = None) -> None:
                 no_improvement_evals = 0
             else:
                 no_improvement_evals += 1
-            save_checkpoint(
-                agent,
-                latest_path,
-                episode=episode,
-                run_seed=args.seed,
-                best_eval_score=None
-                if best_eval_score == -math.inf
-                else best_eval_score,
-                best_eval_episode=best_eval_episode,
-                train_args=args,
-                checkpoint_role="latest",
-                best_checkpoint_path=output_path,
-            )
+            while next_eval_episode <= episodes_completed:
+                next_eval_episode += args.eval_interval
 
-        if episode % args.checkpoint_interval == 0 and not should_evaluate:
+        should_checkpoint = episodes_completed >= next_checkpoint_episode
+        if should_checkpoint or should_evaluate:
             save_checkpoint(
                 agent,
                 latest_path,
-                episode=episode,
+                episode=episodes_completed,
                 run_seed=args.seed,
                 best_eval_score=None
                 if best_eval_score == -math.inf
@@ -1018,29 +1198,38 @@ def train(args: argparse.Namespace | None = None) -> None:
                 train_args=args,
                 checkpoint_role="latest",
                 best_checkpoint_path=output_path,
+                episodes_started=episodes_started,
             )
+            while next_checkpoint_episode <= episodes_completed:
+                next_checkpoint_episode += args.checkpoint_interval
 
         with log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(metrics, ensure_ascii=False) + "\n")
-        final_episode = episode
-
-        if args.render_frequency and episode % args.render_frequency == 0:
-            print(train_env.render(to_string=True))
-        if episode % 10 == 0 or episode == start_episode:
-            print(
-                f"Episode {episode:6d} | score={train_env.score:3d} | "
-                f"rolling100={metrics['rolling_score_100']:.2f} | steps={train_env.steps:4d} | "
-                f"epsilon={agent.epsilon:.3f} | loss={metrics['avg_loss']} | {terminal_event}"
-            )
+            stream.write(json.dumps(collection_metrics, ensure_ascii=False) + "\n")
+            for metrics in completed_summaries:
+                rendered = metrics.pop("render")
+                stream.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+                if rendered is not None:
+                    print(rendered)
+                episode = int(metrics["episode"])
+                if episode % 10 == 0 or episode == start_episode:
+                    print(
+                        f"Episode {episode:6d} | score={metrics['score']:3d} | "
+                        f"rolling100={metrics['rolling_score_100']:.2f} | "
+                        f"steps={metrics['steps']:4d} | epsilon={agent.epsilon:.3f} | "
+                        f"loss={metrics['avg_loss']} | {metrics['terminal_event']} | "
+                        f"env={collection_metrics['env_steps_per_second']:.1f} steps/s | "
+                        f"updates={collection_metrics['updates_per_second']:.1f}/s | "
+                        f"sample={sampling_seconds:.3f}s | gpu_wait={gpu_wait_seconds:.3f}s"
+                    )
         if (
             args.early_stop_patience > 0
             and no_improvement_evals >= args.early_stop_patience
         ):
             print(
-                f"Early stopping at episode {episode}; best fixed-suite score "
+                f"Early stopping at episode {episodes_completed}; best fixed-suite score "
                 f"{best_eval_score:.3f} at {best_eval_episode}."
             )
-            break
+            stop_requested = True
 
     save_checkpoint(
         agent,
@@ -1052,6 +1241,7 @@ def train(args: argparse.Namespace | None = None) -> None:
         train_args=args,
         checkpoint_role="latest",
         best_checkpoint_path=output_path,
+        episodes_started=episodes_started,
     )
     print(
         f"Training complete. Latest: {latest_path}; "
