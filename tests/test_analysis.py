@@ -114,6 +114,37 @@ def test_zero_eval_reward_ranks_above_negative_reward(tmp_path: Path) -> None:
     assert report["evaluation"]["best"]["episode"] == 1
 
 
+def test_standalone_baseline_participates_and_raw_score_selects_best(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "baseline.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "record_type": "evaluation",
+                "evaluation_kind": "warm_start_baseline",
+                "episode": 0,
+                "eval_score_mean": 7.0,
+                "eval_reward_mean": -100.0,
+            },
+            {
+                "record_type": "episode",
+                "episode": 10,
+                "eval_score_mean": 6.0,
+                "eval_reward_mean": 100.0,
+            },
+        ],
+    )
+
+    report = _report(path, plateau_window=1)
+
+    assert report["evaluation"]["count"] == 2
+    assert report["evaluation"]["best_by"] == "avg_score"
+    assert report["evaluation"]["best"]["episode"] == 0
+    assert report["evaluation"]["best"]["avg_score"] == pytest.approx(7.0)
+
+
 def test_plateau_is_explicitly_a_non_statistical_heuristic() -> None:
     flat = analyze_training.diagnose_plateau(
         [10.0] * 20,

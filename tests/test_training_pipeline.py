@@ -13,6 +13,7 @@ from dqn_agent import DQNAgent, flatten_observation
 from env import Action, GameConfig, RelativeAction, SnakeGameEnv
 from play_dqn import absolute_action, run_episode
 from train_dqn import (
+    EvaluationConvergenceController,
     _prepare_fresh_outputs,
     _release_accelerator_resources,
     accelerator_runtime_info,
@@ -22,12 +23,152 @@ from train_dqn import (
     load_warm_start_metadata,
     parse_args,
     potential_shaping,
+    restore_convergence_controller,
     save_checkpoint,
     state_potential,
     train,
+    validate_resume_agent_options,
     validate_resume_seed,
+    validate_resume_identity,
     validate_v3_contract,
 )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--lr-plateau-patience", "-1"],
+        ["--lr-plateau-factor", "0"],
+        ["--lr-plateau-factor", "1"],
+        ["--lr-plateau-min", "0"],
+        ["--lr-plateau-min", "-0.1"],
+        ["--lr", "0.001", "--lr-plateau-patience", "1", "--lr-plateau-min", "0.002"],
+        ["--early-stop-patience", "-1"],
+        ["--early-stop-delta", "-0.1"],
+        ["--early-stop-delta", "nan"],
+    ],
+)
+def test_convergence_cli_rejects_invalid_ranges(options: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(options)
+
+
+def test_convergence_controller_reduces_to_min_then_gates_early_stop() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.1)
+    controller = EvaluationConvergenceController(
+        lr_plateau_patience=2,
+        lr_plateau_factor=0.5,
+        lr_plateau_min=0.025,
+        early_stop_patience=2,
+        early_stop_delta=1.0,
+    )
+
+    assert controller.observe(10.0, optimizer)["significant_improvement"]
+    assert not controller.observe(10.5, optimizer)["lr_reduced"]
+    assert controller.observe(10.8, optimizer)["learning_rates"] == [0.05]
+    assert not controller.observe(10.9, optimizer)["lr_reduced"]
+    reached_min = controller.observe(10.7, optimizer)
+    assert reached_min["learning_rates"] == [0.025]
+    assert reached_min["at_min_lr"]
+    assert reached_min["min_lr_evaluations"] == 0
+    assert not controller.observe(10.6, optimizer)["should_stop"]
+    assert controller.observe(10.4, optimizer)["should_stop"]
+
+
+def test_convergence_controller_significant_improvement_resets_patience() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.1)
+    controller = EvaluationConvergenceController(2, 0.5, 0.01, 3, 1.0)
+
+    controller.observe(5.0, optimizer)
+    controller.observe(5.5, optimizer)
+    decision = controller.observe(6.0, optimizer)
+
+    assert decision["significant_improvement"]
+    assert decision["reference_score"] == 6.0
+    assert decision["plateau_evaluations"] == 0
+    assert decision["min_lr_evaluations"] == 0
+
+
+def test_convergence_controller_without_scheduler_preserves_legacy_early_stop() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.1)
+    controller = EvaluationConvergenceController(0, 0.5, 0.01, 2, 1.0)
+
+    controller.observe(5.0, optimizer)
+    assert not controller.observe(5.5, optimizer)["should_stop"]
+    decision = controller.observe(5.4, optimizer)
+
+    assert decision["should_stop"]
+    assert decision["decision"] == "early_stop_patience"
+    assert decision["learning_rates"] == [0.1]
+
+
+def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) -> None:
+    config = GameConfig(width=5, height=5, max_episode_steps=2)
+    agent = make_agent(config)
+    agent.optimizer.param_groups[0]["lr"] = 5e-5
+    controller = EvaluationConvergenceController(2, 0.5, 1e-5, 4, 0.75)
+    controller.reference_score = 3.0
+    controller.plateau_evaluations = 1
+    checkpoint = tmp_path / "latest.pt"
+    args = parse_args(
+        [
+            "--width", "5", "--height", "5", "--max-steps", "2",
+            "--output", str(tmp_path / "best.pt"),
+            "--latest-output", str(checkpoint),
+        ]
+    )
+    save_checkpoint(
+        agent,
+        checkpoint,
+        episode=2,
+        run_seed=args.seed,
+        best_eval_score=3.0,
+        best_eval_episode=2,
+        train_args=args,
+        checkpoint_role="latest",
+        convergence_controller=controller,
+    )
+    metadata = load_resume_metadata(checkpoint, ignore_mismatch=False)
+    loaded_agent = DQNAgent.load(str(checkpoint), device="cpu")
+    resume_args = parse_args(
+        [
+            "--resume-from", str(checkpoint),
+            "--output", str(tmp_path / "best.pt"),
+            "--latest-output", str(checkpoint),
+        ]
+    )
+    restored = restore_convergence_controller(
+        metadata, resume_args, loaded_agent, legacy_reference_score=3.0
+    )
+    assert restored.to_dict() == controller.to_dict()
+    assert resume_args.lr_plateau_patience == 2
+    assert metadata["base_learning_rate"] == pytest.approx(agent.lr)
+    assert metadata["current_learning_rates"] == [5e-5]
+
+    conflict_args = parse_args(
+        [
+            "--resume-from", str(checkpoint),
+            "--lr-plateau-factor", "0.25",
+            "--output", str(tmp_path / "best.pt"),
+            "--latest-output", str(checkpoint),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="scheduler/early-stop options conflict"):
+        restore_convergence_controller(
+            metadata, conflict_args, loaded_agent, legacy_reference_score=3.0
+        )
+
+
+def test_resume_lr_option_compares_base_lr_not_scheduled_optimizer_lr() -> None:
+    agent = make_agent(GameConfig(width=5, height=5))
+    agent.optimizer.param_groups[0]["lr"] = 5e-5
+
+    validate_resume_agent_options(parse_args(["--lr", str(agent.lr)]), agent)
+    with pytest.raises(RuntimeError, match="hyperparameters conflict"):
+        validate_resume_agent_options(parse_args(["--lr", "0.0003"]), agent)
 
 
 def make_agent(config: GameConfig, action_dim: int = 3) -> DQNAgent:
@@ -156,6 +297,21 @@ def test_episode_seed_is_stable_and_stream_separated() -> None:
     assert deterministic_episode_seed(42, 5, 0) != deterministic_episode_seed(42, 5, 1)
 
 
+def test_full_resume_rejects_best_checkpoint_role() -> None:
+    agent = make_agent(GameConfig(width=5, height=5))
+    metadata = {
+        "checkpoint_role": "best_eval",
+        "network_version": agent.network_version,
+        "action_dim": agent.action_dim,
+        "obs_shape": list(agent.obs_shape),
+        "behavior_steps": agent.behavior_steps,
+        "learn_step_counter": agent.learn_step_counter,
+    }
+
+    with pytest.raises(RuntimeError, match="Use --warm-start-from"):
+        validate_resume_identity(metadata, agent)
+
+
 def test_state_potential_is_bounded() -> None:
     env = SnakeGameEnv(GameConfig(width=6, height=6))
     env.reset(seed=2)
@@ -174,6 +330,23 @@ def test_terminal_potential_shaping_has_no_bootstrap_value() -> None:
 def test_output_paths_must_be_distinct() -> None:
     with pytest.raises(SystemExit):
         parse_args(["--output", "same.pt", "--latest-output", "same.pt"])
+
+
+def test_resume_source_cannot_be_the_best_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "best.pt"
+    source.write_bytes(b"checkpoint")
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--resume-from", str(source),
+                "--output", str(source),
+                "--latest-output", str(tmp_path / "latest.pt"),
+            ]
+        )
+    assert "immutable best" in capsys.readouterr().err
 
 
 def test_warm_start_arguments_require_one_distinct_existing_source(
@@ -463,6 +636,7 @@ def test_invalid_warm_start_never_deletes_existing_outputs(tmp_path: Path) -> No
 
 def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "source.pt"
     save_source_checkpoint(source)
@@ -515,8 +689,21 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
             "--disable-amp",
         ]
     )
+    original_evaluate = training_module.evaluate_agent
+    baseline_calls: list[tuple[int, int]] = []
+
+    def checked_evaluate(*call_args: object, **call_kwargs: object) -> dict[str, object]:
+        evaluated_agent = call_args[0]
+        assert isinstance(evaluated_agent, DQNAgent)
+        baseline_calls.append(
+            (evaluated_agent.behavior_steps, evaluated_agent.learn_step_counter)
+        )
+        return original_evaluate(*call_args, **call_kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(training_module, "evaluate_agent", checked_evaluate)
     train(args)
 
+    assert baseline_calls == [(0, 0)]
     assert file_sha256(source) == source_hash
     assert file_sha256(source_sidecar) == source_sidecar_hash
     metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
@@ -545,6 +732,16 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
     assert run_start["start_episode"] == 1
     assert run_start["resume_path"] is None
     assert run_start["warm_start_provenance"] == provenance
+    baseline = next(
+        record
+        for record in records
+        if record["record_type"] == "evaluation" and record["episode"] == 0
+    )
+    assert baseline["evaluation_kind"] == "warm_start_baseline"
+    assert baseline["eval_score_mean"] == metadata["best_eval_score"]
+    assert baseline["convergence_decision"]["significant_improvement"] is True
+    assert baseline["current_learning_rates"] == [0.003]
+    assert all(record.get("episode") != 0 for record in records if record["record_type"] == "episode")
 
     resume_args = parse_args(
         [
@@ -581,6 +778,71 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
     assert resumed["warm_start_provenance"] == provenance
     assert file_sha256(source) == source_hash
     assert file_sha256(source_sidecar) == source_sidecar_hash
+
+
+def test_warm_start_baseline_survives_regression_and_min_lr_stops_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pt"
+    save_source_checkpoint(source)
+    source_hash = file_sha256(source)
+    source_sidecar_hash = file_sha256(source.with_suffix(".meta.json"))
+    best = tmp_path / "stable-best.pt"
+    latest = tmp_path / "stable-latest.pt"
+    scores = iter((5.0, 3.0, 3.0))
+
+    def fake_evaluate(*_args: object, **_kwargs: object) -> dict[str, object]:
+        score = next(scores)
+        distribution = {
+            "mean": score,
+            "std": 0.0,
+            "ci95_low": score,
+            "ci95_high": score,
+            "median": score,
+            "p10": score,
+            "p90": score,
+            "min": score,
+            "max": score,
+        }
+        return {
+            "reward": dict(distribution),
+            "score": dict(distribution),
+            "steps": dict(distribution),
+            "terminal_events": {"test": 1},
+            "truncated_count": 0,
+            "episodes": 1,
+        }
+
+    monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
+    args = parse_args(
+        [
+            "--episodes", "10", "--width", "5", "--height", "5",
+            "--max-steps", "1", "--eval-interval", "1", "--eval-episodes", "1",
+            "--checkpoint-interval", "1", "--batch-size", "2", "--min-replay", "32",
+            "--replay-capacity", "64", "--hidden", "16",
+            "--lr-plateau-patience", "1", "--lr-plateau-factor", "0.5",
+            "--lr-plateau-min", "0.0001", "--early-stop-patience", "1",
+            "--early-stop-delta", "1.0",
+            "--warm-start-from", str(source), "--output", str(best),
+            "--latest-output", str(latest), "--log-dir", str(tmp_path / "logs"),
+            "--device", "cpu", "--disable-amp",
+        ]
+    )
+
+    train(args)
+
+    best_metadata = json.loads(best.with_suffix(".meta.json").read_text("utf-8"))
+    latest_metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    assert best_metadata["best_eval_score"] == pytest.approx(5.0)
+    assert best_metadata["best_eval_episode"] == 0
+    assert latest_metadata["best_eval_score"] == pytest.approx(5.0)
+    assert latest_metadata["best_eval_episode"] == 0
+    assert latest_metadata["episodes_completed"] == 2
+    assert latest_metadata["current_learning_rates"] == [0.0001]
+    assert latest_metadata["convergence_controller"]["state"]["reductions"] == 1
+    assert latest_metadata["convergence_controller"]["state"]["min_lr_evaluations"] == 1
+    assert file_sha256(source) == source_hash
+    assert file_sha256(source.with_suffix(".meta.json")) == source_sidecar_hash
 
 
 def test_short_training_creates_distinct_latest_and_best(tmp_path: Path) -> None:

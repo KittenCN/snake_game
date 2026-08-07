@@ -157,25 +157,14 @@ def _evaluation_summary(records: Sequence[LogRecord]) -> dict[str, Any]:
     ]
     if not evaluations:
         return {"count": 0, "best": None, "last": None, "best_by": None}
-    reward_rows = [
+    score_rows = [
         r
         for r in evaluations
-        if _first_number(r, ("eval_reward_mean", "eval_avg_reward")) is not None
+        if _first_number(r, ("eval_score_mean", "eval_avg_score")) is not None
     ]
-    if reward_rows:
+    if score_rows:
         best = max(
-            reward_rows,
-            key=lambda r: (
-                value
-                if (value := _first_number(r, ("eval_reward_mean", "eval_avg_reward")))
-                is not None
-                else -math.inf
-            ),
-        )
-        best_by = "avg_reward"
-    else:
-        best = max(
-            evaluations,
+            score_rows,
             key=lambda r: (
                 value
                 if (value := _first_number(r, ("eval_score_mean", "eval_avg_score")))
@@ -184,6 +173,17 @@ def _evaluation_summary(records: Sequence[LogRecord]) -> dict[str, Any]:
             ),
         )
         best_by = "avg_score"
+    else:
+        best = max(
+            evaluations,
+            key=lambda r: (
+                value
+                if (value := _first_number(r, ("eval_reward_mean", "eval_avg_reward")))
+                is not None
+                else -math.inf
+            ),
+        )
+        best_by = "avg_reward"
     return {
         "count": len(evaluations),
         "best": _evaluation_entry(best),

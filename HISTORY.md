@@ -1,5 +1,13 @@
 # History
 
+## 0.4.3 - 2026-08-07
+
+- Added a serializable fixed-suite convergence controller with optional plateau LR reductions and minimum-LR-gated early stopping.
+- Kept raw mean score as the sole best-checkpoint selector while using the absolute early-stop delta only for significant-improvement patience resets.
+- Persisted and verified controller state, base/current learning rates, and safe resume option inheritance/conflict rejection.
+- Added mandatory episode-0 fixed-suite baselines and distinct atomic best/latest outputs for authenticated warm starts without modifying their sources.
+- Made JSONL diagnostics include standalone baselines and select best evaluations by raw score consistently with training.
+
 ## 0.4.2 - 2026-08-07
 
 - Validated native Windows ROCm 7.14 training on an AMD Radeon RX 7600M XT (`gfx1102`).

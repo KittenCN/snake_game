@@ -39,6 +39,186 @@ except ImportError:
 
 CHECKPOINT_FORMAT = 3
 V3_OBSERVATION_CHANNELS = 20
+CONVERGENCE_CONTROLLER_VERSION = 1
+
+
+@dataclass
+class EvaluationConvergenceController:
+    """Serializable fixed-suite convergence policy.
+
+    Raw fixed-suite score is deliberately the sole signal.  Checkpoint selection
+    remains separate: a non-significant score can still be a new raw-score best.
+    """
+
+    lr_plateau_patience: int
+    lr_plateau_factor: float
+    lr_plateau_min: float
+    early_stop_patience: int
+    early_stop_delta: float
+    reference_score: float | None = None
+    plateau_evaluations: int = 0
+    min_lr_evaluations: int = 0
+    reductions: int = 0
+    evaluations: int = 0
+
+    @property
+    def scheduler_enabled(self) -> bool:
+        return self.lr_plateau_patience > 0
+
+    def reset(self, reference_score: float | None = None) -> None:
+        self.reference_score = reference_score
+        self.plateau_evaluations = 0
+        self.min_lr_evaluations = 0
+        self.reductions = 0
+        self.evaluations = 0
+
+    @staticmethod
+    def learning_rates(optimizer: torch.optim.Optimizer) -> list[float]:
+        return [float(group["lr"]) for group in optimizer.param_groups]
+
+    def at_min_lr(self, optimizer: torch.optim.Optimizer) -> bool:
+        tolerance = max(1e-15, abs(self.lr_plateau_min) * 1e-12)
+        return all(
+            lr <= self.lr_plateau_min + tolerance
+            for lr in self.learning_rates(optimizer)
+        )
+
+    def observe(
+        self, score: float, optimizer: torch.optim.Optimizer
+    ) -> dict[str, Any]:
+        if not math.isfinite(score):
+            raise ValueError("Evaluation score must be finite")
+        before_reference = self.reference_score
+        before_lrs = self.learning_rates(optimizer)
+        self.evaluations += 1
+        significant = (
+            before_reference is None
+            or score >= before_reference + self.early_stop_delta
+        )
+        reduced = False
+        stop = False
+        decision = "significant_improvement"
+
+        if significant:
+            self.reference_score = (
+                score if before_reference is None else max(before_reference, score)
+            )
+            self.plateau_evaluations = 0
+            self.min_lr_evaluations = 0
+        elif not self.scheduler_enabled:
+            self.plateau_evaluations += 1
+            decision = "early_stop_patience"
+            stop = (
+                self.early_stop_patience > 0
+                and self.plateau_evaluations >= self.early_stop_patience
+            )
+        elif self.at_min_lr(optimizer):
+            self.min_lr_evaluations += 1
+            decision = "min_lr_early_stop_patience"
+            stop = (
+                self.early_stop_patience > 0
+                and self.min_lr_evaluations >= self.early_stop_patience
+            )
+        else:
+            self.plateau_evaluations += 1
+            decision = "lr_plateau_patience"
+            if self.plateau_evaluations >= self.lr_plateau_patience:
+                for group in optimizer.param_groups:
+                    group["lr"] = max(
+                        self.lr_plateau_min,
+                        float(group["lr"]) * self.lr_plateau_factor,
+                    )
+                self.reductions += 1
+                self.plateau_evaluations = 0
+                self.min_lr_evaluations = 0
+                reduced = True
+                decision = "lr_reduced"
+
+        after_lrs = self.learning_rates(optimizer)
+        return {
+            "score": score,
+            "decision": decision,
+            "significant_improvement": significant,
+            "lr_reduced": reduced,
+            "should_stop": stop,
+            "reference_score_before": before_reference,
+            "reference_score": self.reference_score,
+            "learning_rates_before": before_lrs,
+            "learning_rates": after_lrs,
+            "at_min_lr": self.at_min_lr(optimizer),
+            "plateau_evaluations": self.plateau_evaluations,
+            "min_lr_evaluations": self.min_lr_evaluations,
+            "reductions": self.reductions,
+            "evaluations": self.evaluations,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": CONVERGENCE_CONTROLLER_VERSION,
+            "config": {
+                "lr_plateau_patience": self.lr_plateau_patience,
+                "lr_plateau_factor": self.lr_plateau_factor,
+                "lr_plateau_min": self.lr_plateau_min,
+                "early_stop_patience": self.early_stop_patience,
+                "early_stop_delta": self.early_stop_delta,
+            },
+            "state": {
+                "reference_score": self.reference_score,
+                "plateau_evaluations": self.plateau_evaluations,
+                "min_lr_evaluations": self.min_lr_evaluations,
+                "reductions": self.reductions,
+                "evaluations": self.evaluations,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> EvaluationConvergenceController:
+        if payload.get("version") != CONVERGENCE_CONTROLLER_VERSION:
+            raise RuntimeError(
+                "Unsupported convergence controller sidecar version: "
+                f"{payload.get('version')!r}"
+            )
+        config = payload.get("config")
+        state = payload.get("state")
+        if not isinstance(config, dict) or not isinstance(state, dict):
+            raise RuntimeError("Convergence controller sidecar is missing config/state")
+        controller = cls(
+            lr_plateau_patience=int(config["lr_plateau_patience"]),
+            lr_plateau_factor=float(config["lr_plateau_factor"]),
+            lr_plateau_min=float(config["lr_plateau_min"]),
+            early_stop_patience=int(config["early_stop_patience"]),
+            early_stop_delta=float(config["early_stop_delta"]),
+            reference_score=(
+                None
+                if state.get("reference_score") is None
+                else float(state["reference_score"])
+            ),
+            plateau_evaluations=int(state.get("plateau_evaluations", 0)),
+            min_lr_evaluations=int(state.get("min_lr_evaluations", 0)),
+            reductions=int(state.get("reductions", 0)),
+            evaluations=int(state.get("evaluations", 0)),
+        )
+        controller.validate()
+        return controller
+
+    def validate(self) -> None:
+        if self.lr_plateau_patience < 0 or self.early_stop_patience < 0:
+            raise RuntimeError("Controller patience values must be non-negative")
+        if not 0.0 < self.lr_plateau_factor < 1.0:
+            raise RuntimeError("Controller LR plateau factor must be between 0 and 1")
+        if not math.isfinite(self.lr_plateau_min) or self.lr_plateau_min <= 0:
+            raise RuntimeError("Controller minimum LR must be finite and positive")
+        if not math.isfinite(self.early_stop_delta) or self.early_stop_delta < 0:
+            raise RuntimeError("Controller early-stop delta must be finite and non-negative")
+        if self.reference_score is not None and not math.isfinite(self.reference_score):
+            raise RuntimeError("Controller reference score must be finite or null")
+        if min(
+            self.plateau_evaluations,
+            self.min_lr_evaluations,
+            self.reductions,
+            self.evaluations,
+        ) < 0:
+            raise RuntimeError("Controller counters must be non-negative")
 
 
 def _same_artifact(first: Path, second: Path) -> bool:
@@ -190,6 +370,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--early-stop-patience", type=int, default=0)
     parser.add_argument("--early-stop-delta", type=float, default=0.25)
+    parser.add_argument(
+        "--lr-plateau-patience",
+        type=int,
+        default=0,
+        help="Non-significant fixed-suite evaluations before reducing LR; 0 disables",
+    )
+    parser.add_argument("--lr-plateau-factor", type=float, default=0.5)
+    parser.add_argument("--lr-plateau-min", type=float, default=1e-6)
     # Accepted only to make old commands fail safe instead of re-enabling the rollback loop.
     parser.add_argument(
         "--resume-best-on-decline", action="store_true", help=argparse.SUPPRESS
@@ -214,6 +402,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("num-envs and rollout-steps must be positive")
     if args.updates_per_collection < 0:
         parser.error("updates-per-collection must be non-negative")
+    if args.early_stop_patience < 0 or args.lr_plateau_patience < 0:
+        parser.error("early-stop-patience and lr-plateau-patience must be non-negative")
+    if not math.isfinite(args.early_stop_delta) or args.early_stop_delta < 0:
+        parser.error("early-stop-delta must be finite and non-negative")
+    if not 0.0 < args.lr_plateau_factor < 1.0:
+        parser.error("lr-plateau-factor must be greater than 0 and less than 1")
+    if not math.isfinite(args.lr_plateau_min) or args.lr_plateau_min <= 0:
+        parser.error("lr-plateau-min must be finite and positive")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("lr must be finite and positive")
+    if args.lr_plateau_patience > 0 and args.lr_plateau_min > args.lr:
+        parser.error("lr-plateau-min must not exceed the initial lr")
     output_artifacts = (
         ("--output", Path(args.output)),
         ("--output sidecar", sidecar_path(Path(args.output))),
@@ -229,6 +429,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     explicit_source = args.warm_start_from or args.resume_from
     if explicit_source is not None and not Path(explicit_source).is_file():
         parser.error(f"Checkpoint not found: {explicit_source}")
+    if args.resume_from is not None and _same_artifact(
+        Path(args.resume_from), Path(args.output)
+    ):
+        parser.error(
+            "--resume-from must differ from --output; resume a latest checkpoint or "
+            "use --warm-start-from so an immutable best cannot be overwritten"
+        )
     if args.warm_start_from is not None:
         source = Path(args.warm_start_from).resolve()
         source_artifacts = (
@@ -527,7 +734,11 @@ def effective_agent_config(agent: DQNAgent) -> dict[str, Any]:
     return {
         "network_version": agent.network_version,
         "hidden_sizes": list(agent.hidden_sizes),
+        "base_lr": float(agent.lr),
+        # Kept for sidecar compatibility; this field has historically held the
+        # optimizer's current per-group values rather than the base LR.
         "lr": learning_rates,
+        "current_learning_rates": learning_rates,
         "gamma": agent.gamma,
         "batch_size": agent.batch_size,
         "replay_capacity": agent.replay_capacity,
@@ -561,6 +772,7 @@ def save_checkpoint(
     best_checkpoint_path: Path | None = None,
     episodes_started: int | None = None,
     warm_start_provenance: dict[str, Any] | None = None,
+    convergence_controller: EvaluationConvergenceController | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     agent.save(str(path))
@@ -601,6 +813,15 @@ def save_checkpoint(
         "replay_restored": False,
         "game_config": asdict(agent.game_config) if agent.game_config else None,
         "effective_agent_config": effective_agent_config(agent),
+        "base_learning_rate": float(agent.lr),
+        "current_learning_rates": EvaluationConvergenceController.learning_rates(
+            agent.optimizer
+        ),
+        "convergence_controller": (
+            convergence_controller.to_dict()
+            if convergence_controller is not None
+            else None
+        ),
         "train_args": vars(train_args),
         "warm_start_provenance": warm_start_provenance,
     }
@@ -720,6 +941,14 @@ def validate_resume_identity(metadata: dict[str, Any], agent: DQNAgent) -> None:
             )
         )
 
+    role = metadata.get("checkpoint_role")
+    if role != "latest":
+        raise RuntimeError(
+            "Full resume requires a latest checkpoint sidecar; "
+            f"got checkpoint_role={role!r}. Use --warm-start-from for a best_eval "
+            "checkpoint so the immutable source cannot be overwritten."
+        )
+
 
 def validate_v3_contract(agent: DQNAgent) -> None:
     if agent.network_version < 3:
@@ -741,7 +970,7 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
     checks: dict[str, tuple[Any, Any]] = {
         "--network-version": (args.network_version, agent.network_version),
         "--hidden": (tuple(args.hidden), tuple(agent.hidden_sizes)),
-        "--lr": (float(args.lr), float(agent.optimizer.param_groups[0]["lr"])),
+        "--lr": (float(args.lr), float(agent.lr)),
         "--gamma": (args.gamma, agent.gamma),
         "--batch-size": (args.batch_size, agent.batch_size),
         "--replay-capacity": (args.replay_capacity, agent.replay_capacity),
@@ -777,6 +1006,91 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
             + detail
             + ". Start a fresh run for a new optimizer/agent configuration."
         )
+
+
+_CONTROLLER_OPTIONS = {
+    "--lr-plateau-patience": "lr_plateau_patience",
+    "--lr-plateau-factor": "lr_plateau_factor",
+    "--lr-plateau-min": "lr_plateau_min",
+    "--early-stop-patience": "early_stop_patience",
+    "--early-stop-delta": "early_stop_delta",
+}
+
+
+def _new_convergence_controller(
+    args: argparse.Namespace, *, reference_score: float | None = None
+) -> EvaluationConvergenceController:
+    controller = EvaluationConvergenceController(
+        lr_plateau_patience=args.lr_plateau_patience,
+        lr_plateau_factor=args.lr_plateau_factor,
+        lr_plateau_min=args.lr_plateau_min,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_delta=args.early_stop_delta,
+        reference_score=reference_score,
+    )
+    controller.validate()
+    return controller
+
+
+def restore_convergence_controller(
+    metadata: dict[str, Any],
+    args: argparse.Namespace,
+    agent: DQNAgent,
+    *,
+    legacy_reference_score: float | None,
+) -> EvaluationConvergenceController:
+    """Restore controller policy/state and verify its optimizer linkage."""
+    optimizer_lrs = EvaluationConvergenceController.learning_rates(agent.optimizer)
+    stored_lrs = metadata.get("current_learning_rates") if metadata else None
+    if stored_lrs is not None:
+        if not isinstance(stored_lrs, list):
+            raise RuntimeError("Resume current_learning_rates must be a list")
+        parsed_lrs = [float(value) for value in stored_lrs]
+        matches = len(parsed_lrs) == len(optimizer_lrs) and all(
+            math.isclose(expected, actual, rel_tol=1e-12, abs_tol=1e-15)
+            for expected, actual in zip(parsed_lrs, optimizer_lrs, strict=True)
+        )
+        if not matches:
+            raise RuntimeError(
+                "Resume sidecar current learning rates conflict with checkpoint "
+                f"optimizer state: sidecar={parsed_lrs}, optimizer={optimizer_lrs}."
+            )
+
+    payload = metadata.get("convergence_controller") if metadata else None
+    if payload is None:
+        if metadata:
+            print(
+                "Warning: resume sidecar has no convergence controller state; "
+                "initializing from the saved best score with zero patience counters."
+            )
+        return _new_convergence_controller(
+            args, reference_score=legacy_reference_score
+        )
+    if not isinstance(payload, dict):
+        raise RuntimeError("Resume convergence_controller must be a JSON object")
+    restored = EvaluationConvergenceController.from_dict(payload)
+    if restored.scheduler_enabled and restored.lr_plateau_min > float(agent.lr):
+        raise RuntimeError(
+            "Resume convergence controller minimum LR exceeds the checkpoint base LR: "
+            f"minimum={restored.lr_plateau_min}, base={agent.lr}."
+        )
+    provided = set(getattr(args, "_provided_options", ()))
+    conflicts: list[str] = []
+    for option, attribute in _CONTROLLER_OPTIONS.items():
+        stored = getattr(restored, attribute)
+        requested = getattr(args, attribute)
+        if option in provided and requested != stored:
+            conflicts.append(
+                f"{option}=requested:{requested!r}/checkpoint:{stored!r}"
+            )
+        elif option not in provided:
+            setattr(args, attribute, stored)
+    if conflicts:
+        raise RuntimeError(
+            "Explicit scheduler/early-stop options conflict with the resumed "
+            "convergence controller: " + ", ".join(conflicts)
+        )
+    return restored
 
 
 def validate_resume_seed(metadata: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1037,6 +1351,7 @@ def _train(args: argparse.Namespace) -> None:
     best_eval_score = -math.inf
     best_eval_episode: int | None = None
     warm_start_provenance: dict[str, Any] | None = None
+    controller: EvaluationConvergenceController
     if resume_path is not None:
         metadata = load_resume_metadata(
             resume_path, ignore_mismatch=args.ignore_resume_metadata
@@ -1068,12 +1383,24 @@ def _train(args: argparse.Namespace) -> None:
             episodes_completed = int(metadata.get("episodes_completed", 0))
             start_episode = episodes_completed + 1
             episodes_started = int(metadata.get("episodes_started", episodes_completed))
+        stored_best = metadata.get("best_eval_score") if metadata else None
+        controller = restore_convergence_controller(
+            metadata,
+            args,
+            agent,
+            legacy_reference_score=(
+                None if stored_best is None else float(stored_best)
+            ),
+        )
+        if metadata:
             best_eval_score, best_eval_episode = validate_resume_best(
                 metadata,
                 args,
                 game_config,
                 output_path,
             )
+        if args.reset_best_evaluation:
+            controller.reset()
         _reheat_exploration(agent, args.resume_epsilon)
         print(
             f"Resuming {resume_path} at episode {start_episode}; replay starts empty and "
@@ -1081,6 +1408,7 @@ def _train(args: argparse.Namespace) -> None:
         )
     else:
         agent = _new_agent(args, game_config, train_env)
+        controller = _new_convergence_controller(args)
         if args.warm_start_from:
             source = Path(args.warm_start_from)
             (
@@ -1119,8 +1447,6 @@ def _train(args: argparse.Namespace) -> None:
     log_path = log_dir / f"train_log_{int(time.time())}.jsonl"
     eval_seeds = [args.eval_seed_base + index for index in range(args.eval_episodes)]
     rolling_scores: deque[int] = deque(maxlen=100)
-    no_improvement_evals = 0
-    early_stop_reference_score = best_eval_score
     episodes_completed = start_episode - 1
     final_episode = episodes_completed
     initial_completed = episodes_completed
@@ -1137,12 +1463,6 @@ def _train(args: argparse.Namespace) -> None:
         _TrainingSlot(stream_id=index, env=SnakeGameEnv(game_config))
         for index in range(min(args.num_envs, args.episodes))
     ]
-    for slot in slots:
-        slot.reset(run_seed=args.seed, seed_index=next_seed_index)
-        next_seed_index += 1
-        episodes_started += 1
-        episodes_launched_this_run += 1
-
     current_encoder = BatchObservationEncoder(
         game_config.width,
         game_config.height,
@@ -1182,11 +1502,79 @@ def _train(args: argparse.Namespace) -> None:
                     "observation_pinned": current_encoder.is_pinned,
                     "runtime": runtime_info,
                     "eval_seeds": eval_seeds,
+                    "current_learning_rates": controller.learning_rates(
+                        agent.optimizer
+                    ),
+                    "convergence_controller": controller.to_dict(),
                     "args": vars(args),
                 }
             )
             + "\n"
         )
+
+    if args.warm_start_from:
+        baseline = evaluate_agent(agent, game_config, eval_seeds, step_limit)
+        baseline_score = float(baseline["score"]["mean"])
+        controller_decision = controller.observe(baseline_score, agent.optimizer)
+        best_eval_score = baseline_score
+        best_eval_episode = 0
+        save_checkpoint(
+            agent,
+            output_path,
+            episode=0,
+            run_seed=args.seed,
+            best_eval_score=best_eval_score,
+            best_eval_episode=best_eval_episode,
+            train_args=args,
+            checkpoint_role="best_eval",
+            best_checkpoint_path=output_path,
+            episodes_started=0,
+            warm_start_provenance=warm_start_provenance,
+            convergence_controller=controller,
+        )
+        save_checkpoint(
+            agent,
+            latest_path,
+            episode=0,
+            run_seed=args.seed,
+            best_eval_score=best_eval_score,
+            best_eval_episode=best_eval_episode,
+            train_args=args,
+            checkpoint_role="latest",
+            best_checkpoint_path=output_path,
+            episodes_started=0,
+            warm_start_provenance=warm_start_provenance,
+            convergence_controller=controller,
+        )
+        baseline_record: dict[str, Any] = {
+            "record_type": "evaluation",
+            "evaluation_kind": "warm_start_baseline",
+            "episode": 0,
+            "best_eval_score": best_eval_score,
+            "best_eval_episode": best_eval_episode,
+            "current_learning_rates": controller.learning_rates(agent.optimizer),
+            "convergence_decision": controller_decision,
+            "convergence_controller": controller.to_dict(),
+        }
+        for group in ("reward", "score", "steps"):
+            for name, value in baseline[group].items():
+                baseline_record[f"eval_{group}_{name}"] = value
+        baseline_record["eval_terminal_events"] = baseline["terminal_events"]
+        baseline_record["eval_truncated_count"] = baseline["truncated_count"]
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(baseline_record, ensure_ascii=False) + "\n")
+        print(
+            f"Warm-start baseline fixed-suite score {baseline_score:.3f}; "
+            f"saved episode-0 best {output_path} and latest {latest_path}."
+        )
+
+    # Training environments are not launched until an authenticated warm-start
+    # baseline and its two new-run checkpoints have been durably recorded.
+    for slot in slots:
+        slot.reset(run_seed=args.seed, seed_index=next_seed_index)
+        next_seed_index += 1
+        episodes_started += 1
+        episodes_launched_this_run += 1
 
     stop_requested = False
     collection_index = 0
@@ -1349,6 +1737,8 @@ def _train(args: argparse.Namespace) -> None:
             "collection_seconds": collection_seconds,
             "update_seconds": update_seconds,
             "epsilon": agent.epsilon,
+            "current_learning_rates": controller.learning_rates(agent.optimizer),
+            "convergence_controller": controller.to_dict(),
             "behavior_steps": agent.behavior_steps,
             "learn_step_counter": agent.learn_step_counter,
             "replay_size": len(agent.replay_buffer),
@@ -1367,6 +1757,7 @@ def _train(args: argparse.Namespace) -> None:
             )
 
         should_evaluate = episodes_completed >= next_eval_episode
+        controller_decision: dict[str, Any] | None = None
         if should_evaluate:
             evaluation = evaluate_agent(agent, game_config, eval_seeds, step_limit)
             metrics = completed_summaries[-1]
@@ -1378,10 +1769,17 @@ def _train(args: argparse.Namespace) -> None:
             average_score = float(evaluation["score"]["mean"])
             previous_best = best_eval_score
             improved = average_score > previous_best
-            significant_improvement = (
-                early_stop_reference_score == -math.inf
-                or average_score >= early_stop_reference_score + args.early_stop_delta
+            controller_decision = controller.observe(average_score, agent.optimizer)
+            metrics["current_learning_rates"] = controller.learning_rates(
+                agent.optimizer
             )
+            metrics["convergence_decision"] = controller_decision
+            metrics["convergence_controller"] = controller.to_dict()
+            collection_metrics["current_learning_rates"] = controller.learning_rates(
+                agent.optimizer
+            )
+            collection_metrics["convergence_decision"] = controller_decision
+            collection_metrics["convergence_controller"] = controller.to_dict()
             if improved:
                 best_eval_score = average_score
                 best_eval_episode = episodes_completed
@@ -1397,19 +1795,19 @@ def _train(args: argparse.Namespace) -> None:
                     best_checkpoint_path=output_path,
                     episodes_started=episodes_started,
                     warm_start_provenance=warm_start_provenance,
+                    convergence_controller=controller,
                 )
                 print(
                     f"New best fixed-suite score {best_eval_score:.3f} at episode "
                     f"{episodes_completed}; "
                     f"saved {output_path}."
                 )
-            if significant_improvement:
-                early_stop_reference_score = max(
-                    early_stop_reference_score, average_score
+            if controller_decision["lr_reduced"]:
+                print(
+                    "Reduced optimizer learning rates after fixed-suite plateau: "
+                    f"{controller_decision['learning_rates_before']} -> "
+                    f"{controller_decision['learning_rates']}."
                 )
-                no_improvement_evals = 0
-            else:
-                no_improvement_evals += 1
             while next_eval_episode <= episodes_completed:
                 next_eval_episode += args.eval_interval
 
@@ -1429,6 +1827,7 @@ def _train(args: argparse.Namespace) -> None:
                 best_checkpoint_path=output_path,
                 episodes_started=episodes_started,
                 warm_start_provenance=warm_start_provenance,
+                convergence_controller=controller,
             )
             while next_checkpoint_episode <= episodes_completed:
                 next_checkpoint_episode += args.checkpoint_interval
@@ -1451,13 +1850,11 @@ def _train(args: argparse.Namespace) -> None:
                         f"updates={collection_metrics['updates_per_second']:.1f}/s | "
                         f"sample={sampling_seconds:.3f}s | gpu_wait={gpu_wait_seconds:.3f}s"
                     )
-        if (
-            args.early_stop_patience > 0
-            and no_improvement_evals >= args.early_stop_patience
-        ):
+        if controller_decision is not None and controller_decision["should_stop"]:
             print(
                 f"Early stopping at episode {episodes_completed}; best fixed-suite score "
-                f"{best_eval_score:.3f} at {best_eval_episode}."
+                f"{best_eval_score:.3f} at {best_eval_episode}; controller decision "
+                f"{controller_decision['decision']}."
             )
             stop_requested = True
 
@@ -1473,6 +1870,7 @@ def _train(args: argparse.Namespace) -> None:
         best_checkpoint_path=output_path,
         episodes_started=episodes_started,
         warm_start_provenance=warm_start_provenance,
+        convergence_controller=controller,
     )
     print(
         f"Training complete. Latest: {latest_path}; "

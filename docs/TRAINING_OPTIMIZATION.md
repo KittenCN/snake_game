@@ -124,6 +124,26 @@ ROCm 会提示 `adaptive_avg_pool2d_backward_cuda` 尚无确定性实现。当�
 隐藏层、学习率、折扣、batch、replay 容量/门槛、n-step、PER、target 与 epsilon 配置。若显式传入的
 值与 checkpoint 不一致，训练会拒绝静默变更，需改为 fresh run。
 
+## 可恢复的收敛控制器
+
+训练循环使用显式、可序列化的 `EvaluationConvergenceController`，唯一输入是固定 seed 评估套件的
+原始 `eval_score_mean`。checkpoint best 阈值与收敛参考分数有意分离：只要分数严格超过既有 best，
+就保存新 best；只有 `score >= reference + early_stop_delta` 才算显著改善并更新 reference、清零耐心。
+因此一个很小但真实的 raw-score best 不会被错误丢弃，也不会伪装成足以重启平台期时钟的改善。
+
+`--lr-plateau-patience 0` 禁用调度并保持旧早停行为。大于零时，每累计相应次数的非显著评估，所有
+optimizer 参数组当前 LR 都乘以 `--lr-plateau-factor`，再钳制到 `--lr-plateau-min`；降 LR 后平台期
+计数清零。这个动作只改 optimizer LR，不恢复历史权重、不重置 optimizer/AMP、不清 replay/n-step。
+到达最小 LR 的那次降幅不计入早停耐心；必须在最小 LR 上再累计 `--early-stop-patience` 次非显著
+评估才停止。显著改善在任何阶段都会清零平台期与最小-LR 早停计数。
+
+latest 与 best sidecar 同时保存控制器版本、配置、reference、两个耐心计数、降幅/评估次数、基础
+学习率及 optimizer 各参数组当前 LR。resume 先校验 sidecar 当前 LR 与 checkpoint optimizer state，
+再恢复控制器；CLI 未显式给出的调度/早停选项继承 sidecar，显式冲突则安全失败。旧 sidecar 没有
+控制器时会明确警告，以已保存 best 为 reference、所有计数为零初始化。基础 `--lr` 只与 checkpoint
+的初始 `agent.lr` 比较，不能把平台期降低后的当前 LR 错当成基础配置冲突。完整 `--resume-from` 只
+接受 `latest` 角色；`best_eval` 应作为 `--warm-start-from` 的不可变策略源。
+
 ## 权重迁移与课程阶段
 
 普通 `--resume-from` 用于延续同一训练身份，因此必须保留 checkpoint 绑定的网络、optimizer、
@@ -137,6 +157,30 @@ pool 允许观测高宽变化，但 network version、action dimension、观测�
 state-dict tensor 的 key/shape/dtype 必须完全兼容。新 latest/best sidecar 保存 warm-start provenance，
 后续普通 resume 继续携带该来源。`--ignore-warm-start-metadata` 只为人工确认过的 legacy source
 提供显式逃生口，不放宽权重结构检查。
+
+通过验证的 warm start 在启动训练环境与任何梯度更新之前，先运行完整固定评估套件。该结果以
+`record_type=evaluation`、`evaluation_kind=warm_start_baseline`、`episode=0` 独立写入 JSONL，初始化
+控制器 reference，并分别原子保存新运行的 episode-0 best 与 latest。源 checkpoint/sidecar 不会被
+修改；即使跨地图迁移，也必须为新阶段指定两个互不相同且不与源重叠的输出路径。推荐 8x8 命令：
+
+```bash
+python3 train_dqn.py \
+  --episodes 20000 \
+  --warm-start-from models/dqn_snake_8x8_b512_best.pt \
+  --width 8 --height 8 \
+  --max-idle-steps 70 --idle-growth-per-food 2 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 32 \
+  --batch-size 512 --min-replay 20000 --replay-capacity 100000 \
+  --lr 0.00005 \
+  --lr-plateau-patience 6 --lr-plateau-factor 0.5 \
+  --lr-plateau-min 0.000003125 --early-stop-patience 12 \
+  --early-stop-delta 0.10 \
+  --epsilon-start 0.10 --epsilon-final 0.02 --epsilon-decay-steps 300000 \
+  --device cuda --allow-nondeterministic \
+  --output models/dqn_snake_8x8_stable_v1_best.pt \
+  --latest-output models/dqn_snake_8x8_stable_v1_latest.pt \
+  --log-dir runs/stable_v1_8x8
+```
 
 推荐每个课程阶段使用独立输出，例如 `6x6 -> 8x8 -> 10x10 -> 12x12`，并以上一阶段固定评估的
 best checkpoint 作为下一阶段 source；不要从 latest 迁移，也不要跨尺寸携带 replay。

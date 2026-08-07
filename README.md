@@ -105,8 +105,8 @@ python train_dqn.py `
 
 - `models/dqn_snake_v3_latest.pt`：每次评估/检查点更新，可用于恢复；
 - `models/dqn_snake_v3_best.pt`：只在固定评估集的原始策略平均分提升时更新（不使用安全回退）；
-- 对应 `.meta.json`：记录 checkpoint SHA-256、episode、架构和训练配置；
-- `runs/train_log_<timestamp>.jsonl`：逐回合指标与评估分布。
+- 对应 `.meta.json`：记录 checkpoint SHA-256、episode、架构、基础/当前学习率及完整收敛控制器状态；
+- `runs/train_log_<timestamp>.jsonl`：逐回合、collection、独立 warm-start 基线及评估决策。
 
 若机器没有 CUDA/ROCm，省略 `--device cuda` 可自动使用 CPU；显式指定不可用的加速器会报错。
 
@@ -175,6 +175,20 @@ in-flight seed 不会在恢复时重放；恢复会从已记录的 `episodes_sta
 网络与 replay 相关的 checkpoint 绑定超参数仍遵循既有恢复校验：显式传入且与 checkpoint 不一致时
 会拒绝静默变更，需开始新训练。
 
+## 固定评估、降学习率与早停
+
+best 选择只看固定 seed 套件的原始 `eval_score_mean`：任何严格高于当前 best 的分数都会更新 best，
+即使增幅小于 `--early-stop-delta`。后者只定义“显著改善”的绝对分数门槛，并同时服务于平台期和
+早停耐心。`--lr-plateau-patience 0`（默认）完全禁用调度，保留原早停语义；启用后，连续达到指定
+次数的非显著评估会把所有 optimizer 参数组的当前 LR 乘以 `--lr-plateau-factor`，并钳制到
+`--lr-plateau-min`。每次降 LR 都清零平台期耐心，不恢复权重、不重建 optimizer，也不清空 replay。
+
+调度启用时，早停不会在降 LR 阶段触发。只有所有参数组已经到达最小 LR 后，再经历
+`--early-stop-patience` 次非显著评估才会停止；显著改善会更新参考分数并清零两类耐心。latest 与 best
+sidecar 都保存控制器配置/计数以及当前 LR。普通 resume 在这些选项未显式提供时自动恢复；显式冲突
+会拒绝启动，sidecar 当前 LR 与 checkpoint optimizer 状态不一致也会失败。完整恢复只接受 `latest`
+角色；要以 `best_eval` 为源必须使用 warm start，避免覆盖不可变的 best。
+
 ## 仅迁移网络权重
 
 当需要保留已学策略、同时更换地图尺寸、batch、学习率或 replay 配置时，使用
@@ -182,13 +196,20 @@ in-flight seed 不会在恢复时重放；恢复会从已记录的 `episodes_sta
 
 ```bash
 python3 train_dqn.py \
-  --warm-start-from models/dqn_snake_parallel_best.pt \
-  --width 6 --height 6 \
-  --num-envs 64 --rollout-steps 4 --updates-per-collection 32 \
-  --batch-size 512 --min-replay 10000 --replay-capacity 100000 \
+  --episodes 20000 \
+  --warm-start-from models/dqn_snake_8x8_b512_best.pt \
+  --width 8 --height 8 \
+  --max-idle-steps 70 --idle-growth-per-food 2 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 32 \
+  --batch-size 512 --min-replay 20000 --replay-capacity 100000 \
+  --lr 0.00005 --lr-plateau-patience 6 \
+  --lr-plateau-factor 0.5 --lr-plateau-min 0.000003125 \
+  --early-stop-patience 12 --early-stop-delta 0.10 \
+  --epsilon-start 0.10 --epsilon-final 0.02 --epsilon-decay-steps 300000 \
   --device cuda --allow-nondeterministic \
-  --output models/dqn_snake_curriculum_6x6_best.pt \
-  --latest-output models/dqn_snake_curriculum_6x6_latest.pt
+  --output models/dqn_snake_8x8_stable_v1_best.pt \
+  --latest-output models/dqn_snake_8x8_stable_v1_latest.pt \
+  --log-dir runs/stable_v1_8x8
 ```
 
 warm start 只迁移 `policy_net` 权重，并用其重新同步 target；optimizer、AMP scaler、replay、
@@ -196,7 +217,9 @@ n-step 队列、epsilon、行为/学习计数、训练 seed 流以及 best 评�
 checkpoint 默认必须带有 SHA-256 匹配的 sidecar，且源文件不能与新 best/latest 输出同名；
 `--ignore-warm-start-metadata` 只用于经过人工确认的旧 checkpoint。网络版本、动作空间、观测
 通道和隐藏层必须兼容，但 v3 网络允许地图高宽变化。新 sidecar 会持续记录迁移来源、SHA-256、
-源回合和源观测形状。
+源回合和源观测形状。每次 warm start 都会在任何训练环境 step 或梯度更新之前运行固定评估套件，
+写入 episode 0 的独立 JSONL evaluation，并原子保存全新的 episode-0 best/latest；源 checkpoint 与
+sidecar 保持字节不变，因此务必像上例一样使用唯一的新输出名。
 
 旧 v1/v2 checkpoint 仅建议用于推理。如果确实需要作为完整状态的 legacy resume，必须显式传入
 `--resume-from`、`--ignore-resume-metadata`，并为 `--latest-output`、`--output` 指定不含
@@ -231,6 +254,7 @@ python analyze_training.py "runs/train_log_*.jsonl" --json
 
 工具会报告全局及最近 100/1,000/5,000 回合指标、best/last evaluation、epsilon floor、
 loss、终止事件和分数/蛇长分桶。平台期判断是诊断启发式，不是统计学证明。
+episode-0 独立基线会参与 evaluation 汇总，best 与 checkpoint 一致优先按原始平均分选择。
 
 ## 测试
 
