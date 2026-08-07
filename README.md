@@ -181,8 +181,11 @@ in-flight seed 不会在恢复时重放；恢复会从已记录的 `episodes_sta
 ## 固定评估、降学习率与早停
 
 默认 best 选择仍使用固定 seed 套件的原始 `eval_score_mean`，保持旧训练兼容。成熟策略 warm start
-应启用 `--require-paired-promotion`：每次评估保存相同 seed 的逐局分数，候选相对当前 best 的配对
-差值必须达到 `--paired-promotion-min-delta`，且 95% 置信区间下界严格大于 0，才允许晋升。
+应启用 `--require-paired-promotion`：每次评估保存相同 seed 的逐局分数，并按
+`meaningful_delta=max(early_stop_delta, paired_promotion_min_delta)` 做三态判断。Bonferroni 校正后的
+配对 CI 下界严格高于 meaningful delta 才是 `confirmed_improvement`；上界严格低于它才是
+`confirmed_plateau`；其余为 `inconclusive`，不消耗 plateau/min-LR/early-stop 耐心，也不降 LR 或停训。
+`clear_regression` 仍按负向阈值独立判断。
 `--early-stop-delta` 定义“显著改善”的绝对分数门槛。`--lr-plateau-patience 0`（默认）完全禁用调度；启用后，连续达到指定
 次数的非显著评估会把所有 optimizer 参数组的当前 LR 乘以 `--lr-plateau-factor`，并钳制到
 `--lr-plateau-min`。每次降 LR 都清零平台期耐心，不恢复权重、不重建 optimizer，也不清空 replay。
@@ -197,16 +200,23 @@ sidecar 都保存控制器配置/计数以及当前 LR。普通 resume 在这些
 `--regression-stop-delta`（即可以排除“只是评估噪声”），连续 N 次后直接停止本次实验。它只停止，
 不会恢复历史权重、optimizer 或 replay；immutable best 始终保持不变。
 
+paired 模式可用 `--adaptive-eval-max-episodes` 与 `--adaptive-eval-growth-factor` 从
+`--eval-episodes` 基数逐级扩容。每一级只评估新增 seed，不重复前缀；inconclusive 继续扩容，前缀
+confirmed improvement 也必须评满 max 后才能晋升，从而保存完整 reference。confirmed plateau 或
+clear regression 可提前结束。多次 look 使用固定计划数的 `paired_normal_bonferroni_v1` 校正，避免
+把普通 95% CI 用于 optional stopping。warm-start baseline 一次评满 max seed，后续较短 candidate
+只与完整 reference 的同长度前缀比较。非 paired 或 max=0 时仍保持单次固定评估行为。
+
 ## 仅迁移网络权重
 
 当需要保留已学策略、同时更换地图尺寸、batch、学习率或 replay 配置时，使用
 `--warm-start-from`，不要使用普通 `--resume-from`：
 
 ```bash
-mkdir -p runs/stable_v3_demonstration_8x8
+mkdir -p runs/stable_v4_adaptive_8x8
 nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   --episodes 30000 \
-  --warm-start-from models/dqn_snake_8x8_b512_best.pt \
+  --warm-start-from models/dqn_snake_8x8_stable_v3_latest.pt \
   --width 8 --height 8 \
   --max-idle-steps 70 --idle-growth-per-food 2 \
   --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
@@ -224,13 +234,19 @@ nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   --require-paired-promotion --paired-promotion-min-delta 0.10 \
   --regression-stop-patience 3 --regression-stop-delta 0.10 \
   --epsilon-start 0.02 --epsilon-final 0.01 --epsilon-decay-steps 600000 \
-  --eval-interval 200 --eval-episodes 50 --checkpoint-interval 200 \
+  --eval-interval 200 --eval-episodes 50 \
+  --adaptive-eval-max-episodes 300 --adaptive-eval-growth-factor 2 \
+  --eval-seed-base 300000 --checkpoint-interval 200 \
   --device cuda --allow-nondeterministic \
-  --output models/dqn_snake_8x8_stable_v3_best.pt \
-  --latest-output models/dqn_snake_8x8_stable_v3_latest.pt \
-  --log-dir runs/stable_v3_demonstration_8x8 \
-  > runs/stable_v3_demonstration_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+  --output models/dqn_snake_8x8_stable_v4_adaptive_best.pt \
+  --latest-output models/dqn_snake_8x8_stable_v4_adaptive_latest.pt \
+  --log-dir runs/stable_v4_adaptive_8x8 \
+  > runs/stable_v4_adaptive_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
+
+这里从 `stable_v3_latest` 而不是旧 `stable_v3_best` 启动是一次有证据的例外：独立 500-seed
+配对留出评估显示 latest 相对旧 best/source 的平均 score 差为 `+0.506`，95% CI 为
+`[+0.307, +0.706]`。没有这种独立证据时，仍应从 SHA-256 已验证的 immutable best warm start。
 
 warm start 只迁移 `policy_net` 权重，并用其重新同步 target；启用保守参数后还会冻结同一 policy 作为
 teacher。前 `--teacher-replay-steps` 个 transition 使用 teacher 的贪心动作收集 replay，期间不执行任何

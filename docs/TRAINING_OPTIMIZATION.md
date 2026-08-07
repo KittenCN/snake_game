@@ -128,8 +128,19 @@ ROCm 会提示 `adaptive_avg_pool2d_backward_cuda` 尚无确定性实现。当�
 
 训练循环使用显式、可序列化的 `EvaluationConvergenceController`。默认模式仍以固定 seed 套件的原始
 `eval_score_mean` 保持旧行为；保守 warm start 使用 `--require-paired-promotion`，保存每个 seed 的
-分数并计算候选与当前 best 的配对差值。只有平均差达到 `--paired-promotion-min-delta` 且 95% CI
-下界大于 0 才能晋升，也只有同时满足 `score >= reference + early_stop_delta` 才重置平台期耐心。
+分数并计算候选与当前 best 的配对差值。有效改善门槛为
+`max(early_stop_delta, paired_promotion_min_delta)`：校正 CI 下界严格高于门槛才是
+`confirmed_improvement`，上界严格低于门槛才是 `confirmed_plateau`，相等或区间跨越门槛均为
+`inconclusive`。inconclusive 不增加 plateau/min-LR/early-stop 计数，不降 LR，也不停训；
+`clear_regression` 仍是独立的负向硬保护。
+
+paired 模式可把 `--eval-episodes` 作为 base，并用 `--adaptive-eval-max-episodes` 与
+`--adaptive-eval-growth-factor` 建立固定 look 计划。每一 look 只运行新增 seed chunk，再合并前缀样本；
+inconclusive 会继续扩，前缀 confirmed improvement 也会继续到 max，只有 confirmed plateau 或 clear
+regression 可以提前结束。为控制 optional stopping 的 family-wise error，每次比较使用
+`paired_normal_bonferroni_v1`：固定 `alpha=0.05`，每 look 使用 `alpha/num_looks`，临界值由标准库
+`NormalDist.inv_cdf(1-alpha_each/2)` 计算。日志保存 method、family/look confidence、planned looks、
+实际/计划/max episode、扩容 stage、三态和 `patience_deferred`。
 
 `--lr-plateau-patience 0` 禁用调度并保持旧早停行为。大于零时，每累计相应次数的非显著评估，所有
 optimizer 参数组当前 LR 都乘以 `--lr-plateau-factor`，再钳制到 `--lr-plateau-min`；降 LR 后平台期
@@ -141,7 +152,9 @@ optimizer 参数组当前 LR 都乘以 `--lr-plateau-factor`，再钳制到 `--l
 latest 与 best sidecar 同时保存控制器版本、配置、均值/逐 seed reference、三类耐心计数、降幅/评估次数、基础
 学习率及 optimizer 各参数组当前 LR。resume 先校验 sidecar 当前 LR 与 checkpoint optimizer state，
 再恢复控制器；CLI 未显式给出的调度/早停选项继承 sidecar，显式冲突则安全失败。旧 sidecar 没有
-控制器时会明确警告，以已保存 best 为 reference、所有计数为零初始化。基础 `--lr` 只与 checkpoint
+控制器时会明确警告，以已保存 best 为 reference、所有计数为零初始化。controller schema v3 可读
+v1/v2；由于旧 paired CI 可能已让 inconclusive 错误消耗耐心，迁移会保留实际 LR/reduction 历史但
+清零 plateau、min-LR 和 regression patience，并记录 migration note。基础 `--lr` 只与 checkpoint
 的初始 `agent.lr` 比较，不能把平台期降低后的当前 LR 错当成基础配置冲突。完整 `--resume-from` 只
 接受 `latest` 角色；`best_eval` 应作为 `--warm-start-from` 的不可变策略源。
 
@@ -161,7 +174,9 @@ state-dict tensor 的 key/shape/dtype 必须完全兼容。新 latest/best sidec
 
 通过验证的 warm start 在启动训练环境与任何梯度更新之前，先运行完整固定评估套件。该结果以
 `record_type=evaluation`、`evaluation_kind=warm_start_baseline`、`episode=0` 独立写入 JSONL，初始化
-控制器 reference，并分别原子保存新运行的 episode-0 best 与 latest。源 checkpoint/sidecar 不会被
+控制器完整 reference，并分别原子保存新运行的 episode-0 best 与 latest。启用 adaptive paired 时，
+baseline 一次运行完整 max seed；candidate 可以用较短前缀比较，但晋升时 reference 必须仍为完整 max。
+源 checkpoint/sidecar 不会被
 修改；即使跨地图迁移，也必须为新阶段指定两个互不相同且不与源重叠的输出路径。
 
 `--teacher-replay-steps` 会冻结 warm-start policy 作为 teacher，先用其贪心动作采集指定数量的
@@ -197,13 +212,13 @@ success 门槛的轨迹晋升为 tier 1，同时超过更高 score/return 门槛
 checkpoint 不保存两个大 replay；完整 resume 会从冻结 teacher 重新采集并重建 demo，所有门槛、batch
 占比、imitation 参数及累计晋升计数仍进入 checkpoint/sidecar 供身份校验与审计。
 
-服务器 `stable_v3` 推荐命令：
+从服务器 `stable_v3_latest` 开始的新 adaptive paired 推荐命令：
 
 ```bash
-mkdir -p runs/stable_v3_demonstration_8x8
+mkdir -p runs/stable_v4_adaptive_8x8
 nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   --episodes 30000 \
-  --warm-start-from models/dqn_snake_8x8_b512_best.pt \
+  --warm-start-from models/dqn_snake_8x8_stable_v3_latest.pt \
   --width 8 --height 8 \
   --max-idle-steps 70 --idle-growth-per-food 2 \
   --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
@@ -222,22 +237,28 @@ nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   --require-paired-promotion --paired-promotion-min-delta 0.10 \
   --regression-stop-patience 3 --regression-stop-delta 0.10 \
   --epsilon-start 0.02 --epsilon-final 0.01 --epsilon-decay-steps 600000 \
-  --eval-interval 200 --eval-episodes 50 --checkpoint-interval 200 \
+  --eval-interval 200 --eval-episodes 50 \
+  --adaptive-eval-max-episodes 300 --adaptive-eval-growth-factor 2 \
+  --eval-seed-base 300000 --checkpoint-interval 200 \
   --device cuda --allow-nondeterministic \
-  --output models/dqn_snake_8x8_stable_v3_best.pt \
-  --latest-output models/dqn_snake_8x8_stable_v3_latest.pt \
-  --log-dir runs/stable_v3_demonstration_8x8 \
-  > runs/stable_v3_demonstration_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+  --output models/dqn_snake_8x8_stable_v4_adaptive_best.pt \
+  --latest-output models/dqn_snake_8x8_stable_v4_adaptive_latest.pt \
+  --log-dir runs/stable_v4_adaptive_8x8 \
+  > runs/stable_v4_adaptive_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
 这组值直接针对服务器 `stable_v2` 的证据：episode-0 固定评估为 3.54，学习期间虽比 v1 稳定，
 但 active evaluation 最高仅 3.38，说明 anchor 成功防止了大幅遗忘，却没有提供超越 immutable best 的
 直接监督。v3 保留低 LR、低 update/data ratio、teacher 和配对保护，同时用 25% demo batch（其中
 6.25% 为 elite）把原始 score/return 验证过的动作加入优化目标；LR 平台期与最小 LR 后耐心也适度拉长。
-必须继续从原始 immutable `dqn_snake_8x8_b512_best.pt` warm start，不得从 stable_v1/v2 latest resume。
+本次新阶段明确以 `dqn_snake_8x8_stable_v3_latest.pt` 作 policy-only warm start，并使用独立 stable_v4
+输出；不会覆盖 stable_v3 源 checkpoint/sidecar，也不会把旧 optimizer/replay/耐心带入新运行。
+这是一次有证据的例外：独立 500-seed 配对留出评估显示 latest 相对旧 best/source 的平均 score 差为
+`+0.506`，95% CI 为 `[+0.307, +0.706]`。没有这种独立证据时，仍应从 SHA-256 已验证的
+immutable best warm start。
 
 推荐每个课程阶段使用独立输出，例如 `6x6 -> 8x8 -> 10x10 -> 12x12`，并以上一阶段固定评估的
-best checkpoint 作为下一阶段 source；不要从 latest 迁移，也不要跨尺寸携带 replay。
+best checkpoint 作为下一阶段 source；不要从未经独立配对证据验证的 latest 迁移，也不要跨尺寸携带 replay。
 
 ## 验收门槛
 

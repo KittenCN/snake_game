@@ -39,7 +39,7 @@ except ImportError:
 
 CHECKPOINT_FORMAT = 4
 V3_OBSERVATION_CHANNELS = 20
-CONVERGENCE_CONTROLLER_VERSION = 2
+CONVERGENCE_CONTROLLER_VERSION = 3
 
 
 @dataclass
@@ -59,6 +59,8 @@ class EvaluationConvergenceController:
     paired_promotion_min_delta: float = 0.0
     regression_stop_patience: int = 0
     regression_stop_delta: float = 0.0
+    adaptive_eval_max_episodes: int = 0
+    adaptive_eval_growth_factor: float = 2.0
     reference_score: float | None = None
     reference_scores: list[float] | None = None
     plateau_evaluations: int = 0
@@ -66,6 +68,7 @@ class EvaluationConvergenceController:
     regression_evaluations: int = 0
     reductions: int = 0
     evaluations: int = 0
+    migration_note: str | None = None
 
     @property
     def scheduler_enabled(self) -> bool:
@@ -88,39 +91,72 @@ class EvaluationConvergenceController:
         self.regression_evaluations = 0
 
     def paired_comparison(
-        self, scores: Sequence[float | int] | None
+        self,
+        scores: Sequence[float | int] | None,
+        *,
+        planned_looks: int = 1,
     ) -> dict[str, Any] | None:
         if scores is None or self.reference_scores is None:
             return None
         candidate = [float(value) for value in scores]
-        if len(candidate) != len(self.reference_scores):
+        if len(candidate) > len(self.reference_scores):
             raise ValueError(
-                "Paired evaluation sample count changed: "
+                "Paired candidate exceeds the complete reference sample count: "
                 f"reference={len(self.reference_scores)}, candidate={len(candidate)}"
             )
         if not candidate or not all(math.isfinite(value) for value in candidate):
             raise ValueError("Paired candidate scores must be non-empty and finite")
+        if planned_looks <= 0:
+            raise ValueError("Paired comparison planned looks must be positive")
+        reference_prefix = self.reference_scores[: len(candidate)]
         differences = [
             current - reference
-            for current, reference in zip(candidate, self.reference_scores, strict=True)
+            for current, reference in zip(candidate, reference_prefix, strict=True)
         ]
         mean = float(statistics.mean(differences))
         std = float(statistics.stdev(differences)) if len(differences) > 1 else 0.0
-        margin = 1.96 * std / math.sqrt(len(differences))
-        ci95_low = mean - margin
-        ci95_high = mean + margin
+        alpha = 0.05
+        alpha_each = alpha / planned_looks
+        critical_value = statistics.NormalDist().inv_cdf(1.0 - alpha_each / 2.0)
+        standard_critical_value = statistics.NormalDist().inv_cdf(1.0 - alpha / 2.0)
+        standard_margin = standard_critical_value * std / math.sqrt(len(differences))
+        adjusted_margin = critical_value * std / math.sqrt(len(differences))
+        ci95_low = mean - standard_margin
+        ci95_high = mean + standard_margin
+        adjusted_ci_low = mean - adjusted_margin
+        adjusted_ci_high = mean + adjusted_margin
+        meaningful_delta = max(
+            self.early_stop_delta, self.paired_promotion_min_delta
+        )
+        confirmed_improvement = adjusted_ci_low > meaningful_delta
+        confirmed_plateau = adjusted_ci_high < meaningful_delta
+        statistical_state = (
+            "confirmed_improvement"
+            if confirmed_improvement
+            else "confirmed_plateau"
+            if confirmed_plateau
+            else "inconclusive"
+        )
         return {
             "count": len(differences),
             "mean_delta": mean,
             "std_delta": std,
             "ci95_low": ci95_low,
             "ci95_high": ci95_high,
+            "adjusted_ci_low": adjusted_ci_low,
+            "adjusted_ci_high": adjusted_ci_high,
+            "method": "paired_normal_bonferroni_v1",
+            "family_confidence": 1.0 - alpha,
+            "look_confidence": 1.0 - alpha_each,
+            "planned_looks": planned_looks,
+            "critical_value": critical_value,
             "min_delta": min(differences),
             "max_delta": max(differences),
-            "promotion_eligible": (
-                mean >= self.paired_promotion_min_delta and ci95_low > 0.0
-            ),
-            "clear_regression": ci95_high < -self.regression_stop_delta,
+            "meaningful_delta": meaningful_delta,
+            "statistical_state": statistical_state,
+            "promotion_eligible": confirmed_improvement,
+            "confirmed_plateau": confirmed_plateau,
+            "clear_regression": adjusted_ci_high < -self.regression_stop_delta,
         }
 
     @staticmethod
@@ -141,12 +177,13 @@ class EvaluationConvergenceController:
         *,
         sample_scores: Sequence[float | int] | None = None,
         defer_reason: str | None = None,
+        planned_looks: int = 1,
     ) -> dict[str, Any]:
         if not math.isfinite(score):
             raise ValueError("Evaluation score must be finite")
         before_reference = self.reference_score
         before_lrs = self.learning_rates(optimizer)
-        paired = self.paired_comparison(sample_scores)
+        paired = self.paired_comparison(sample_scores, planned_looks=planned_looks)
         aggregate_significant = (
             before_reference is None
             or score >= before_reference + self.early_stop_delta
@@ -161,6 +198,10 @@ class EvaluationConvergenceController:
                 "paired_comparison": paired,
                 "paired_promotion_eligible": False,
                 "clear_regression": False,
+                "statistical_state": (
+                    paired["statistical_state"] if paired else "deferred"
+                ),
+                "patience_deferred": True,
                 "regression_evaluations": self.regression_evaluations,
                 "lr_reduced": False,
                 "should_stop": False,
@@ -173,14 +214,29 @@ class EvaluationConvergenceController:
                 "min_lr_evaluations": self.min_lr_evaluations,
                 "reductions": self.reductions,
                 "evaluations": self.evaluations,
+                "migration_note": self.migration_note,
             }
         self.evaluations += 1
+        statistical_state = (
+            str(paired["statistical_state"])
+            if paired is not None
+            else (
+                "confirmed_improvement"
+                if aggregate_significant
+                else "confirmed_plateau"
+            )
+        )
         significant = aggregate_significant and (
             before_reference is None
             or not self.require_paired_promotion
-            or bool(paired and paired["promotion_eligible"])
+            or statistical_state == "confirmed_improvement"
         )
-        clear_regression = bool(paired and paired["clear_regression"])
+        clear_regression = bool(
+            self.require_paired_promotion
+            and self.regression_stop_patience > 0
+            and paired
+            and paired["clear_regression"]
+        )
         if clear_regression:
             self.regression_evaluations += 1
         else:
@@ -202,6 +258,13 @@ class EvaluationConvergenceController:
         elif regression_stop:
             decision = "paired_regression_patience"
             stop = True
+        elif clear_regression:
+            # Regression has its own consecutive-evidence guard.  It must not
+            # also spend plateau/min-LR patience, otherwise one evaluation can
+            # advance two independent stop mechanisms.
+            decision = "paired_clear_regression"
+        elif self.require_paired_promotion and statistical_state == "inconclusive":
+            decision = "paired_inconclusive"
         elif not self.scheduler_enabled:
             self.plateau_evaluations += 1
             decision = "early_stop_patience"
@@ -243,6 +306,10 @@ class EvaluationConvergenceController:
                 paired and paired["promotion_eligible"]
             ),
             "clear_regression": clear_regression,
+            "statistical_state": statistical_state,
+            "patience_deferred": (
+                self.require_paired_promotion and statistical_state == "inconclusive"
+            ),
             "regression_evaluations": self.regression_evaluations,
             "lr_reduced": reduced,
             "should_stop": stop,
@@ -255,6 +322,7 @@ class EvaluationConvergenceController:
             "min_lr_evaluations": self.min_lr_evaluations,
             "reductions": self.reductions,
             "evaluations": self.evaluations,
+            "migration_note": self.migration_note,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -270,6 +338,8 @@ class EvaluationConvergenceController:
                 "paired_promotion_min_delta": self.paired_promotion_min_delta,
                 "regression_stop_patience": self.regression_stop_patience,
                 "regression_stop_delta": self.regression_stop_delta,
+                "adaptive_eval_max_episodes": self.adaptive_eval_max_episodes,
+                "adaptive_eval_growth_factor": self.adaptive_eval_growth_factor,
             },
             "state": {
                 "reference_score": self.reference_score,
@@ -279,13 +349,14 @@ class EvaluationConvergenceController:
                 "regression_evaluations": self.regression_evaluations,
                 "reductions": self.reductions,
                 "evaluations": self.evaluations,
+                "migration_note": self.migration_note,
             },
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> EvaluationConvergenceController:
         version = payload.get("version")
-        if version not in {1, CONVERGENCE_CONTROLLER_VERSION}:
+        if version not in {1, 2, CONVERGENCE_CONTROLLER_VERSION}:
             raise RuntimeError(
                 "Unsupported convergence controller sidecar version: "
                 f"{payload.get('version')!r}"
@@ -310,6 +381,12 @@ class EvaluationConvergenceController:
                 config.get("regression_stop_patience", 0)
             ),
             regression_stop_delta=float(config.get("regression_stop_delta", 0.0)),
+            adaptive_eval_max_episodes=int(
+                config.get("adaptive_eval_max_episodes", 0)
+            ),
+            adaptive_eval_growth_factor=float(
+                config.get("adaptive_eval_growth_factor", 2.0)
+            ),
             reference_score=(
                 None
                 if state.get("reference_score") is None
@@ -325,7 +402,19 @@ class EvaluationConvergenceController:
             regression_evaluations=int(state.get("regression_evaluations", 0)),
             reductions=int(state.get("reductions", 0)),
             evaluations=int(state.get("evaluations", 0)),
+            migration_note=(
+                None
+                if state.get("migration_note") is None
+                else str(state["migration_note"])
+            ),
         )
+        if version in {1, 2}:
+            controller.plateau_evaluations = 0
+            controller.min_lr_evaluations = 0
+            controller.regression_evaluations = 0
+            controller.migration_note = (
+                f"v{version}_patience_counters_cleared_for_bonferroni_v3"
+            )
         controller.validate()
         return controller
 
@@ -350,6 +439,15 @@ class EvaluationConvergenceController:
         if not math.isfinite(self.regression_stop_delta) or self.regression_stop_delta < 0:
             raise RuntimeError(
                 "Controller regression-stop delta must be finite and non-negative"
+            )
+        if self.adaptive_eval_max_episodes < 0:
+            raise RuntimeError("Controller adaptive evaluation maximum must be non-negative")
+        if (
+            not math.isfinite(self.adaptive_eval_growth_factor)
+            or self.adaptive_eval_growth_factor <= 1.0
+        ):
+            raise RuntimeError(
+                "Controller adaptive evaluation growth factor must be finite and greater than 1"
             )
         if self.reference_score is not None and not math.isfinite(self.reference_score):
             raise RuntimeError("Controller reference score must be finite or null")
@@ -574,6 +672,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--paired-promotion-min-delta", type=float, default=0.0)
     parser.add_argument("--regression-stop-patience", type=int, default=0)
     parser.add_argument("--regression-stop-delta", type=float, default=0.0)
+    parser.add_argument(
+        "--adaptive-eval-max-episodes",
+        type=int,
+        default=0,
+        help=(
+            "Maximum paired evaluation episodes; 0 disables adaptive expansion "
+            "and uses --eval-episodes"
+        ),
+    )
+    parser.add_argument("--adaptive-eval-growth-factor", type=float, default=2.0)
     # Accepted only to make old commands fail safe instead of re-enabling the rollback loop.
     parser.add_argument(
         "--resume-best-on-decline", action="store_true", help=argparse.SUPPRESS
@@ -680,6 +788,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         or args.paired_promotion_min_delta < 0
     ):
         parser.error("paired-promotion-min-delta must be finite and non-negative")
+    if args.adaptive_eval_max_episodes < 0:
+        parser.error("adaptive-eval-max-episodes must be non-negative")
+    if (
+        args.adaptive_eval_max_episodes > 0
+        and args.adaptive_eval_max_episodes < args.eval_episodes
+    ):
+        parser.error("adaptive-eval-max-episodes must be at least eval-episodes")
+    if (
+        not math.isfinite(args.adaptive_eval_growth_factor)
+        or args.adaptive_eval_growth_factor <= 1.0
+    ):
+        parser.error("adaptive-eval-growth-factor must be finite and greater than 1")
+    if (
+        args.adaptive_eval_max_episodes > 0
+        and not args.require_paired_promotion
+        and args.resume_from is None
+    ):
+        parser.error("adaptive evaluation requires --require-paired-promotion")
     if not 0.0 < args.lr_plateau_factor < 1.0:
         parser.error("lr-plateau-factor must be greater than 0 and less than 1")
     if not math.isfinite(args.lr_plateau_min) or args.lr_plateau_min <= 0:
@@ -976,6 +1102,147 @@ def evaluation_samples(
     return [mean] * max(1, episodes)
 
 
+def adaptive_evaluation_plan(
+    base_episodes: int, max_episodes: int, growth_factor: float
+) -> list[int]:
+    """Return deterministic cumulative look sizes, including base and maximum."""
+    resolved_max = max_episodes if max_episodes > 0 else base_episodes
+    if base_episodes <= 0 or resolved_max < base_episodes:
+        raise ValueError("Adaptive evaluation requires 0 < base <= max episodes")
+    if not math.isfinite(growth_factor) or growth_factor <= 1.0:
+        raise ValueError("Adaptive evaluation growth factor must exceed 1")
+    plan = [base_episodes]
+    while plan[-1] < resolved_max:
+        grown = max(plan[-1] + 1, math.ceil(plan[-1] * growth_factor))
+        plan.append(min(resolved_max, grown))
+    return plan
+
+
+def _merge_evaluation_chunks(chunks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not chunks:
+        raise ValueError("At least one evaluation chunk is required")
+    seeds: list[int] = []
+    reward_samples: list[float] = []
+    score_samples: list[float] = []
+    step_samples: list[float] = []
+    terminal_events: Counter[str] = Counter()
+    truncated_count = 0
+    for chunk in chunks:
+        seeds.extend(int(value) for value in chunk.get("seeds", ()))
+        reward_samples.extend(evaluation_samples(chunk, "reward"))
+        score_samples.extend(evaluation_samples(chunk, "score"))
+        step_samples.extend(evaluation_samples(chunk, "step"))
+        terminal_events.update(chunk.get("terminal_events", {}))
+        truncated_count += int(chunk.get("truncated_count", 0))
+
+    def distribution(values: Sequence[float]) -> dict[str, float]:
+        array = np.asarray(values, dtype=np.float64)
+        std = float(array.std(ddof=1)) if len(array) > 1 else 0.0
+        margin = 1.96 * std / math.sqrt(len(array))
+        return {
+            "mean": float(array.mean()),
+            "std": std,
+            "ci95_low": float(array.mean()) - margin,
+            "ci95_high": float(array.mean()) + margin,
+            "median": float(np.median(array)),
+            "p10": float(np.percentile(array, 10)),
+            "p90": float(np.percentile(array, 90)),
+            "min": float(array.min()),
+            "max": float(array.max()),
+        }
+
+    return {
+        "reward": distribution(reward_samples),
+        "score": distribution(score_samples),
+        "steps": distribution(step_samples),
+        "seeds": seeds,
+        "reward_samples": reward_samples,
+        "score_samples": score_samples,
+        "step_samples": [int(value) for value in step_samples],
+        "terminal_events": dict(sorted(terminal_events.items())),
+        "truncated_count": truncated_count,
+        "episodes": len(seeds),
+    }
+
+
+def evaluate_adaptive_paired(
+    agent: DQNAgent,
+    game_config: GameConfig,
+    seeds: Sequence[int],
+    max_steps: int,
+    controller: EvaluationConvergenceController,
+    *,
+    base_episodes: int,
+    max_episodes: int,
+    growth_factor: float,
+    adaptive_enabled: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Evaluate disjoint seed chunks until paired evidence reaches a terminal state."""
+    plan = adaptive_evaluation_plan(base_episodes, max_episodes, growth_factor)
+    if not adaptive_enabled:
+        plan = plan[:1]
+    planned_looks = len(
+        adaptive_evaluation_plan(base_episodes, max_episodes, growth_factor)
+    )
+    chunks: list[dict[str, Any]] = []
+    stage_records: list[dict[str, Any]] = []
+    evaluated = 0
+    evaluation: dict[str, Any] | None = None
+    paired: dict[str, Any] | None = None
+    for stage, target in enumerate(plan, start=1):
+        chunk_seeds = seeds[evaluated:target]
+        if len(chunk_seeds) != target - evaluated:
+            raise ValueError("Adaptive evaluation seed plan is incomplete")
+        chunks.append(evaluate_agent(agent, game_config, chunk_seeds, max_steps))
+        evaluated = target
+        evaluation = _merge_evaluation_chunks(chunks)
+        paired = controller.paired_comparison(
+            evaluation_samples(evaluation, "score"), planned_looks=planned_looks
+        )
+        state = paired["statistical_state"] if paired else "unpaired_reference"
+        stage_records.append(
+            {
+                "stage": stage,
+                "actual_episodes": evaluated,
+                "planned_episodes": target,
+                "statistical_state": state,
+                "clear_regression": bool(paired and paired["clear_regression"]),
+            }
+        )
+        if not adaptive_enabled:
+            break
+        if paired and (
+            paired["clear_regression"]
+            or paired["statistical_state"] == "confirmed_plateau"
+        ):
+            break
+        # Both inconclusive evidence and a prefix improvement continue.  A
+        # promotion is allowed only after the complete reference-sized suite.
+    if evaluation is None:
+        raise RuntimeError("Adaptive evaluation produced no result")
+    metadata = {
+        "actual_episodes": int(evaluation["episodes"]),
+        "planned_episodes": stage_records[-1]["planned_episodes"],
+        "max_episodes": max_episodes if max_episodes > 0 else base_episodes,
+        "expansion_stage": stage_records[-1]["stage"],
+        "planned_looks": planned_looks,
+        "stages": stage_records,
+        "statistical_method": (
+            paired["method"] if paired else "paired_normal_bonferroni_v1"
+        ),
+        "family_confidence": paired["family_confidence"] if paired else 0.95,
+        "look_confidence": (
+            paired["look_confidence"]
+            if paired
+            else 1.0 - 0.05 / planned_looks
+        ),
+        "statistical_state": (
+            paired["statistical_state"] if paired else "unpaired_reference"
+        ),
+    }
+    return evaluation, metadata
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -1018,6 +1285,8 @@ def evaluation_identity(
         "run_seed": train_args.seed,
         "eval_seed_base": train_args.eval_seed_base,
         "eval_episodes": train_args.eval_episodes,
+        "adaptive_eval_max_episodes": train_args.adaptive_eval_max_episodes,
+        "adaptive_eval_growth_factor": train_args.adaptive_eval_growth_factor,
         "game_config": asdict(game_config),
     }
     if train_args.require_paired_promotion:
@@ -1383,6 +1652,8 @@ _CONTROLLER_OPTIONS = {
     "--paired-promotion-min-delta": "paired_promotion_min_delta",
     "--regression-stop-patience": "regression_stop_patience",
     "--regression-stop-delta": "regression_stop_delta",
+    "--adaptive-eval-max-episodes": "adaptive_eval_max_episodes",
+    "--adaptive-eval-growth-factor": "adaptive_eval_growth_factor",
 }
 
 
@@ -1399,6 +1670,8 @@ def _new_convergence_controller(
         paired_promotion_min_delta=args.paired_promotion_min_delta,
         regression_stop_patience=args.regression_stop_patience,
         regression_stop_delta=args.regression_stop_delta,
+        adaptive_eval_max_episodes=args.adaptive_eval_max_episodes,
+        adaptive_eval_growth_factor=args.adaptive_eval_growth_factor,
         reference_score=reference_score,
     )
     controller.validate()
@@ -1463,6 +1736,45 @@ def restore_convergence_controller(
             "Explicit scheduler/early-stop options conflict with the resumed "
             "convergence controller: " + ", ".join(conflicts)
         )
+    if (
+        restored.require_paired_promotion
+        and legacy_reference_score is not None
+        and not args.reset_best_evaluation
+    ):
+        expected_reference_count = (
+            restored.adaptive_eval_max_episodes
+            if restored.adaptive_eval_max_episodes > 0
+            else args.eval_episodes
+        )
+        actual_reference_count = (
+            0 if restored.reference_scores is None else len(restored.reference_scores)
+        )
+        if actual_reference_count != expected_reference_count:
+            raise RuntimeError(
+                "Resume paired reference cache length conflicts with the evaluation "
+                f"identity: expected={expected_reference_count}, "
+                f"actual={actual_reference_count}."
+            )
+        if restored.reference_score is None or not math.isclose(
+            restored.reference_score,
+            legacy_reference_score,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                "Resume paired reference score conflicts with the immutable best score."
+            )
+        reference_mean = float(statistics.mean(restored.reference_scores or ()))
+        if not math.isclose(
+            reference_mean,
+            restored.reference_score,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                "Resume paired reference sample mean conflicts with the immutable "
+                "best score."
+            )
     return restored
 
 
@@ -1522,7 +1834,17 @@ def validate_resume_best(
     if not metadata or metadata.get("best_eval_score") is None:
         return -math.inf, None
 
-    stored_identity = metadata.get("evaluation_identity")
+    def compatible_identity(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        # v0.5.0 and earlier predate adaptive looks; missing fields mean the
+        # unchanged single-look defaults, not an unknown evaluation identity.
+        normalized.setdefault("adaptive_eval_max_episodes", 0)
+        normalized.setdefault("adaptive_eval_growth_factor", 2.0)
+        return normalized
+
+    stored_identity = compatible_identity(metadata.get("evaluation_identity"))
     current_identity = evaluation_identity(args, game_config)
     if stored_identity != current_identity:
         raise RuntimeError(
@@ -1557,7 +1879,8 @@ def validate_resume_best(
     if (
         best_metadata.get("checkpoint_role") != "best_eval"
         or best_metadata.get("checkpoint_sha256") != referenced_sha
-        or best_metadata.get("evaluation_identity") != current_identity
+        or compatible_identity(best_metadata.get("evaluation_identity"))
+        != current_identity
         or best_metadata.get("best_eval_score") != score
         or best_metadata.get("best_eval_episode") != episode
     ):
@@ -1854,7 +2177,17 @@ def _train(args: argparse.Namespace) -> None:
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"train_log_{int(time.time())}.jsonl"
-    eval_seeds = [args.eval_seed_base + index for index in range(args.eval_episodes)]
+    eval_max_episodes = (
+        args.adaptive_eval_max_episodes
+        if args.require_paired_promotion and args.adaptive_eval_max_episodes > 0
+        else args.eval_episodes
+    )
+    eval_plan = adaptive_evaluation_plan(
+        args.eval_episodes,
+        eval_max_episodes,
+        args.adaptive_eval_growth_factor,
+    )
+    eval_seeds = [args.eval_seed_base + index for index in range(eval_max_episodes)]
     rolling_scores: deque[int] = deque(maxlen=100)
     episodes_completed = start_episode - 1
     final_episode = episodes_completed
@@ -1911,6 +2244,22 @@ def _train(args: argparse.Namespace) -> None:
                     "observation_pinned": current_encoder.is_pinned,
                     "runtime": runtime_info,
                     "eval_seeds": eval_seeds,
+                    "eval_episodes_planned": args.eval_episodes,
+                    "eval_episodes_max": eval_max_episodes,
+                    "eval_planned_looks": len(eval_plan),
+                    "eval_statistical_method": (
+                        "paired_normal_bonferroni_v1"
+                        if args.require_paired_promotion
+                        else None
+                    ),
+                    "eval_family_confidence": (
+                        0.95 if args.require_paired_promotion else None
+                    ),
+                    "eval_look_confidence": (
+                        1.0 - 0.05 / len(eval_plan)
+                        if args.require_paired_promotion
+                        else None
+                    ),
                     "current_learning_rates": controller.learning_rates(
                         agent.optimizer
                     ),
@@ -1922,6 +2271,8 @@ def _train(args: argparse.Namespace) -> None:
         )
 
     if args.warm_start_from:
+        # The immutable warm-start reference is evaluated once at the complete
+        # maximum suite size; candidate prefixes compare against its prefix.
         baseline = evaluate_agent(agent, game_config, eval_seeds, step_limit)
         baseline_score = float(baseline["score"]["mean"])
         baseline_score_samples = evaluation_samples(baseline, "score")
@@ -1929,6 +2280,7 @@ def _train(args: argparse.Namespace) -> None:
             baseline_score,
             agent.optimizer,
             sample_scores=baseline_score_samples,
+            planned_looks=len(eval_plan),
         )
         controller.set_paired_reference(baseline_score_samples)
         best_eval_score = baseline_score
@@ -1970,6 +2322,26 @@ def _train(args: argparse.Namespace) -> None:
             "current_learning_rates": controller.learning_rates(agent.optimizer),
             "convergence_decision": controller_decision,
             "convergence_controller": controller.to_dict(),
+            "eval_episodes_actual": len(baseline_score_samples),
+            "eval_episodes_planned": eval_max_episodes,
+            "eval_episodes_max": eval_max_episodes,
+            "eval_expansion_stage": 1,
+            "eval_planned_looks": len(eval_plan),
+            "eval_statistical_method": (
+                "paired_normal_bonferroni_v1"
+                if args.require_paired_promotion
+                else None
+            ),
+            "eval_family_confidence": (
+                0.95 if args.require_paired_promotion else None
+            ),
+            "eval_look_confidence": (
+                1.0 - 0.05 / len(eval_plan)
+                if args.require_paired_promotion
+                else None
+            ),
+            "eval_statistical_state": controller_decision["statistical_state"],
+            "eval_patience_deferred": controller_decision["patience_deferred"],
         }
         for group in ("reward", "score", "steps"):
             for name, value in baseline[group].items():
@@ -2240,7 +2612,36 @@ def _train(args: argparse.Namespace) -> None:
         should_evaluate = episodes_completed >= next_eval_episode
         controller_decision: dict[str, Any] | None = None
         if should_evaluate:
-            evaluation = evaluate_agent(agent, game_config, eval_seeds, step_limit)
+            if args.require_paired_promotion:
+                evaluation, adaptive_metadata = evaluate_adaptive_paired(
+                    agent,
+                    game_config,
+                    eval_seeds,
+                    step_limit,
+                    controller,
+                    base_episodes=args.eval_episodes,
+                    max_episodes=eval_max_episodes,
+                    growth_factor=args.adaptive_eval_growth_factor,
+                    adaptive_enabled=(
+                        teacher_replay_complete and eval_max_episodes > args.eval_episodes
+                    ),
+                )
+            else:
+                evaluation = evaluate_agent(
+                    agent, game_config, eval_seeds[: args.eval_episodes], step_limit
+                )
+                adaptive_metadata = {
+                    "actual_episodes": args.eval_episodes,
+                    "planned_episodes": args.eval_episodes,
+                    "max_episodes": args.eval_episodes,
+                    "expansion_stage": 1,
+                    "planned_looks": 1,
+                    "stages": [],
+                    "statistical_method": None,
+                    "family_confidence": None,
+                    "look_confidence": None,
+                    "statistical_state": None,
+                }
             metrics = completed_summaries[-1]
             for group in ("reward", "score", "steps"):
                 for name, value in evaluation[group].items():
@@ -2254,8 +2655,24 @@ def _train(args: argparse.Namespace) -> None:
             )
             metrics["eval_score_samples"] = score_samples
             metrics["eval_step_samples"] = evaluation_samples(evaluation, "step")
+            metrics["eval_episodes_actual"] = adaptive_metadata["actual_episodes"]
+            metrics["eval_episodes_planned"] = adaptive_metadata["planned_episodes"]
+            metrics["eval_episodes_max"] = adaptive_metadata["max_episodes"]
+            metrics["eval_expansion_stage"] = adaptive_metadata["expansion_stage"]
+            metrics["eval_planned_looks"] = adaptive_metadata["planned_looks"]
+            metrics["eval_adaptive_stages"] = adaptive_metadata["stages"]
+            metrics["eval_statistical_method"] = adaptive_metadata[
+                "statistical_method"
+            ]
+            metrics["eval_family_confidence"] = adaptive_metadata[
+                "family_confidence"
+            ]
+            metrics["eval_look_confidence"] = adaptive_metadata[
+                "look_confidence"
+            ]
             average_score = float(evaluation["score"]["mean"])
             previous_best = best_eval_score
+            had_paired_reference = controller.reference_scores is not None
             controller_decision = controller.observe(
                 average_score,
                 agent.optimizer,
@@ -2263,10 +2680,21 @@ def _train(args: argparse.Namespace) -> None:
                 defer_reason=(
                     None if teacher_replay_complete else "teacher_replay_warmup"
                 ),
+                planned_looks=int(adaptive_metadata["planned_looks"]),
             )
-            improved = teacher_replay_complete and average_score > previous_best and (
-                not controller.require_paired_promotion
-                or controller_decision["paired_promotion_eligible"]
+            metrics["eval_statistical_state"] = controller_decision[
+                "statistical_state"
+            ]
+            metrics["eval_patience_deferred"] = controller_decision[
+                "patience_deferred"
+            ]
+            improved = teacher_replay_complete and (
+                (
+                    not had_paired_reference
+                    or controller_decision["paired_promotion_eligible"]
+                )
+                if controller.require_paired_promotion
+                else average_score > previous_best
             )
             metrics["current_learning_rates"] = controller.learning_rates(
                 agent.optimizer
@@ -2278,9 +2706,27 @@ def _train(args: argparse.Namespace) -> None:
             )
             collection_metrics["convergence_decision"] = controller_decision
             collection_metrics["convergence_controller"] = controller.to_dict()
+            for key in (
+                "eval_episodes_actual",
+                "eval_episodes_planned",
+                "eval_episodes_max",
+                "eval_expansion_stage",
+                "eval_planned_looks",
+                "eval_adaptive_stages",
+                "eval_statistical_method",
+                "eval_family_confidence",
+                "eval_look_confidence",
+                "eval_statistical_state",
+                "eval_patience_deferred",
+            ):
+                collection_metrics[key] = metrics[key]
             if improved:
                 best_eval_score = average_score
                 best_eval_episode = episodes_completed
+                if controller.require_paired_promotion and len(score_samples) != eval_max_episodes:
+                    raise RuntimeError(
+                        "Paired promotion requires a complete maximum-sized reference"
+                    )
                 controller.set_paired_reference(score_samples)
                 metrics["convergence_controller"] = controller.to_dict()
                 collection_metrics["convergence_controller"] = controller.to_dict()

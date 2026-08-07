@@ -154,6 +154,14 @@ def test_paired_evaluation_and_anchor_loss_are_reported(tmp_path: Path) -> None:
                 "episode": 100,
                 "score": 2,
                 "eval_score_mean": 2.5,
+                "eval_episodes_actual": 200,
+                "eval_episodes_planned": 200,
+                "eval_episodes_max": 300,
+                "eval_expansion_stage": 3,
+                "eval_planned_looks": 4,
+                "eval_statistical_method": "paired_normal_bonferroni_v1",
+                "eval_statistical_state": "confirmed_plateau",
+                "eval_patience_deferred": False,
                 "avg_loss": 0.2,
                 "avg_td_loss": 0.15,
                 "avg_anchor_loss": 0.2,
@@ -170,6 +178,8 @@ def test_paired_evaluation_and_anchor_loss_are_reported(tmp_path: Path) -> None:
                         "mean_delta": -1.0,
                         "ci95_low": -1.2,
                         "ci95_high": -0.8,
+                        "adjusted_ci_low": -1.3,
+                        "adjusted_ci_high": -0.7,
                     },
                 },
             }
@@ -182,7 +192,18 @@ def test_paired_evaluation_and_anchor_loss_are_reported(tmp_path: Path) -> None:
     assert last["decision"] == "paired_regression_patience"
     assert last["paired_mean_delta"] == pytest.approx(-1.0)
     assert last["paired_ci95_high"] == pytest.approx(-0.8)
+    assert last["paired_adjusted_ci_low"] == pytest.approx(-1.3)
+    assert last["statistical_state"] == "confirmed_plateau"
+    assert last["patience_deferred"] is False
+    assert last["eval_episodes_actual"] == 200
+    assert last["expansion_stage"] == 3
     assert last["clear_regression"] is True
+    assert report["evaluation"]["statistical_state_counts"] == {
+        "confirmed_plateau": 1
+    }
+    assert report["evaluation"]["expanded_count"] == 1
+    assert report["evaluation"]["total_eval_episodes"] == 200
+    assert report["evaluation"]["max_eval_episodes_used"] == 200
     assert report["td_loss"]["last"] == pytest.approx(0.15)
     assert report["anchor_loss"]["last"] == pytest.approx(0.2)
     assert report["imitation_loss"]["last"] == pytest.approx(0.4)
@@ -190,6 +211,8 @@ def test_paired_evaluation_and_anchor_loss_are_reported(tmp_path: Path) -> None:
     assert report["demonstration_replay_size"]["last"] == pytest.approx(1200)
     rendered = analyze_training.format_human(report)
     assert "Paired evaluation:" in rendered
+    assert "state=confirmed_plateau" in rendered
+    assert "Adaptive evaluation:" in rendered
     assert "decision=paired_regression_patience" in rendered
     assert "Demonstrations:" in rendered
     assert "replay_size=1200.000" in rendered
@@ -223,6 +246,34 @@ def test_paired_mode_best_ignores_unpromoted_raw_score(tmp_path: Path) -> None:
 
     assert report["evaluation"]["best_by"] == "paired_promoted_avg_score"
     assert report["evaluation"]["best"]["episode"] == 0
+
+
+def test_paired_resume_log_without_promotion_reports_no_best(tmp_path: Path) -> None:
+    path = tmp_path / "paired-resume-only.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "record_type": "run_start",
+                "args": {"require_paired_promotion": True},
+            },
+            {
+                "record_type": "episode",
+                "episode": 100,
+                "eval_score_mean": 9.0,
+                "convergence_decision": {
+                    "paired_promotion_eligible": False,
+                    "statistical_state": "inconclusive",
+                },
+            },
+        ],
+    )
+
+    report = _report(path, plateau_window=1)
+
+    assert report["evaluation"]["best"] is None
+    assert report["evaluation"]["best_by"] == "paired_no_promoted_evaluation"
+    assert "no promoted evaluation" in analyze_training.format_human(report)
 
 
 def test_plateau_is_explicitly_a_non_statistical_heuristic() -> None:

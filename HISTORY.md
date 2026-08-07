@@ -1,5 +1,14 @@
 # History
 
+## 0.5.1 - 2026-08-07
+
+- Added paired evaluation states for confirmed improvement, confirmed plateau, and inconclusive evidence; inconclusive results now defer every plateau/min-LR/early-stop action.
+- Added incremental paired evaluation expansion with disjoint seed chunks, complete maximum-sized warm-start references, and full-suite promotion.
+- Applied fixed-look Bonferroni confidence intervals to adaptive evaluation so optional stopping does not reuse an unadjusted 95% interval.
+- Upgraded convergence-controller sidecars to schema v3 with v1/v2 migration, adaptive configuration resume gates, and conservative patience-counter cleanup.
+- Logged adaptive episode counts, expansion stages, confidence method, statistical state, and patience deferral decisions.
+- Kept clear-regression patience independent from LR/plateau patience and extended the log analyzer with adaptive sample/state summaries.
+
 ## 0.5.0 - 2026-08-07
 
 - Added a dedicated demonstration replay that atomically promotes complete trajectories only after their raw score and environment return meet auditable success or elite thresholds.

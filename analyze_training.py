@@ -142,6 +142,18 @@ def _evaluation_entry(record: LogRecord) -> dict[str, Any]:
     decision = decision if isinstance(decision, Mapping) else {}
     paired = decision.get("paired_comparison")
     paired = paired if isinstance(paired, Mapping) else {}
+    statistical_state = record.data.get("eval_statistical_state")
+    if not isinstance(statistical_state, str):
+        statistical_state = decision.get("statistical_state")
+    patience_deferred = record.data.get("eval_patience_deferred")
+    if not isinstance(patience_deferred, bool):
+        patience_deferred = decision.get("patience_deferred")
+    adjusted_low = _number(paired.get("adjusted_ci_low"))
+    adjusted_high = _number(paired.get("adjusted_ci_high"))
+    if adjusted_low is None:
+        adjusted_low = _number(paired.get("ci95_low"))
+    if adjusted_high is None:
+        adjusted_high = _number(paired.get("ci95_high"))
     return {
         "episode": _display_number(_number(record.data.get("episode"))),
         "avg_reward": _first_number(record, ("eval_reward_mean", "eval_avg_reward")),
@@ -151,8 +163,28 @@ def _evaluation_entry(record: LogRecord) -> dict[str, Any]:
         "paired_mean_delta": _number(paired.get("mean_delta")),
         "paired_ci95_low": _number(paired.get("ci95_low")),
         "paired_ci95_high": _number(paired.get("ci95_high")),
+        "paired_adjusted_ci_low": adjusted_low,
+        "paired_adjusted_ci_high": adjusted_high,
         "paired_promotion_eligible": decision.get("paired_promotion_eligible"),
         "clear_regression": decision.get("clear_regression"),
+        "statistical_state": statistical_state,
+        "patience_deferred": patience_deferred,
+        "eval_episodes_actual": _display_number(
+            _number(record.data.get("eval_episodes_actual"))
+        ),
+        "eval_episodes_planned": _display_number(
+            _number(record.data.get("eval_episodes_planned"))
+        ),
+        "eval_episodes_max": _display_number(
+            _number(record.data.get("eval_episodes_max"))
+        ),
+        "expansion_stage": _display_number(
+            _number(record.data.get("eval_expansion_stage"))
+        ),
+        "planned_looks": _display_number(
+            _number(record.data.get("eval_planned_looks"))
+        ),
+        "statistical_method": record.data.get("eval_statistical_method"),
         "source": record.source,
         "line": record.line,
     }
@@ -193,20 +225,29 @@ def _evaluation_summary(records: Sequence[LogRecord]) -> dict[str, Any]:
                 is True
             )
         ]
-        if eligible_score_rows:
-            score_rows = eligible_score_rows
-        best = max(
-            score_rows,
-            key=lambda r: (
-                value
-                if (value := _first_number(r, ("eval_score_mean", "eval_avg_score")))
-                is not None
-                else -math.inf
-            ),
-        )
-        best_by = (
-            "paired_promoted_avg_score" if paired_sources else "avg_score"
-        )
+        if paired_sources and not eligible_score_rows:
+            best = None
+            best_by = "paired_no_promoted_evaluation"
+        else:
+            score_rows = eligible_score_rows or score_rows
+            best = max(
+                score_rows,
+                key=lambda r: (
+                    value
+                    if (
+                        value := _first_number(
+                            r, ("eval_score_mean", "eval_avg_score")
+                        )
+                    )
+                    is not None
+                    else -math.inf
+                ),
+            )
+            best_by = (
+                "paired_promoted_avg_score"
+                if best.source in paired_sources
+                else "avg_score"
+            )
     else:
         best = max(
             evaluations,
@@ -218,11 +259,32 @@ def _evaluation_summary(records: Sequence[LogRecord]) -> dict[str, Any]:
             ),
         )
         best_by = "avg_reward"
+    entries = [_evaluation_entry(record) for record in evaluations]
+    state_counts = Counter(
+        entry["statistical_state"]
+        for entry in entries
+        if isinstance(entry["statistical_state"], str)
+    )
+    actual_episode_counts = [
+        int(value)
+        for entry in entries
+        if (value := entry["eval_episodes_actual"]) is not None
+    ]
+    expanded_count = sum(
+        1
+        for entry in entries
+        if isinstance(entry["expansion_stage"], (int, float))
+        and entry["expansion_stage"] > 1
+    )
     return {
         "count": len(evaluations),
-        "best": _evaluation_entry(best),
+        "best": _evaluation_entry(best) if best is not None else None,
         "last": _evaluation_entry(evaluations[-1]),
         "best_by": best_by,
+        "statistical_state_counts": dict(sorted(state_counts.items())),
+        "expanded_count": expanded_count,
+        "total_eval_episodes": sum(actual_episode_counts),
+        "max_eval_episodes_used": max(actual_episode_counts, default=None),
     }
 
 
@@ -459,22 +521,40 @@ def format_human(report: Mapping[str, Any]) -> str:
     ]
     if evaluation["count"]:
         best, last = evaluation["best"], evaluation["last"]
-        lines.append(
-            "Evaluation: "
-            f"count={evaluation['count']}, best ep={_fmt(best['episode'])} "
-            f"reward={_fmt(best['avg_reward'])} score={_fmt(best['avg_score'])}; "
-            f"last ep={_fmt(last['episode'])} reward={_fmt(last['avg_reward'])} "
-            f"score={_fmt(last['avg_score'])}"
-        )
+        if best is None:
+            lines.append(
+                "Evaluation: "
+                f"count={evaluation['count']}, no promoted evaluation in these logs; "
+                f"last ep={_fmt(last['episode'])} reward={_fmt(last['avg_reward'])} "
+                f"score={_fmt(last['avg_score'])}"
+            )
+        else:
+            lines.append(
+                "Evaluation: "
+                f"count={evaluation['count']}, best ep={_fmt(best['episode'])} "
+                f"reward={_fmt(best['avg_reward'])} score={_fmt(best['avg_score'])}; "
+                f"last ep={_fmt(last['episode'])} reward={_fmt(last['avg_reward'])} "
+                f"score={_fmt(last['avg_score'])}"
+            )
         if last["paired_mean_delta"] is not None:
             lines.append(
                 "Paired evaluation: "
                 f"mean delta={_fmt(last['paired_mean_delta'])}, "
-                f"CI95=[{_fmt(last['paired_ci95_low'])}, "
-                f"{_fmt(last['paired_ci95_high'])}], "
+                f"adjusted CI=[{_fmt(last['paired_adjusted_ci_low'])}, "
+                f"{_fmt(last['paired_adjusted_ci_high'])}], "
+                f"state={last['statistical_state']}, "
+                f"patience deferred={last['patience_deferred']}, "
                 f"promotion={last['paired_promotion_eligible']}, "
                 f"clear regression={last['clear_regression']}, "
                 f"decision={last['decision']}"
+            )
+        if evaluation["total_eval_episodes"]:
+            lines.append(
+                "Adaptive evaluation: "
+                f"episodes={evaluation['total_eval_episodes']}, "
+                f"max used={_fmt(evaluation['max_eval_episodes_used'])}, "
+                f"expanded={evaluation['expanded_count']}, "
+                f"states={evaluation['statistical_state_counts']}"
             )
     else:
         lines.append("Evaluation: no evaluation fields found")

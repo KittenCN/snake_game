@@ -17,8 +17,10 @@ from train_dqn import (
     _prepare_fresh_outputs,
     _release_accelerator_resources,
     accelerator_runtime_info,
+    adaptive_evaluation_plan,
     deterministic_episode_seed,
     evaluate_agent,
+    evaluate_adaptive_paired,
     load_resume_metadata,
     load_warm_start_metadata,
     parse_args,
@@ -66,6 +68,11 @@ from train_dqn import (
         ["--paired-promotion-min-delta", "-0.1"],
         ["--regression-stop-patience", "-1"],
         ["--regression-stop-delta", "-0.1"],
+        ["--adaptive-eval-max-episodes", "-1"],
+        ["--eval-episodes", "4", "--adaptive-eval-max-episodes", "2", "--require-paired-promotion"],
+        ["--adaptive-eval-max-episodes", "8"],
+        ["--adaptive-eval-growth-factor", "1"],
+        ["--adaptive-eval-growth-factor", "nan"],
     ],
 )
 def test_convergence_cli_rejects_invalid_ranges(options: list[str]) -> None:
@@ -168,6 +175,10 @@ def test_paired_promotion_and_clear_regression_guard() -> None:
     )
     assert first_regression["clear_regression"]
     assert not first_regression["should_stop"]
+    assert first_regression["decision"] == "paired_clear_regression"
+    assert first_regression["plateau_evaluations"] == 0
+    assert first_regression["min_lr_evaluations"] == 0
+    assert not first_regression["lr_reduced"]
     stopped = controller.observe(
         2.0,
         optimizer,
@@ -175,6 +186,166 @@ def test_paired_promotion_and_clear_regression_guard() -> None:
     )
     assert stopped["should_stop"]
     assert stopped["decision"] == "paired_regression_patience"
+
+
+def test_paired_inconclusive_ci_does_not_consume_any_patience() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.01)
+    controller = EvaluationConvergenceController(
+        lr_plateau_patience=2,
+        lr_plateau_factor=0.5,
+        lr_plateau_min=0.001,
+        early_stop_patience=2,
+        early_stop_delta=0.25,
+        require_paired_promotion=True,
+        paired_promotion_min_delta=0.1,
+        reference_score=0.0,
+    )
+    controller.set_paired_reference([0.0] * 4)
+    controller.plateau_evaluations = 1
+    controller.min_lr_evaluations = 1
+
+    decision = controller.observe(
+        0.3,
+        optimizer,
+        sample_scores=[-0.1, 0.1, 0.5, 0.7],
+        planned_looks=3,
+    )
+
+    assert decision["aggregate_significant_improvement"]
+    assert decision["statistical_state"] == "inconclusive"
+    assert decision["patience_deferred"] is True
+    assert decision["plateau_evaluations"] == 1
+    assert decision["min_lr_evaluations"] == 1
+    assert decision["learning_rates"] == [0.01]
+    paired = decision["paired_comparison"]
+    assert paired["ci95_low"] < 0 < paired["ci95_high"]
+    assert paired["adjusted_ci_low"] < paired["ci95_low"]
+    assert paired["adjusted_ci_high"] > paired["ci95_high"]
+    assert paired["method"] == "paired_normal_bonferroni_v1"
+    assert paired["planned_looks"] == 3
+
+
+def test_only_confirmed_paired_plateau_reduces_lr() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.01)
+    controller = EvaluationConvergenceController(
+        lr_plateau_patience=1,
+        lr_plateau_factor=0.5,
+        lr_plateau_min=0.001,
+        early_stop_patience=2,
+        early_stop_delta=0.25,
+        require_paired_promotion=True,
+        paired_promotion_min_delta=0.1,
+        reference_score=1.0,
+    )
+    controller.set_paired_reference([1.0] * 4)
+
+    decision = controller.observe(
+        1.1,
+        optimizer,
+        sample_scores=[1.1] * 4,
+        planned_looks=3,
+    )
+
+    assert decision["statistical_state"] == "confirmed_plateau"
+    assert decision["lr_reduced"] is True
+    assert decision["learning_rates"] == [0.005]
+
+
+def _evaluation_payload(seeds: list[int], score: float) -> dict[str, object]:
+    count = len(seeds)
+    samples = [score] * count
+    distribution = {
+        "mean": score, "std": 0.0, "ci95_low": score, "ci95_high": score,
+        "median": score, "p10": score, "p90": score, "min": score, "max": score,
+    }
+    return {
+        "reward": dict(distribution),
+        "score": dict(distribution),
+        "steps": dict(distribution),
+        "seeds": seeds,
+        "reward_samples": samples,
+        "score_samples": samples,
+        "step_samples": [1] * count,
+        "terminal_events": {"test": count},
+        "truncated_count": 0,
+        "episodes": count,
+    }
+
+
+@pytest.mark.parametrize(
+    ("candidate_score", "expected_state"),
+    [(0.25, "inconclusive"), (1.0, "confirmed_improvement")],
+)
+def test_adaptive_paired_evaluation_uses_disjoint_chunks_and_full_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_score: float,
+    expected_state: str,
+) -> None:
+    agent = make_agent(GameConfig(width=5, height=5))
+    controller = EvaluationConvergenceController(
+        2, 0.5, 0.001, 2, 0.25,
+        require_paired_promotion=True,
+        paired_promotion_min_delta=0.1,
+        reference_score=0.0,
+    )
+    controller.set_paired_reference([0.0] * 6)
+    seed_chunks: list[list[int]] = []
+
+    def fake_evaluate(
+        _agent: DQNAgent,
+        _config: GameConfig,
+        seeds: list[int],
+        _max_steps: int,
+    ) -> dict[str, object]:
+        seed_chunks.append(list(seeds))
+        return _evaluation_payload(list(seeds), candidate_score)
+
+    monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
+    evaluation, metadata = evaluate_adaptive_paired(
+        agent,
+        GameConfig(width=5, height=5),
+        list(range(6)),
+        2,
+        controller,
+        base_episodes=2,
+        max_episodes=6,
+        growth_factor=2.0,
+        adaptive_enabled=True,
+    )
+
+    assert adaptive_evaluation_plan(2, 6, 2.0) == [2, 4, 6]
+    assert seed_chunks == [[0, 1], [2, 3], [4, 5]]
+    assert evaluation["seeds"] == list(range(6))
+    assert metadata["actual_episodes"] == 6
+    assert metadata["expansion_stage"] == 3
+    assert metadata["planned_looks"] == 3
+    assert metadata["statistical_state"] == expected_state
+
+
+def test_v2_controller_migration_clears_potentially_polluted_patience() -> None:
+    controller = EvaluationConvergenceController(
+        2, 0.5, 0.001, 2, 0.25, require_paired_promotion=True
+    )
+    payload = controller.to_dict()
+    payload["version"] = 2
+    payload["state"].update(
+        {
+            "plateau_evaluations": 1,
+            "min_lr_evaluations": 1,
+            "regression_evaluations": 1,
+            "reductions": 2,
+        }
+    )
+
+    restored = EvaluationConvergenceController.from_dict(payload)
+
+    assert restored.plateau_evaluations == 0
+    assert restored.min_lr_evaluations == 0
+    assert restored.regression_evaluations == 0
+    assert restored.reductions == 2
+    assert restored.migration_note == "v2_patience_counters_cleared_for_bonferroni_v3"
 
 
 def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) -> None:
@@ -187,7 +358,9 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     controller.paired_promotion_min_delta = 0.1
     controller.regression_stop_patience = 3
     controller.regression_stop_delta = 0.2
-    controller.set_paired_reference([2.0, 3.0, 4.0])
+    controller.adaptive_eval_max_episodes = 8
+    controller.adaptive_eval_growth_factor = 2.0
+    controller.set_paired_reference([3.0] * 8)
     controller.plateau_evaluations = 1
     checkpoint = tmp_path / "latest.pt"
     args = parse_args(
@@ -222,8 +395,74 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     )
     assert restored.to_dict() == controller.to_dict()
     assert resume_args.lr_plateau_patience == 2
+    assert resume_args.adaptive_eval_max_episodes == 8
     assert metadata["base_learning_rate"] == pytest.approx(agent.lr)
     assert metadata["current_learning_rates"] == [5e-5]
+
+    corrupted_metadata = json.loads(json.dumps(metadata))
+    corrupted_metadata["convergence_controller"]["state"]["reference_scores"] = [
+        2.0,
+        3.0,
+    ]
+    corrupted_args = parse_args(
+        [
+            "--resume-from", str(checkpoint),
+            "--output", str(tmp_path / "best.pt"),
+            "--latest-output", str(checkpoint),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="reference cache length"):
+        restore_convergence_controller(
+            corrupted_metadata,
+            corrupted_args,
+            loaded_agent,
+            legacy_reference_score=3.0,
+        )
+
+    wrong_mean_metadata = json.loads(json.dumps(metadata))
+    wrong_mean_metadata["convergence_controller"]["state"]["reference_scores"] = [
+        4.0
+    ] * 8
+    wrong_mean_args = parse_args(
+        [
+            "--resume-from", str(checkpoint),
+            "--output", str(tmp_path / "best.pt"),
+            "--latest-output", str(checkpoint),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="sample mean"):
+        restore_convergence_controller(
+            wrong_mean_metadata,
+            wrong_mean_args,
+            loaded_agent,
+            legacy_reference_score=3.0,
+        )
+
+    reset_metadata = json.loads(json.dumps(metadata))
+    reset_metadata["convergence_controller"]["config"][
+        "adaptive_eval_max_episodes"
+    ] = 0
+    reset_metadata["convergence_controller"]["state"]["reference_scores"] = [
+        3.0
+    ] * 50
+    reset_args = parse_args(
+        [
+            "--resume-from", str(checkpoint),
+            "--reset-best-evaluation",
+            "--eval-episodes", "60",
+            "--output", str(tmp_path / "best.pt"),
+            "--latest-output", str(checkpoint),
+        ]
+    )
+    reset_controller = restore_convergence_controller(
+        reset_metadata,
+        reset_args,
+        loaded_agent,
+        legacy_reference_score=3.0,
+    )
+    reset_controller.reset()
+    assert reset_controller.reference_score is None
+    assert reset_controller.reference_scores is None
 
     conflict_args = parse_args(
         [
@@ -925,6 +1164,88 @@ def test_warm_start_baseline_survives_regression_and_min_lr_stops_training(
     assert latest_metadata["convergence_controller"]["state"]["min_lr_evaluations"] == 1
     assert file_sha256(source) == source_hash
     assert file_sha256(source.with_suffix(".meta.json")) == source_sidecar_hash
+
+
+def test_adaptive_warm_start_promotion_and_resume_keep_full_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pt"
+    save_source_checkpoint(source)
+    best = tmp_path / "adaptive-best.pt"
+    latest = tmp_path / "adaptive-latest.pt"
+    logs = tmp_path / "adaptive-logs"
+    calls: list[list[int]] = []
+
+    def fake_evaluate(
+        _agent: DQNAgent,
+        _config: GameConfig,
+        seeds: list[int],
+        _max_steps: int,
+    ) -> dict[str, object]:
+        current = list(seeds)
+        calls.append(current)
+        score = 0.0 if len(calls) == 1 else 1.0
+        return _evaluation_payload(current, score)
+
+    monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
+    common = [
+        "--width", "5", "--height", "5", "--max-steps", "1",
+        "--eval-interval", "1", "--eval-episodes", "2",
+        "--eval-seed-base", "300000", "--adaptive-eval-max-episodes", "6",
+        "--adaptive-eval-growth-factor", "2", "--checkpoint-interval", "1",
+        "--batch-size", "2", "--min-replay", "32", "--replay-capacity", "64",
+        "--hidden", "16", "--require-paired-promotion",
+        "--paired-promotion-min-delta", "0.1", "--early-stop-delta", "0.25",
+        "--output", str(best), "--latest-output", str(latest),
+        "--log-dir", str(logs), "--device", "cpu", "--disable-amp",
+    ]
+    train(parse_args(["--episodes", "1", "--warm-start-from", str(source), *common]))
+
+    assert calls == [
+        list(range(300000, 300006)),
+        [300000, 300001],
+        [300002, 300003],
+        [300004, 300005],
+    ]
+    latest_metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    controller_state = latest_metadata["convergence_controller"]["state"]
+    assert latest_metadata["best_eval_episode"] == 1
+    assert controller_state["reference_scores"] == [1.0] * 6
+    records = [
+        json.loads(line)
+        for line in next(logs.glob("train_log_*.jsonl")).read_text("utf-8").splitlines()
+    ]
+    evaluation_record = next(
+        record
+        for record in records
+        if record.get("record_type") == "episode" and "eval_score_mean" in record
+    )
+    assert evaluation_record["eval_episodes_actual"] == 6
+    assert evaluation_record["eval_episodes_planned"] == 6
+    assert evaluation_record["eval_episodes_max"] == 6
+    assert evaluation_record["eval_expansion_stage"] == 3
+    assert evaluation_record["eval_planned_looks"] == 3
+    assert evaluation_record["eval_statistical_method"] == "paired_normal_bonferroni_v1"
+    assert evaluation_record["eval_statistical_state"] == "confirmed_improvement"
+    assert evaluation_record["eval_patience_deferred"] is False
+
+    resume_args = parse_args(
+        [
+            "--episodes", "1", "--width", "5", "--height", "5",
+            "--max-steps", "1", "--eval-interval", "1", "--eval-episodes", "2",
+            "--eval-seed-base", "300000", "--checkpoint-interval", "1",
+            "--batch-size", "2", "--min-replay", "32", "--replay-capacity", "64",
+            "--hidden", "16", "--resume-from", str(latest),
+            "--output", str(best), "--latest-output", str(latest),
+            "--log-dir", str(logs), "--device", "cpu", "--disable-amp",
+        ]
+    )
+    train(resume_args)
+    assert resume_args.require_paired_promotion is True
+    assert resume_args.adaptive_eval_max_episodes == 6
+    assert resume_args.adaptive_eval_growth_factor == 2.0
+    resumed = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    assert resumed["convergence_controller"]["state"]["reference_scores"] == [1.0] * 6
 
 
 def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
