@@ -46,6 +46,13 @@ from train_dqn import (
         ["--early-stop-patience", "-1"],
         ["--early-stop-delta", "-0.1"],
         ["--early-stop-delta", "nan"],
+        ["--policy-anchor-weight", "-0.1"],
+        ["--policy-anchor-weight", "nan"],
+        ["--teacher-replay-steps", "-1"],
+        ["--teacher-replay-steps", "101", "--replay-capacity", "100"],
+        ["--paired-promotion-min-delta", "-0.1"],
+        ["--regression-stop-patience", "-1"],
+        ["--regression-stop-delta", "-0.1"],
     ],
 )
 def test_convergence_cli_rejects_invalid_ranges(options: list[str]) -> None:
@@ -105,12 +112,69 @@ def test_convergence_controller_without_scheduler_preserves_legacy_early_stop() 
     assert decision["learning_rates"] == [0.1]
 
 
+def test_paired_promotion_and_clear_regression_guard() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.01)
+    controller = EvaluationConvergenceController(
+        lr_plateau_patience=4,
+        lr_plateau_factor=0.5,
+        lr_plateau_min=0.001,
+        early_stop_patience=10,
+        early_stop_delta=0.1,
+        require_paired_promotion=True,
+        paired_promotion_min_delta=0.1,
+        regression_stop_patience=2,
+        regression_stop_delta=0.1,
+        reference_score=3.0,
+    )
+    controller.set_paired_reference([1.0, 2.0, 3.0, 4.0])
+
+    noisy = controller.observe(
+        3.2,
+        optimizer,
+        sample_scores=[0.0, 4.0, 2.0, 5.0],
+    )
+    assert noisy["aggregate_significant_improvement"]
+    assert not noisy["paired_promotion_eligible"]
+    assert not noisy["significant_improvement"]
+
+    promoted = controller.observe(
+        4.0,
+        optimizer,
+        sample_scores=[2.0, 3.0, 4.0, 5.0],
+    )
+    assert promoted["paired_promotion_eligible"]
+    assert promoted["paired_comparison"]["ci95_low"] == pytest.approx(1.0)
+    assert promoted["significant_improvement"]
+    controller.set_paired_reference([2.0, 3.0, 4.0, 5.0])
+
+    first_regression = controller.observe(
+        2.0,
+        optimizer,
+        sample_scores=[1.0, 2.0, 3.0, 4.0],
+    )
+    assert first_regression["clear_regression"]
+    assert not first_regression["should_stop"]
+    stopped = controller.observe(
+        2.0,
+        optimizer,
+        sample_scores=[1.0, 2.0, 3.0, 4.0],
+    )
+    assert stopped["should_stop"]
+    assert stopped["decision"] == "paired_regression_patience"
+
+
 def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) -> None:
     config = GameConfig(width=5, height=5, max_episode_steps=2)
     agent = make_agent(config)
     agent.optimizer.param_groups[0]["lr"] = 5e-5
     controller = EvaluationConvergenceController(2, 0.5, 1e-5, 4, 0.75)
     controller.reference_score = 3.0
+    controller.require_paired_promotion = True
+    controller.paired_promotion_min_delta = 0.1
+    controller.regression_stop_patience = 3
+    controller.regression_stop_delta = 0.2
+    controller.set_paired_reference([2.0, 3.0, 4.0])
     controller.plateau_evaluations = 1
     checkpoint = tmp_path / "latest.pt"
     args = parse_args(
@@ -470,6 +534,11 @@ def test_fixed_seed_evaluation_is_repeatable() -> None:
     first = evaluate_agent(agent, config, [10, 11, 12], max_steps=50)
     second = evaluate_agent(agent, config, [10, 11, 12], max_steps=50)
     assert first == second
+    assert first["seeds"] == [10, 11, 12]
+    assert len(first["score_samples"]) == 3
+    assert first["score"]["mean"] == pytest.approx(
+        sum(first["score_samples"]) / 3
+    )
 
 
 def test_fixed_evaluation_counts_environment_time_limit() -> None:
@@ -843,6 +912,95 @@ def test_warm_start_baseline_survives_regression_and_min_lr_stops_training(
     assert latest_metadata["convergence_controller"]["state"]["min_lr_evaluations"] == 1
     assert file_sha256(source) == source_hash
     assert file_sha256(source.with_suffix(".meta.json")) == source_sidecar_hash
+
+
+def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pt"
+    save_source_checkpoint(source)
+    best = tmp_path / "guarded-best.pt"
+    latest = tmp_path / "guarded-latest.pt"
+    sample_sets = iter(([5.0] * 4, [3.0] * 4, [3.0] * 4, [3.0] * 4))
+
+    def fake_evaluate(*_args: object, **_kwargs: object) -> dict[str, object]:
+        samples = list(next(sample_sets))
+        mean = sum(samples) / len(samples)
+        distribution = {
+            "mean": mean,
+            "std": 0.0,
+            "ci95_low": mean,
+            "ci95_high": mean,
+            "median": mean,
+            "p10": mean,
+            "p90": mean,
+            "min": mean,
+            "max": mean,
+        }
+        return {
+            "reward": dict(distribution),
+            "score": dict(distribution),
+            "steps": dict(distribution),
+            "seeds": [100, 101, 102, 103],
+            "reward_samples": samples,
+            "score_samples": samples,
+            "step_samples": samples,
+            "terminal_events": {"test": 4},
+            "truncated_count": 0,
+            "episodes": 4,
+        }
+
+    monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
+    args = parse_args(
+        [
+            "--episodes", "10", "--width", "5", "--height", "5",
+            "--max-steps", "1", "--eval-interval", "1", "--eval-episodes", "4",
+            "--checkpoint-interval", "1", "--batch-size", "2", "--min-replay", "2",
+            "--replay-capacity", "64", "--hidden", "16",
+            "--policy-anchor-weight", "0.5", "--teacher-replay-steps", "2",
+            "--require-paired-promotion", "--paired-promotion-min-delta", "0.1",
+            "--regression-stop-patience", "2", "--regression-stop-delta", "0.1",
+            "--warm-start-from", str(source), "--output", str(best),
+            "--latest-output", str(latest), "--log-dir", str(tmp_path / "logs"),
+            "--device", "cpu", "--disable-amp",
+        ]
+    )
+
+    train(args)
+
+    latest_metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    assert latest_metadata["episodes_completed"] == 3
+    assert latest_metadata["learn_step_counter"] == 2
+    assert latest_metadata["best_eval_score"] == pytest.approx(5.0)
+    assert latest_metadata["best_eval_episode"] == 0
+    assert latest_metadata["effective_agent_config"]["policy_anchor_enabled"] is True
+    assert latest_metadata["convergence_controller"]["state"][
+        "regression_evaluations"
+    ] == 2
+    records = [
+        json.loads(line)
+        for line in next((tmp_path / "logs").glob("train_log_*.jsonl")).read_text(
+            "utf-8"
+        ).splitlines()
+    ]
+    assert any(
+        record.get("convergence_decision", {}).get("decision")
+        == "paired_regression_patience"
+        for record in records
+    )
+    prewarm = [
+        record
+        for record in records
+        if record.get("record_type") == "collection"
+        and record.get("teacher_replay_complete") is False
+    ]
+    assert prewarm
+    assert all(record["collection_updates"] == 0 for record in prewarm)
+    assert any(
+        record.get("convergence_decision", {}).get("decision")
+        == "teacher_replay_warmup"
+        for record in records
+    )
 
 
 def test_short_training_creates_distinct_latest_and_best(tmp_path: Path) -> None:

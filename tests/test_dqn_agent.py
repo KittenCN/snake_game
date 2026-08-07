@@ -167,6 +167,72 @@ def test_select_actions_accepts_nhwc_numpy_batch() -> None:
     assert actions == [3, 3, 3]
 
 
+def test_frozen_policy_anchor_drives_teacher_replay_and_behavior_schedule() -> None:
+    agent = make_agent(epsilon_start=0.2, epsilon_final=0.0, epsilon_decay_steps=8)
+    agent.policy_net = FixedQ([1.0, 4.0, 3.0, 2.0])
+    agent.snapshot_policy_anchor()
+    assert agent.policy_anchor_net is not None
+    with torch.no_grad():
+        agent.policy_net.values.copy_(torch.tensor([9.0, 1.0, 2.0, 3.0]))
+    states = torch.zeros((4, *agent.obs_shape))
+
+    actions = agent.select_anchor_actions(
+        states, action_masks=[[True, True, True, True]] * 4
+    )
+
+    assert actions == [1, 1, 1, 1]
+    assert agent.behavior_steps == 4
+    assert agent.epsilon == pytest.approx(0.1)
+
+
+def test_anchor_loss_and_teacher_state_survive_checkpoint_round_trip(
+    tmp_path: Path,
+) -> None:
+    agent = make_agent(
+        n_step=1,
+        policy_anchor_weight=0.5,
+        teacher_replay_steps=23,
+    )
+    agent.snapshot_policy_anchor()
+    assert agent.policy_anchor_net is not None
+    anchor_before = {
+        key: value.detach().clone()
+        for key, value in agent.policy_anchor_net.state_dict().items()
+    }
+    with torch.no_grad():
+        for parameter in agent.policy_net.parameters():
+            parameter.add_(0.05)
+    state = torch.zeros(agent.obs_shape)
+    for action in (0, 1):
+        agent.remember(state, action, 1.0, state, True)
+
+    metrics = agent.learn()
+
+    assert metrics is not None
+    assert metrics["anchor_loss"] > 0
+    assert metrics["loss"] == pytest.approx(
+        metrics["td_loss"] + 0.5 * metrics["anchor_loss"], rel=1e-5
+    )
+    path = tmp_path / "anchored.pt"
+    agent.save(str(path))
+    loaded = DQNAgent.load(str(path), device="cpu")
+    assert loaded.policy_anchor_weight == pytest.approx(0.5)
+    assert loaded.teacher_replay_steps == 23
+    assert loaded.policy_anchor_net is not None
+    for key, expected in anchor_before.items():
+        assert torch.equal(loaded.policy_anchor_net.state_dict()[key], expected)
+
+
+def test_anchor_weight_fails_closed_without_frozen_teacher() -> None:
+    agent = make_agent(n_step=1, policy_anchor_weight=0.5)
+    state = torch.zeros(agent.obs_shape)
+    for action in (0, 1):
+        agent.remember(state, action, 1.0, state, True)
+
+    with pytest.raises(RuntimeError, match="no frozen anchor"):
+        agent.learn()
+
+
 def test_n_step_terminal_flush_emits_all_prefixes() -> None:
     agent = make_agent(gamma=0.5, n_step=3)
     states = [torch.full(agent.obs_shape, float(index)) for index in range(4)]

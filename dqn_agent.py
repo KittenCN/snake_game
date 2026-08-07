@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import math
@@ -719,6 +720,8 @@ class DQNAgent:
         network_version: int = 3,
         amp_enabled: bool | None = None,
         pin_memory: bool | None = None,
+        policy_anchor_weight: float = 0.0,
+        teacher_replay_steps: int = 0,
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -755,6 +758,14 @@ class DQNAgent:
         ) and self.device.type == "cuda"
         self.game_config = game_config
         self.network_version = network_version
+        if not math.isfinite(policy_anchor_weight) or policy_anchor_weight < 0:
+            raise ValueError("policy_anchor_weight must be finite and non-negative")
+        if teacher_replay_steps < 0:
+            raise ValueError("teacher_replay_steps must be non-negative")
+        if teacher_replay_steps > replay_capacity:
+            raise ValueError("teacher_replay_steps must not exceed replay_capacity")
+        self.policy_anchor_weight = float(policy_anchor_weight)
+        self.teacher_replay_steps = int(teacher_replay_steps)
         self._configure_amp(amp_enabled)
 
         if obs_shape is None:
@@ -778,6 +789,7 @@ class DQNAgent:
         ).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
+        self.policy_anchor_net: nn.Module | None = None
 
         self.optimizer = Adam(self.policy_net.parameters(), lr=lr, weight_decay=2e-5)
         self.replay_buffer = ReplayBuffer(
@@ -806,6 +818,17 @@ class DQNAgent:
         ] = self._n_step_buffers.setdefault(0, deque())
         self.replay_restored = False
         self.learn_step_counter = 0
+
+    def snapshot_policy_anchor(self) -> None:
+        """Freeze the current policy as an immutable teacher for conservative updates."""
+        anchor = copy.deepcopy(self.policy_net).to(self.device)
+        anchor.eval()
+        anchor.requires_grad_(False)
+        self.policy_anchor_net = anchor
+
+    @property
+    def policy_anchor_enabled(self) -> bool:
+        return self.policy_anchor_net is not None
 
     def configure_amp(self, enabled: bool | None = None) -> None:
         self._configure_amp(enabled)
@@ -886,6 +909,30 @@ class DQNAgent:
             self._update_epsilon()
         return [int(action) for action in actions]
 
+    def select_anchor_actions(
+        self,
+        states: Sequence[np.ndarray | torch.Tensor] | np.ndarray | torch.Tensor,
+        *,
+        action_masks: (
+            torch.Tensor | Sequence[bool] | Sequence[Sequence[bool]] | None
+        ) = None,
+        advance_behavior_steps: bool = True,
+    ) -> list[int]:
+        """Select greedy actions from the frozen warm-start teacher."""
+        if self.policy_anchor_net is None:
+            raise RuntimeError("policy anchor is not configured")
+        state_tensor = self._ensure_batch_tensor(states)
+        batch_size = int(state_tensor.shape[0])
+        legal_masks = self._normalize_action_masks(action_masks, batch_size)
+        with torch.no_grad():
+            q_values = self.policy_anchor_net(state_tensor)
+            q_values = q_values.masked_fill(~legal_masks, -torch.inf)
+        actions = [int(action) for action in q_values.argmax(dim=1).tolist()]
+        if advance_behavior_steps:
+            self.behavior_steps += batch_size
+            self._update_epsilon()
+        return actions
+
     def remember(
         self,
         state: np.ndarray | torch.Tensor,
@@ -933,6 +980,10 @@ class DQNAgent:
     def learn(self) -> dict[str, float] | None:
         if len(self.replay_buffer) < max(self.batch_size, self.min_replay_size):
             return None
+        if self.policy_anchor_weight > 0 and self.policy_anchor_net is None:
+            raise RuntimeError(
+                "policy anchor weight is enabled but no frozen anchor is configured"
+            )
         beta_progress = min(1.0, self.learn_step_counter / self.per_beta_frames)
         beta = self.per_beta_start + beta_progress * (1.0 - self.per_beta_start)
         sampling_started = time.perf_counter()
@@ -946,11 +997,10 @@ class DQNAgent:
         )
 
         with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            q_values = (
-                self.policy_net(batch.states)
-                .gather(1, batch.actions.long().unsqueeze(1))
-                .squeeze(1)
-            )
+            policy_q_values = self.policy_net(batch.states)
+            q_values = policy_q_values.gather(
+                1, batch.actions.long().unsqueeze(1)
+            ).squeeze(1)
             with torch.no_grad():
                 if self.use_double_dqn:
                     was_training = self.policy_net.training
@@ -982,7 +1032,16 @@ class DQNAgent:
             targets = targets.to(q_values.dtype)
             td_errors = targets - q_values
             element_losses = F.smooth_l1_loss(q_values, targets, reduction="none")
-            loss = (batch.weights * element_losses).mean()
+            td_loss = (batch.weights * element_losses).mean()
+            if self.policy_anchor_net is not None and self.policy_anchor_weight > 0:
+                with torch.no_grad():
+                    anchor_q_values = self.policy_anchor_net(batch.states)
+                anchor_loss = F.smooth_l1_loss(
+                    policy_q_values, anchor_q_values, reduction="mean"
+                )
+            else:
+                anchor_loss = torch.zeros((), device=self.device, dtype=td_loss.dtype)
+            loss = td_loss + self.policy_anchor_weight * anchor_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
@@ -1005,6 +1064,8 @@ class DQNAgent:
         gpu_wait_started = time.perf_counter()
         td_errors_cpu = td_errors.detach().abs().to(device="cpu", dtype=torch.float32)
         loss_value = float(loss.detach().cpu().item())
+        td_loss_value = float(td_loss.detach().cpu().item())
+        anchor_loss_value = float(anchor_loss.detach().cpu().item())
         td_error_value = float(td_errors_cpu.mean().item())
         grad_norm_value = float(torch.as_tensor(grad_norm).detach().cpu().item())
         q_mean_value = float(q_values.detach().mean().cpu().item())
@@ -1021,6 +1082,9 @@ class DQNAgent:
         self._update_target_network()
         return {
             "loss": loss_value,
+            "td_loss": td_loss_value,
+            "anchor_loss": anchor_loss_value,
+            "anchor_weight": self.policy_anchor_weight,
             "td_error": td_error_value,
             "grad_norm": grad_norm_value,
             "q_mean": q_mean_value,
@@ -1036,6 +1100,11 @@ class DQNAgent:
             "checkpoint_schema_version": 3,
             "policy_state_dict": self.policy_net.state_dict(),
             "target_state_dict": self.target_net.state_dict(),
+            "policy_anchor_state_dict": (
+                self.policy_anchor_net.state_dict()
+                if self.policy_anchor_net is not None
+                else None
+            ),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "grad_scaler_state_dict": (
                 self.grad_scaler.state_dict() if self.grad_scaler is not None else None
@@ -1091,6 +1160,9 @@ class DQNAgent:
                 "learn_step_counter": self.learn_step_counter,
                 "obs_shape": self.obs_shape,
                 "network_version": self.network_version,
+                "policy_anchor_weight": self.policy_anchor_weight,
+                "teacher_replay_steps": self.teacher_replay_steps,
+                "policy_anchor_enabled": self.policy_anchor_net is not None,
                 "game_config": asdict(self.game_config) if self.game_config else None,
             },
         }
@@ -1285,11 +1357,22 @@ class DQNAgent:
             # Pinned memory is a runtime/device property and replay is not
             # restored, so configure it from the selected device every time.
             pin_memory=None,
+            policy_anchor_weight=metadata.get("policy_anchor_weight", 0.0),
+            teacher_replay_steps=metadata.get("teacher_replay_steps", 0),
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(
             checkpoint.get("target_state_dict", checkpoint["policy_state_dict"])
         )
+        anchor_state = checkpoint.get("policy_anchor_state_dict")
+        if anchor_state is not None:
+            agent.snapshot_policy_anchor()
+            assert agent.policy_anchor_net is not None
+            agent.policy_anchor_net.load_state_dict(anchor_state, strict=True)
+        elif metadata.get("policy_anchor_enabled"):
+            raise RuntimeError(
+                "checkpoint metadata requires a policy anchor but its state is missing"
+            )
         if checkpoint.get("optimizer_state_dict") is not None:
             agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scaler_state = checkpoint.get("grad_scaler_state_dict")

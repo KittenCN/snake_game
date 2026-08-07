@@ -177,9 +177,10 @@ in-flight seed 不会在恢复时重放；恢复会从已记录的 `episodes_sta
 
 ## 固定评估、降学习率与早停
 
-best 选择只看固定 seed 套件的原始 `eval_score_mean`：任何严格高于当前 best 的分数都会更新 best，
-即使增幅小于 `--early-stop-delta`。后者只定义“显著改善”的绝对分数门槛，并同时服务于平台期和
-早停耐心。`--lr-plateau-patience 0`（默认）完全禁用调度，保留原早停语义；启用后，连续达到指定
+默认 best 选择仍使用固定 seed 套件的原始 `eval_score_mean`，保持旧训练兼容。成熟策略 warm start
+应启用 `--require-paired-promotion`：每次评估保存相同 seed 的逐局分数，候选相对当前 best 的配对
+差值必须达到 `--paired-promotion-min-delta`，且 95% 置信区间下界严格大于 0，才允许晋升。
+`--early-stop-delta` 定义“显著改善”的绝对分数门槛。`--lr-plateau-patience 0`（默认）完全禁用调度；启用后，连续达到指定
 次数的非显著评估会把所有 optimizer 参数组的当前 LR 乘以 `--lr-plateau-factor`，并钳制到
 `--lr-plateau-min`。每次降 LR 都清零平台期耐心，不恢复权重、不重建 optimizer，也不清空 replay。
 
@@ -189,30 +190,45 @@ sidecar 都保存控制器配置/计数以及当前 LR。普通 resume 在这些
 会拒绝启动，sidecar 当前 LR 与 checkpoint optimizer 状态不一致也会失败。完整恢复只接受 `latest`
 角色；要以 `best_eval` 为源必须使用 warm start，避免覆盖不可变的 best。
 
+`--regression-stop-patience N` 提供独立的硬退化门槛：若配对差值置信区间上界仍低于负的
+`--regression-stop-delta`（即可以排除“只是评估噪声”），连续 N 次后直接停止本次实验。它只停止，
+不会恢复历史权重、optimizer 或 replay；immutable best 始终保持不变。
+
 ## 仅迁移网络权重
 
 当需要保留已学策略、同时更换地图尺寸、batch、学习率或 replay 配置时，使用
 `--warm-start-from`，不要使用普通 `--resume-from`：
 
 ```bash
-python3 train_dqn.py \
+mkdir -p runs/stable_v2_conservative_8x8
+nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   --episodes 20000 \
   --warm-start-from models/dqn_snake_8x8_b512_best.pt \
   --width 8 --height 8 \
   --max-idle-steps 70 --idle-growth-per-food 2 \
-  --num-envs 32 --rollout-steps 4 --updates-per-collection 32 \
-  --batch-size 512 --min-replay 20000 --replay-capacity 100000 \
-  --lr 0.00005 --lr-plateau-patience 6 \
-  --lr-plateau-factor 0.5 --lr-plateau-min 0.000003125 \
-  --early-stop-patience 12 --early-stop-delta 0.10 \
-  --epsilon-start 0.10 --epsilon-final 0.02 --epsilon-decay-steps 300000 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
+  --batch-size 512 --min-replay 50000 --replay-capacity 100000 \
+  --policy-anchor-weight 0.25 --teacher-replay-steps 50000 \
+  --lr 0.000003125 --lr-plateau-patience 3 \
+  --lr-plateau-factor 0.5 --lr-plateau-min 0.000000390625 \
+  --early-stop-patience 5 --early-stop-delta 0.10 \
+  --require-paired-promotion --paired-promotion-min-delta 0.10 \
+  --regression-stop-patience 3 --regression-stop-delta 0.10 \
+  --epsilon-start 0.02 --epsilon-final 0.01 --epsilon-decay-steps 600000 \
+  --eval-interval 100 --eval-episodes 50 --checkpoint-interval 100 \
   --device cuda --allow-nondeterministic \
-  --output models/dqn_snake_8x8_stable_v1_best.pt \
-  --latest-output models/dqn_snake_8x8_stable_v1_latest.pt \
-  --log-dir runs/stable_v1_8x8
+  --output models/dqn_snake_8x8_stable_v2_best.pt \
+  --latest-output models/dqn_snake_8x8_stable_v2_latest.pt \
+  --log-dir runs/stable_v2_conservative_8x8 \
+  > runs/stable_v2_conservative_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
-warm start 只迁移 `policy_net` 权重，并用其重新同步 target；optimizer、AMP scaler、replay、
+warm start 只迁移 `policy_net` 权重，并用其重新同步 target；启用保守参数后还会冻结同一 policy 作为
+teacher。前 `--teacher-replay-steps` 个 transition 使用 teacher 的贪心动作收集 replay，期间不执行任何
+梯度更新；之后 TD loss 叠加 `--policy-anchor-weight * anchor_loss`，限制 Q 值偏离 immutable best。
+完整 resume 因 replay 不持久化，会自动重新完成这一 teacher 预热，而不是在空 replay 上恢复更新。
+预热期固定评估仅记录，不累计学习率、早停或退化耐心。
+optimizer、AMP scaler、replay、
 n-step 队列、epsilon、行为/学习计数、训练 seed 流以及 best 评估身份都从新配置重新开始。源
 checkpoint 默认必须带有 SHA-256 匹配的 sidecar，且源文件不能与新 best/latest 输出同名；
 `--ignore-warm-start-metadata` 只用于经过人工确认的旧 checkpoint。网络版本、动作空间、观测
@@ -254,7 +270,8 @@ python analyze_training.py "runs/train_log_*.jsonl" --json
 
 工具会报告全局及最近 100/1,000/5,000 回合指标、best/last evaluation、epsilon floor、
 loss、终止事件和分数/蛇长分桶。平台期判断是诊断启发式，不是统计学证明。
-episode-0 独立基线会参与 evaluation 汇总，best 与 checkpoint 一致优先按原始平均分选择。
+episode-0 独立基线会参与 evaluation 汇总；配对模式还会记录逐 seed 样本、差值置信区间、晋升资格和
+明确退化计数。
 
 ## 测试
 
@@ -264,7 +281,7 @@ python -m ruff check .
 ```
 
 测试覆盖环境状态不变量、尾格移动、随机多 seed、相对动作、动态 idle、seed 序列、PER、
-n-step、epsilon、action mask、target buffer 同步、旧 checkpoint、tail/body-order 观测、
+n-step、epsilon、action mask、target buffer 同步、冻结 teacher/anchor loss、旧 checkpoint、tail/body-order 观测、
 固定评估、有限时域、checkpoint 身份校验、防止 fresh 混写和短训练闭环。GitHub Actions
 会运行同样的 pytest 门槛。
 

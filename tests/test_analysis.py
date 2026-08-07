@@ -145,6 +145,76 @@ def test_standalone_baseline_participates_and_raw_score_selects_best(
     assert report["evaluation"]["best"]["avg_score"] == pytest.approx(7.0)
 
 
+def test_paired_evaluation_and_anchor_loss_are_reported(tmp_path: Path) -> None:
+    path = tmp_path / "paired.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "episode": 100,
+                "score": 2,
+                "eval_score_mean": 2.5,
+                "avg_loss": 0.2,
+                "avg_td_loss": 0.15,
+                "avg_anchor_loss": 0.2,
+                "convergence_decision": {
+                    "decision": "paired_regression_patience",
+                    "paired_promotion_eligible": False,
+                    "clear_regression": True,
+                    "paired_comparison": {
+                        "mean_delta": -1.0,
+                        "ci95_low": -1.2,
+                        "ci95_high": -0.8,
+                    },
+                },
+            }
+        ],
+    )
+
+    report = _report(path, plateau_window=1)
+    last = report["evaluation"]["last"]
+
+    assert last["decision"] == "paired_regression_patience"
+    assert last["paired_mean_delta"] == pytest.approx(-1.0)
+    assert last["paired_ci95_high"] == pytest.approx(-0.8)
+    assert last["clear_regression"] is True
+    assert report["td_loss"]["last"] == pytest.approx(0.15)
+    assert report["anchor_loss"]["last"] == pytest.approx(0.2)
+    rendered = analyze_training.format_human(report)
+    assert "Paired evaluation:" in rendered
+    assert "decision=paired_regression_patience" in rendered
+
+
+def test_paired_mode_best_ignores_unpromoted_raw_score(tmp_path: Path) -> None:
+    path = tmp_path / "paired-best.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "record_type": "run_start",
+                "args": {"require_paired_promotion": True},
+            },
+            {
+                "record_type": "evaluation",
+                "evaluation_kind": "warm_start_baseline",
+                "episode": 0,
+                "eval_score_mean": 3.5,
+            },
+            {
+                "record_type": "episode",
+                "episode": 100,
+                "eval_score_mean": 3.8,
+                "convergence_decision": {"paired_promotion_eligible": False},
+            },
+        ],
+    )
+
+    report = _report(path, plateau_window=1)
+
+    assert report["evaluation"]["best_by"] == "paired_promoted_avg_score"
+    assert report["evaluation"]["best"]["episode"] == 0
+
+
 def test_plateau_is_explicitly_a_non_statistical_heuristic() -> None:
     flat = analyze_training.diagnose_plateau(
         [10.0] * 20,

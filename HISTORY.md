@@ -1,5 +1,13 @@
 # History
 
+## 0.4.4 - 2026-08-07
+
+- Added a frozen warm-start policy teacher and configurable Q-value anchor loss to prevent destructive fine-tuning.
+- Added teacher-driven replay bootstrap that defers all gradient updates until the configured transition budget is collected.
+- Persisted policy-anchor weights and conservative replay configuration in resumable checkpoints and sidecars.
+- Added per-seed evaluation samples, paired confidence-interval best promotion, and clear-regression early stopping without rollback.
+- Reduced the recommended mature-policy update/data ratio and documented a distinct immutable-best `stable_v2` server run.
+
 ## 0.4.3 - 2026-08-07
 
 - Added a serializable fixed-suite convergence controller with optional plateau LR reductions and minimum-LR-gated early stopping.

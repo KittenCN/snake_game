@@ -138,11 +138,21 @@ def _series_summary(
 
 
 def _evaluation_entry(record: LogRecord) -> dict[str, Any]:
+    decision = record.data.get("convergence_decision")
+    decision = decision if isinstance(decision, Mapping) else {}
+    paired = decision.get("paired_comparison")
+    paired = paired if isinstance(paired, Mapping) else {}
     return {
         "episode": _display_number(_number(record.data.get("episode"))),
         "avg_reward": _first_number(record, ("eval_reward_mean", "eval_avg_reward")),
         "avg_score": _first_number(record, ("eval_score_mean", "eval_avg_score")),
         "avg_steps": _first_number(record, ("eval_steps_mean", "eval_avg_steps")),
+        "decision": decision.get("decision"),
+        "paired_mean_delta": _number(paired.get("mean_delta")),
+        "paired_ci95_low": _number(paired.get("ci95_low")),
+        "paired_ci95_high": _number(paired.get("ci95_high")),
+        "paired_promotion_eligible": decision.get("paired_promotion_eligible"),
+        "clear_regression": decision.get("clear_regression"),
         "source": record.source,
         "line": record.line,
     }
@@ -157,12 +167,34 @@ def _evaluation_summary(records: Sequence[LogRecord]) -> dict[str, Any]:
     ]
     if not evaluations:
         return {"count": 0, "best": None, "last": None, "best_by": None}
+    paired_sources = {
+        record.source
+        for record in records
+        if record.data.get("record_type") == "run_start"
+        and isinstance(record.data.get("args"), Mapping)
+        and record.data["args"].get("require_paired_promotion") is True
+    }
     score_rows = [
         r
         for r in evaluations
         if _first_number(r, ("eval_score_mean", "eval_avg_score")) is not None
     ]
     if score_rows:
+        eligible_score_rows = [
+            row
+            for row in score_rows
+            if row.source not in paired_sources
+            or row.data.get("evaluation_kind") == "warm_start_baseline"
+            or (
+                isinstance(row.data.get("convergence_decision"), Mapping)
+                and row.data["convergence_decision"].get(
+                    "paired_promotion_eligible"
+                )
+                is True
+            )
+        ]
+        if eligible_score_rows:
+            score_rows = eligible_score_rows
         best = max(
             score_rows,
             key=lambda r: (
@@ -172,7 +204,9 @@ def _evaluation_summary(records: Sequence[LogRecord]) -> dict[str, Any]:
                 else -math.inf
             ),
         )
-        best_by = "avg_score"
+        best_by = (
+            "paired_promoted_avg_score" if paired_sources else "avg_score"
+        )
     else:
         best = max(
             evaluations,
@@ -366,6 +400,8 @@ def build_report(
         "evaluation": _evaluation_summary(records),
         "epsilon": _epsilon_summary(records),
         "loss": _series_summary(_values(records, "avg_loss")),
+        "td_loss": _series_summary(_values(records, "avg_td_loss")),
+        "anchor_loss": _series_summary(_values(records, "avg_anchor_loss")),
         "termination_events": {"available": bool(events), "counts": dict(events)},
         "score_buckets": _bucket_summary(records, ("score",)),
         "snake_length_buckets": _bucket_summary(
@@ -417,6 +453,16 @@ def format_human(report: Mapping[str, Any]) -> str:
             f"last ep={_fmt(last['episode'])} reward={_fmt(last['avg_reward'])} "
             f"score={_fmt(last['avg_score'])}"
         )
+        if last["paired_mean_delta"] is not None:
+            lines.append(
+                "Paired evaluation: "
+                f"mean delta={_fmt(last['paired_mean_delta'])}, "
+                f"CI95=[{_fmt(last['paired_ci95_low'])}, "
+                f"{_fmt(last['paired_ci95_high'])}], "
+                f"promotion={last['paired_promotion_eligible']}, "
+                f"clear regression={last['clear_regression']}, "
+                f"decision={last['decision']}"
+            )
     else:
         lines.append("Evaluation: no evaluation fields found")
     floor_position = epsilon["first_floor_position"]

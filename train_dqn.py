@@ -39,15 +39,15 @@ except ImportError:
 
 CHECKPOINT_FORMAT = 3
 V3_OBSERVATION_CHANNELS = 20
-CONVERGENCE_CONTROLLER_VERSION = 1
+CONVERGENCE_CONTROLLER_VERSION = 2
 
 
 @dataclass
 class EvaluationConvergenceController:
     """Serializable fixed-suite convergence policy.
 
-    Raw fixed-suite score is deliberately the sole signal.  Checkpoint selection
-    remains separate: a non-significant score can still be a new raw-score best.
+    Legacy runs use raw fixed-suite mean score. Conservative warm starts can also
+    require a positive paired-seed confidence interval and stop on clear regression.
     """
 
     lr_plateau_patience: int
@@ -55,9 +55,15 @@ class EvaluationConvergenceController:
     lr_plateau_min: float
     early_stop_patience: int
     early_stop_delta: float
+    require_paired_promotion: bool = False
+    paired_promotion_min_delta: float = 0.0
+    regression_stop_patience: int = 0
+    regression_stop_delta: float = 0.0
     reference_score: float | None = None
+    reference_scores: list[float] | None = None
     plateau_evaluations: int = 0
     min_lr_evaluations: int = 0
+    regression_evaluations: int = 0
     reductions: int = 0
     evaluations: int = 0
 
@@ -67,10 +73,55 @@ class EvaluationConvergenceController:
 
     def reset(self, reference_score: float | None = None) -> None:
         self.reference_score = reference_score
+        self.reference_scores = None
         self.plateau_evaluations = 0
         self.min_lr_evaluations = 0
+        self.regression_evaluations = 0
         self.reductions = 0
         self.evaluations = 0
+
+    def set_paired_reference(self, scores: Sequence[float | int]) -> None:
+        parsed = [float(value) for value in scores]
+        if not parsed or not all(math.isfinite(value) for value in parsed):
+            raise ValueError("Paired reference scores must be non-empty and finite")
+        self.reference_scores = parsed
+        self.regression_evaluations = 0
+
+    def paired_comparison(
+        self, scores: Sequence[float | int] | None
+    ) -> dict[str, Any] | None:
+        if scores is None or self.reference_scores is None:
+            return None
+        candidate = [float(value) for value in scores]
+        if len(candidate) != len(self.reference_scores):
+            raise ValueError(
+                "Paired evaluation sample count changed: "
+                f"reference={len(self.reference_scores)}, candidate={len(candidate)}"
+            )
+        if not candidate or not all(math.isfinite(value) for value in candidate):
+            raise ValueError("Paired candidate scores must be non-empty and finite")
+        differences = [
+            current - reference
+            for current, reference in zip(candidate, self.reference_scores, strict=True)
+        ]
+        mean = float(statistics.mean(differences))
+        std = float(statistics.stdev(differences)) if len(differences) > 1 else 0.0
+        margin = 1.96 * std / math.sqrt(len(differences))
+        ci95_low = mean - margin
+        ci95_high = mean + margin
+        return {
+            "count": len(differences),
+            "mean_delta": mean,
+            "std_delta": std,
+            "ci95_low": ci95_low,
+            "ci95_high": ci95_high,
+            "min_delta": min(differences),
+            "max_delta": max(differences),
+            "promotion_eligible": (
+                mean >= self.paired_promotion_min_delta and ci95_low > 0.0
+            ),
+            "clear_regression": ci95_high < -self.regression_stop_delta,
+        }
 
     @staticmethod
     def learning_rates(optimizer: torch.optim.Optimizer) -> list[float]:
@@ -84,16 +135,59 @@ class EvaluationConvergenceController:
         )
 
     def observe(
-        self, score: float, optimizer: torch.optim.Optimizer
+        self,
+        score: float,
+        optimizer: torch.optim.Optimizer,
+        *,
+        sample_scores: Sequence[float | int] | None = None,
+        defer_reason: str | None = None,
     ) -> dict[str, Any]:
         if not math.isfinite(score):
             raise ValueError("Evaluation score must be finite")
         before_reference = self.reference_score
         before_lrs = self.learning_rates(optimizer)
-        self.evaluations += 1
-        significant = (
+        paired = self.paired_comparison(sample_scores)
+        aggregate_significant = (
             before_reference is None
             or score >= before_reference + self.early_stop_delta
+        )
+        if defer_reason is not None:
+            return {
+                "score": score,
+                "decision": defer_reason,
+                "observation_deferred": True,
+                "significant_improvement": False,
+                "aggregate_significant_improvement": aggregate_significant,
+                "paired_comparison": paired,
+                "paired_promotion_eligible": False,
+                "clear_regression": False,
+                "regression_evaluations": self.regression_evaluations,
+                "lr_reduced": False,
+                "should_stop": False,
+                "reference_score_before": before_reference,
+                "reference_score": self.reference_score,
+                "learning_rates_before": before_lrs,
+                "learning_rates": before_lrs,
+                "at_min_lr": self.at_min_lr(optimizer),
+                "plateau_evaluations": self.plateau_evaluations,
+                "min_lr_evaluations": self.min_lr_evaluations,
+                "reductions": self.reductions,
+                "evaluations": self.evaluations,
+            }
+        self.evaluations += 1
+        significant = aggregate_significant and (
+            before_reference is None
+            or not self.require_paired_promotion
+            or bool(paired and paired["promotion_eligible"])
+        )
+        clear_regression = bool(paired and paired["clear_regression"])
+        if clear_regression:
+            self.regression_evaluations += 1
+        else:
+            self.regression_evaluations = 0
+        regression_stop = (
+            self.regression_stop_patience > 0
+            and self.regression_evaluations >= self.regression_stop_patience
         )
         reduced = False
         stop = False
@@ -105,6 +199,9 @@ class EvaluationConvergenceController:
             )
             self.plateau_evaluations = 0
             self.min_lr_evaluations = 0
+        elif regression_stop:
+            decision = "paired_regression_patience"
+            stop = True
         elif not self.scheduler_enabled:
             self.plateau_evaluations += 1
             decision = "early_stop_patience"
@@ -138,7 +235,15 @@ class EvaluationConvergenceController:
         return {
             "score": score,
             "decision": decision,
+            "observation_deferred": False,
             "significant_improvement": significant,
+            "aggregate_significant_improvement": aggregate_significant,
+            "paired_comparison": paired,
+            "paired_promotion_eligible": bool(
+                paired and paired["promotion_eligible"]
+            ),
+            "clear_regression": clear_regression,
+            "regression_evaluations": self.regression_evaluations,
             "lr_reduced": reduced,
             "should_stop": stop,
             "reference_score_before": before_reference,
@@ -161,11 +266,17 @@ class EvaluationConvergenceController:
                 "lr_plateau_min": self.lr_plateau_min,
                 "early_stop_patience": self.early_stop_patience,
                 "early_stop_delta": self.early_stop_delta,
+                "require_paired_promotion": self.require_paired_promotion,
+                "paired_promotion_min_delta": self.paired_promotion_min_delta,
+                "regression_stop_patience": self.regression_stop_patience,
+                "regression_stop_delta": self.regression_stop_delta,
             },
             "state": {
                 "reference_score": self.reference_score,
+                "reference_scores": self.reference_scores,
                 "plateau_evaluations": self.plateau_evaluations,
                 "min_lr_evaluations": self.min_lr_evaluations,
+                "regression_evaluations": self.regression_evaluations,
                 "reductions": self.reductions,
                 "evaluations": self.evaluations,
             },
@@ -173,7 +284,8 @@ class EvaluationConvergenceController:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> EvaluationConvergenceController:
-        if payload.get("version") != CONVERGENCE_CONTROLLER_VERSION:
+        version = payload.get("version")
+        if version not in {1, CONVERGENCE_CONTROLLER_VERSION}:
             raise RuntimeError(
                 "Unsupported convergence controller sidecar version: "
                 f"{payload.get('version')!r}"
@@ -188,13 +300,29 @@ class EvaluationConvergenceController:
             lr_plateau_min=float(config["lr_plateau_min"]),
             early_stop_patience=int(config["early_stop_patience"]),
             early_stop_delta=float(config["early_stop_delta"]),
+            require_paired_promotion=bool(
+                config.get("require_paired_promotion", False)
+            ),
+            paired_promotion_min_delta=float(
+                config.get("paired_promotion_min_delta", 0.0)
+            ),
+            regression_stop_patience=int(
+                config.get("regression_stop_patience", 0)
+            ),
+            regression_stop_delta=float(config.get("regression_stop_delta", 0.0)),
             reference_score=(
                 None
                 if state.get("reference_score") is None
                 else float(state["reference_score"])
             ),
+            reference_scores=(
+                None
+                if state.get("reference_scores") is None
+                else [float(value) for value in state["reference_scores"]]
+            ),
             plateau_evaluations=int(state.get("plateau_evaluations", 0)),
             min_lr_evaluations=int(state.get("min_lr_evaluations", 0)),
+            regression_evaluations=int(state.get("regression_evaluations", 0)),
             reductions=int(state.get("reductions", 0)),
             evaluations=int(state.get("evaluations", 0)),
         )
@@ -210,11 +338,30 @@ class EvaluationConvergenceController:
             raise RuntimeError("Controller minimum LR must be finite and positive")
         if not math.isfinite(self.early_stop_delta) or self.early_stop_delta < 0:
             raise RuntimeError("Controller early-stop delta must be finite and non-negative")
+        if (
+            not math.isfinite(self.paired_promotion_min_delta)
+            or self.paired_promotion_min_delta < 0
+        ):
+            raise RuntimeError(
+                "Controller paired-promotion delta must be finite and non-negative"
+            )
+        if self.regression_stop_patience < 0:
+            raise RuntimeError("Controller regression patience must be non-negative")
+        if not math.isfinite(self.regression_stop_delta) or self.regression_stop_delta < 0:
+            raise RuntimeError(
+                "Controller regression-stop delta must be finite and non-negative"
+            )
         if self.reference_score is not None and not math.isfinite(self.reference_score):
             raise RuntimeError("Controller reference score must be finite or null")
+        if self.reference_scores is not None and (
+            not self.reference_scores
+            or not all(math.isfinite(value) for value in self.reference_scores)
+        ):
+            raise RuntimeError("Controller paired reference scores must be finite")
         if min(
             self.plateau_evaluations,
             self.min_lr_evaluations,
+            self.regression_evaluations,
             self.reductions,
             self.evaluations,
         ) < 0:
@@ -270,6 +417,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epsilon-start", type=float, default=1.0)
     parser.add_argument("--epsilon-final", type=float, default=0.05)
     parser.add_argument("--epsilon-decay-steps", type=int, default=250_000)
+    parser.add_argument(
+        "--policy-anchor-weight",
+        type=float,
+        default=0.0,
+        help="Smooth-L1 weight that anchors Q values to the frozen warm-start policy",
+    )
+    parser.add_argument(
+        "--teacher-replay-steps",
+        type=int,
+        default=0,
+        help="Initial environment transitions collected greedily from the frozen teacher",
+    )
     parser.add_argument(
         "--resume-epsilon",
         type=float,
@@ -378,6 +537,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--lr-plateau-factor", type=float, default=0.5)
     parser.add_argument("--lr-plateau-min", type=float, default=1e-6)
+    parser.add_argument(
+        "--require-paired-promotion",
+        action="store_true",
+        help="Promote best only when paired fixed-seed score CI is strictly positive",
+    )
+    parser.add_argument("--paired-promotion-min-delta", type=float, default=0.0)
+    parser.add_argument("--regression-stop-patience", type=int, default=0)
+    parser.add_argument("--regression-stop-delta", type=float, default=0.0)
     # Accepted only to make old commands fail safe instead of re-enabling the rollback loop.
     parser.add_argument(
         "--resume-best-on-decline", action="store_true", help=argparse.SUPPRESS
@@ -402,10 +569,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("num-envs and rollout-steps must be positive")
     if args.updates_per_collection < 0:
         parser.error("updates-per-collection must be non-negative")
+    if args.teacher_replay_steps < 0:
+        parser.error("teacher-replay-steps must be non-negative")
+    if args.teacher_replay_steps > args.replay_capacity:
+        parser.error("teacher-replay-steps must not exceed replay-capacity")
+    if not math.isfinite(args.policy_anchor_weight) or args.policy_anchor_weight < 0:
+        parser.error("policy-anchor-weight must be finite and non-negative")
     if args.early_stop_patience < 0 or args.lr_plateau_patience < 0:
         parser.error("early-stop-patience and lr-plateau-patience must be non-negative")
     if not math.isfinite(args.early_stop_delta) or args.early_stop_delta < 0:
         parser.error("early-stop-delta must be finite and non-negative")
+    if args.regression_stop_patience < 0:
+        parser.error("regression-stop-patience must be non-negative")
+    if (
+        not math.isfinite(args.regression_stop_delta)
+        or args.regression_stop_delta < 0
+    ):
+        parser.error("regression-stop-delta must be finite and non-negative")
+    if (
+        not math.isfinite(args.paired_promotion_min_delta)
+        or args.paired_promotion_min_delta < 0
+    ):
+        parser.error("paired-promotion-min-delta must be finite and non-negative")
     if not 0.0 < args.lr_plateau_factor < 1.0:
         parser.error("lr-plateau-factor must be greater than 0 and less than 1")
     if not math.isfinite(args.lr_plateau_min) or args.lr_plateau_min <= 0:
@@ -679,10 +864,27 @@ def evaluate_agent(
         "reward": distribution(rewards),
         "score": distribution(scores),
         "steps": distribution(steps_taken),
+        "seeds": [int(seed) for seed in seeds],
+        "reward_samples": [float(value) for value in rewards],
+        "score_samples": [float(value) for value in scores],
+        "step_samples": [int(value) for value in steps_taken],
         "terminal_events": dict(sorted(events.items())),
         "truncated_count": truncated_count,
         "episodes": len(seeds),
     }
+
+
+def evaluation_samples(
+    evaluation: dict[str, Any], group: str
+) -> list[float]:
+    """Read per-seed samples while remaining compatible with legacy test/eval payloads."""
+    raw = evaluation.get(f"{group}_samples")
+    if isinstance(raw, list) and raw:
+        return [float(value) for value in raw]
+    episodes = int(evaluation.get("episodes", 1))
+    distribution_group = "steps" if group == "step" else group
+    mean = float(evaluation[distribution_group]["mean"])
+    return [mean] * max(1, episodes)
 
 
 def _sha256(path: Path) -> str:
@@ -719,14 +921,19 @@ def sidecar_path(checkpoint_path: Path) -> Path:
 def evaluation_identity(
     train_args: argparse.Namespace, game_config: GameConfig
 ) -> dict[str, Any]:
-    return {
-        "selection_metric": "raw_score_mean",
+    identity = {
+        "selection_metric": (
+            "paired_score_ci95" if train_args.require_paired_promotion else "raw_score_mean"
+        ),
         "safety_fallback": False,
         "run_seed": train_args.seed,
         "eval_seed_base": train_args.eval_seed_base,
         "eval_episodes": train_args.eval_episodes,
         "game_config": asdict(game_config),
     }
+    if train_args.require_paired_promotion:
+        identity["paired_promotion_min_delta"] = train_args.paired_promotion_min_delta
+    return identity
 
 
 def effective_agent_config(agent: DQNAgent) -> dict[str, Any]:
@@ -755,6 +962,9 @@ def effective_agent_config(agent: DQNAgent) -> dict[str, Any]:
         "epsilon_start": agent.epsilon_start,
         "epsilon_final": agent.epsilon_final,
         "epsilon_decay_steps": agent.epsilon_decay_steps,
+        "policy_anchor_weight": agent.policy_anchor_weight,
+        "teacher_replay_steps": agent.teacher_replay_steps,
+        "policy_anchor_enabled": agent.policy_anchor_enabled,
         "amp_enabled": agent.amp_enabled,
     }
 
@@ -990,6 +1200,14 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
         "--epsilon-start": (args.epsilon_start, agent.epsilon_start),
         "--epsilon-final": (args.epsilon_final, agent.epsilon_final),
         "--epsilon-decay-steps": (args.epsilon_decay_steps, agent.epsilon_decay_steps),
+        "--policy-anchor-weight": (
+            args.policy_anchor_weight,
+            agent.policy_anchor_weight,
+        ),
+        "--teacher-replay-steps": (
+            args.teacher_replay_steps,
+            agent.teacher_replay_steps,
+        ),
     }
     conflicts = {
         option: values
@@ -1014,6 +1232,10 @@ _CONTROLLER_OPTIONS = {
     "--lr-plateau-min": "lr_plateau_min",
     "--early-stop-patience": "early_stop_patience",
     "--early-stop-delta": "early_stop_delta",
+    "--require-paired-promotion": "require_paired_promotion",
+    "--paired-promotion-min-delta": "paired_promotion_min_delta",
+    "--regression-stop-patience": "regression_stop_patience",
+    "--regression-stop-delta": "regression_stop_delta",
 }
 
 
@@ -1026,6 +1248,10 @@ def _new_convergence_controller(
         lr_plateau_min=args.lr_plateau_min,
         early_stop_patience=args.early_stop_patience,
         early_stop_delta=args.early_stop_delta,
+        require_paired_promotion=args.require_paired_promotion,
+        paired_promotion_min_delta=args.paired_promotion_min_delta,
+        regression_stop_patience=args.regression_stop_patience,
+        regression_stop_delta=args.regression_stop_delta,
         reference_score=reference_score,
     )
     controller.validate()
@@ -1254,6 +1480,8 @@ def _new_agent(
         obs_shape=obs_shape,
         network_version=args.network_version,
         amp_enabled=False if args.disable_amp else None,
+        policy_anchor_weight=args.policy_anchor_weight,
+        teacher_replay_steps=args.teacher_replay_steps,
     )
 
 
@@ -1344,6 +1572,19 @@ def _train(args: argparse.Namespace) -> None:
         _validate_output_network_identity(
             args.network_version, output_path, latest_path
         )
+    conservative_options_enabled = any(
+        (
+            args.policy_anchor_weight > 0,
+            args.teacher_replay_steps > 0,
+            args.require_paired_promotion,
+            args.regression_stop_patience > 0,
+        )
+    )
+    if resume_path is None and not args.warm_start_from and conservative_options_enabled:
+        raise RuntimeError(
+            "Policy anchoring, teacher replay, and paired evaluation guards require "
+            "--warm-start-from (or a latest checkpoint that already contains them)."
+        )
     if not args.warm_start_from:
         _prepare_fresh_outputs(args, resume_path)
     start_episode = 1
@@ -1370,6 +1611,13 @@ def _train(args: argparse.Namespace) -> None:
         agent.game_config = game_config
         agent.configure_amp(False if args.disable_amp else None)
         agent.configure_replay_pin_memory()
+        if (
+            (agent.policy_anchor_weight > 0 or agent.teacher_replay_steps > 0)
+            and not agent.policy_anchor_enabled
+        ):
+            raise RuntimeError(
+                "Resume checkpoint requires a frozen policy anchor, but none was restored."
+            )
         resume_state = flatten_observation(
             train_env, agent.device, expected_channels=agent.obs_shape[0]
         )
@@ -1421,6 +1669,8 @@ def _train(args: argparse.Namespace) -> None:
             embedded_metadata = agent.load_policy_weights(
                 str(source), expected_sha256=source_checkpoint_sha256
             )
+            if agent.policy_anchor_weight > 0 or agent.teacher_replay_steps > 0:
+                agent.snapshot_policy_anchor()
             embedded_obs_shape = embedded_metadata.get("obs_shape")
             warm_start_provenance = {
                 "source_path": str(source.resolve()),
@@ -1515,7 +1765,13 @@ def _train(args: argparse.Namespace) -> None:
     if args.warm_start_from:
         baseline = evaluate_agent(agent, game_config, eval_seeds, step_limit)
         baseline_score = float(baseline["score"]["mean"])
-        controller_decision = controller.observe(baseline_score, agent.optimizer)
+        baseline_score_samples = evaluation_samples(baseline, "score")
+        controller_decision = controller.observe(
+            baseline_score,
+            agent.optimizer,
+            sample_scores=baseline_score_samples,
+        )
+        controller.set_paired_reference(baseline_score_samples)
         best_eval_score = baseline_score
         best_eval_episode = 0
         save_checkpoint(
@@ -1561,6 +1817,12 @@ def _train(args: argparse.Namespace) -> None:
                 baseline_record[f"eval_{group}_{name}"] = value
         baseline_record["eval_terminal_events"] = baseline["terminal_events"]
         baseline_record["eval_truncated_count"] = baseline["truncated_count"]
+        baseline_record["eval_seeds"] = baseline.get("seeds", eval_seeds)
+        baseline_record["eval_reward_samples"] = evaluation_samples(
+            baseline, "reward"
+        )
+        baseline_record["eval_score_samples"] = baseline_score_samples
+        baseline_record["eval_step_samples"] = evaluation_samples(baseline, "step")
         with log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(baseline_record, ensure_ascii=False) + "\n")
         print(
@@ -1601,10 +1863,18 @@ def _train(args: argparse.Namespace) -> None:
                 else np.zeros(len(active_envs), dtype=np.float64)
             )
             selection_started = time.perf_counter()
-            chosen_actions = agent.select_actions(
-                states,
-                action_masks=[action_mask(agent, env) for env in active_envs],
-            )
+            masks = [action_mask(agent, env) for env in active_envs]
+            if (
+                agent.policy_anchor_enabled
+                and len(agent.replay_buffer) < agent.teacher_replay_steps
+            ):
+                chosen_actions = agent.select_anchor_actions(
+                    states,
+                    action_masks=masks,
+                    advance_behavior_steps=True,
+                )
+            else:
+                chosen_actions = agent.select_actions(states, action_masks=masks)
             action_selection_seconds += time.perf_counter() - selection_started
 
             step_results: list[tuple[float, bool, bool, dict[str, object]]] = []
@@ -1693,7 +1963,12 @@ def _train(args: argparse.Namespace) -> None:
                     slot.active = False
 
         collection_seconds = max(time.perf_counter() - collection_started, 1e-12)
-        if args.updates_per_collection > 0:
+        teacher_replay_complete = (
+            len(agent.replay_buffer) >= agent.teacher_replay_steps
+        )
+        if not teacher_replay_complete:
+            update_attempts = 0
+        elif args.updates_per_collection > 0:
             update_attempts = args.updates_per_collection
         else:
             update_attempts = (
@@ -1742,7 +2017,15 @@ def _train(args: argparse.Namespace) -> None:
             "behavior_steps": agent.behavior_steps,
             "learn_step_counter": agent.learn_step_counter,
             "replay_size": len(agent.replay_buffer),
+            "teacher_replay_steps": agent.teacher_replay_steps,
+            "teacher_replay_collected": min(
+                len(agent.replay_buffer), agent.teacher_replay_steps
+            ),
+            "teacher_replay_complete": teacher_replay_complete,
             "avg_loss": metric_mean("loss"),
+            "avg_td_loss": metric_mean("td_loss"),
+            "avg_anchor_loss": metric_mean("anchor_loss"),
+            "policy_anchor_weight": agent.policy_anchor_weight,
             "avg_td_error": metric_mean("td_error"),
             "avg_grad_norm": metric_mean("grad_norm"),
             "avg_q_mean": metric_mean("q_mean"),
@@ -1766,10 +2049,27 @@ def _train(args: argparse.Namespace) -> None:
                     metrics[f"eval_{group}_{name}"] = value
             metrics["eval_terminal_events"] = evaluation["terminal_events"]
             metrics["eval_truncated_count"] = evaluation["truncated_count"]
+            score_samples = evaluation_samples(evaluation, "score")
+            metrics["eval_seeds"] = evaluation.get("seeds", eval_seeds)
+            metrics["eval_reward_samples"] = evaluation_samples(
+                evaluation, "reward"
+            )
+            metrics["eval_score_samples"] = score_samples
+            metrics["eval_step_samples"] = evaluation_samples(evaluation, "step")
             average_score = float(evaluation["score"]["mean"])
             previous_best = best_eval_score
-            improved = average_score > previous_best
-            controller_decision = controller.observe(average_score, agent.optimizer)
+            controller_decision = controller.observe(
+                average_score,
+                agent.optimizer,
+                sample_scores=score_samples,
+                defer_reason=(
+                    None if teacher_replay_complete else "teacher_replay_warmup"
+                ),
+            )
+            improved = teacher_replay_complete and average_score > previous_best and (
+                not controller.require_paired_promotion
+                or controller_decision["paired_promotion_eligible"]
+            )
             metrics["current_learning_rates"] = controller.learning_rates(
                 agent.optimizer
             )
@@ -1783,6 +2083,9 @@ def _train(args: argparse.Namespace) -> None:
             if improved:
                 best_eval_score = average_score
                 best_eval_episode = episodes_completed
+                controller.set_paired_reference(score_samples)
+                metrics["convergence_controller"] = controller.to_dict()
+                collection_metrics["convergence_controller"] = controller.to_dict()
                 save_checkpoint(
                     agent,
                     output_path,
