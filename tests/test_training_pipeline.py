@@ -50,6 +50,19 @@ from train_dqn import (
         ["--policy-anchor-weight", "nan"],
         ["--teacher-replay-steps", "-1"],
         ["--teacher-replay-steps", "101", "--replay-capacity", "100"],
+        [
+            "--batch-size", "2", "--demonstration-capacity", "8",
+            "--demonstration-batch-fraction", "0.1",
+        ],
+        [
+            "--batch-size", "2", "--demonstration-capacity", "8",
+            "--demonstration-batch-fraction", "0.75",
+        ],
+        [
+            "--batch-size", "2", "--demonstration-capacity", "8",
+            "--demonstration-batch-fraction", "0.5",
+            "--elite-demonstration-batch-fraction", "0.1",
+        ],
         ["--paired-promotion-min-delta", "-0.1"],
         ["--regression-stop-patience", "-1"],
         ["--regression-stop-delta", "-0.1"],
@@ -958,6 +971,14 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
             "--checkpoint-interval", "1", "--batch-size", "2", "--min-replay", "2",
             "--replay-capacity", "64", "--hidden", "16",
             "--policy-anchor-weight", "0.5", "--teacher-replay-steps", "2",
+            "--demonstration-capacity", "16",
+            "--demonstration-batch-fraction", "0.5",
+            "--elite-demonstration-batch-fraction", "0.5",
+            "--demonstration-min-score", "0",
+            "--demonstration-min-return", "-100",
+            "--demonstration-elite-score", "0",
+            "--demonstration-elite-return", "-100",
+            "--imitation-loss-weight", "0.5", "--imitation-margin", "0.8",
             "--require-paired-promotion", "--paired-promotion-min-delta", "0.1",
             "--regression-stop-patience", "2", "--regression-stop-delta", "0.1",
             "--warm-start-from", str(source), "--output", str(best),
@@ -974,6 +995,16 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
     assert latest_metadata["best_eval_score"] == pytest.approx(5.0)
     assert latest_metadata["best_eval_episode"] == 0
     assert latest_metadata["effective_agent_config"]["policy_anchor_enabled"] is True
+    assert latest_metadata["effective_agent_config"][
+        "demonstration_batch_fraction"
+    ] == pytest.approx(0.5)
+    assert latest_metadata["effective_agent_config"][
+        "imitation_loss_weight"
+    ] == pytest.approx(0.5)
+    assert latest_metadata["demonstration_replay_size_at_save"] > 0
+    assert latest_metadata["demonstration_replay_elite_count_at_save"] > 0
+    assert latest_metadata["demonstration_trajectories_seen_lifetime"] > 0
+    assert latest_metadata["demonstration_transitions_promoted_lifetime"] > 0
     assert latest_metadata["convergence_controller"]["state"][
         "regression_evaluations"
     ] == 2
@@ -1001,6 +1032,21 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
         == "teacher_replay_warmup"
         for record in records
     )
+    learned_collections = [
+        record
+        for record in records
+        if record.get("record_type") == "collection"
+        and record.get("collection_updates", 0) > 0
+    ]
+    assert learned_collections
+    assert all(record["avg_imitation_loss"] is not None for record in learned_collections)
+    assert all(
+        record["avg_demonstration_batch_fraction"] == pytest.approx(0.5)
+        for record in learned_collections
+    )
+    assert max(
+        record.get("demonstration_replay_elite_count", 0) for record in records
+    ) > 0
 
 
 def test_short_training_creates_distinct_latest_and_best(tmp_path: Path) -> None:

@@ -402,6 +402,19 @@ def build_report(
         "loss": _series_summary(_values(records, "avg_loss")),
         "td_loss": _series_summary(_values(records, "avg_td_loss")),
         "anchor_loss": _series_summary(_values(records, "avg_anchor_loss")),
+        "imitation_loss": _series_summary(_values(records, "avg_imitation_loss")),
+        "demonstration_batch_fraction": _series_summary(
+            _values(records, "avg_demonstration_batch_fraction")
+        ),
+        "elite_demonstration_batch_fraction": _series_summary(
+            _values(records, "avg_elite_demonstration_batch_fraction")
+        ),
+        "demonstration_replay_size": _series_summary(
+            _values(records, "demonstration_replay_size")
+        ),
+        "demonstration_replay_elite_count": _series_summary(
+            _values(records, "demonstration_replay_elite_count")
+        ),
         "termination_events": {"available": bool(events), "counts": dict(events)},
         "score_buckets": _bucket_summary(records, ("score",)),
         "snake_length_buckets": _bucket_summary(
@@ -476,6 +489,16 @@ def format_human(report: Mapping[str, Any]) -> str:
         "Loss: "
         f"last={_fmt(loss['last'])}, last100={_fmt(recent_loss['100'])}, "
         f"last1000={_fmt(recent_loss['1000'])}, last5000={_fmt(recent_loss['5000'])}"
+    )
+    imitation = report["imitation_loss"]
+    demo_fraction = report["demonstration_batch_fraction"]
+    demo_size = report["demonstration_replay_size"]
+    lines.append(
+        "Demonstrations: "
+        f"imitation_loss={_fmt(imitation['last'])}, "
+        f"batch_fraction={_fmt(demo_fraction['last'])}, "
+        f"replay_size={_fmt(demo_size['last'])}, "
+        f"elite={_fmt(report['demonstration_replay_elite_count']['last'])}"
     )
     event_counts = report["termination_events"]["counts"]
     lines.append(

@@ -233,6 +233,187 @@ def test_anchor_weight_fails_closed_without_frozen_teacher() -> None:
         agent.learn()
 
 
+def test_completed_high_score_trajectories_are_promoted_and_stratified(
+    tmp_path: Path,
+) -> None:
+    agent = make_agent(
+        n_step=2,
+        batch_size=4,
+        demonstration_capacity=16,
+        demonstration_batch_fraction=0.5,
+        elite_demonstration_batch_fraction=0.25,
+        demonstration_min_score=4,
+        demonstration_min_return=5,
+        demonstration_elite_score=6,
+        demonstration_elite_return=20,
+    )
+    state = torch.zeros(agent.obs_shape)
+
+    agent.remember(state, 0, 1.0, state, True)
+    rejected = agent.finalize_trajectory(score=3, episode_return=10)
+    assert rejected == {"quality_tier": 0.0, "promoted_transitions": 0.0}
+
+    for index in range(3):
+        agent.remember(state, index % 4, 1.0, state, index == 2)
+    success = agent.finalize_trajectory(score=4, episode_return=10)
+    assert success == {"quality_tier": 1.0, "promoted_transitions": 3.0}
+
+    for index in range(2):
+        agent.remember(state, index, 1.0, state, index == 1)
+    elite = agent.finalize_trajectory(score=6, episode_return=25)
+    assert elite == {"quality_tier": 2.0, "promoted_transitions": 2.0}
+    assert agent.demonstration_replay is not None
+    assert agent.demonstration_replay.demonstration_count == 5
+    assert agent.demonstration_replay.elite_demonstration_count == 2
+
+    batch = agent.demonstration_replay.sample_demonstrations(5, elite_count=2)
+    assert batch.demonstration_mask.all()
+    assert batch.quality_tiers.tolist() == [1, 1, 1, 2, 2]
+    assert batch.imitation_mask.sum().item() == 3
+    assert batch.trajectory_scores[:3].tolist() == [4.0, 4.0, 4.0]
+    assert batch.trajectory_returns[3:].tolist() == [25.0, 25.0]
+
+    checkpoint = tmp_path / "demonstrations.pt"
+    agent.save(str(checkpoint))
+    loaded = DQNAgent.load(str(checkpoint), device="cpu")
+    assert loaded.demonstration_capacity == 16
+    assert loaded.demonstration_batch_fraction == pytest.approx(0.5)
+    assert loaded.elite_demonstration_batch_fraction == pytest.approx(0.25)
+    assert loaded.demonstration_min_score == pytest.approx(4)
+    assert loaded.demonstration_elite_return == pytest.approx(20)
+    assert loaded.demonstration_replay is not None
+    assert len(loaded.demonstration_replay) == 0
+    assert loaded.demonstration_trajectories_seen == 2
+
+
+def test_trajectory_promotion_is_atomic_when_a_source_slot_was_overwritten() -> None:
+    source = ReplayBuffer(2, torch.device("cpu"), action_dim=2)
+    target = ReplayBuffer(8, torch.device("cpu"), action_dim=2)
+    state = torch.zeros((1, 2, 2))
+    tokens = [
+        source.push(state, 0, 1.0, state, False),
+        source.push(state, 1, 1.0, state, True),
+    ]
+    source.push(state, 0, 0.0, state, False)
+
+    copied = source.copy_trajectory_to(
+        tokens,
+        target,
+        quality_tier=1,
+        trajectory_score=4,
+        trajectory_return=10,
+    )
+
+    assert copied == 0
+    assert len(target) == 0
+
+
+def test_trajectory_larger_than_demo_capacity_is_rejected_atomically() -> None:
+    source = ReplayBuffer(4, torch.device("cpu"), action_dim=2)
+    target = ReplayBuffer(2, torch.device("cpu"), action_dim=2)
+    state = torch.zeros((1, 2, 2))
+    tokens = [source.push(state, 0, 1.0, state, False) for _ in range(3)]
+
+    copied = source.copy_trajectory_to(
+        tokens,
+        target,
+        quality_tier=1,
+        trajectory_score=4,
+        trajectory_return=10,
+    )
+
+    assert copied == 0
+    assert len(target) == 0
+
+
+def test_full_demo_stratum_is_uniform_without_replacement_or_fake_is_weights() -> None:
+    replay = ReplayBuffer(4, torch.device("cpu"), action_dim=2, alpha=1.0)
+    state = torch.zeros((1, 2, 2))
+    for index, priority in enumerate((1.0, 10.0, 100.0, 1000.0)):
+        replay.push(
+            state,
+            index % 2,
+            1.0,
+            state,
+            False,
+            priority=priority,
+            quality_tier=1,
+            trajectory_score=4,
+            trajectory_return=10,
+            imitation_eligible=True,
+        )
+
+    batch = replay.sample_demonstrations(4)
+
+    assert sorted(batch.indices.tolist()) == [0, 1, 2, 3]
+    assert batch.weights.tolist() == pytest.approx([1.0] * 4)
+
+
+@pytest.mark.parametrize("fraction", [0.1, 0.75])
+def test_demo_fraction_must_reserve_demo_and_regular_rows(fraction: float) -> None:
+    with pytest.raises(ValueError, match="at least one demo row"):
+        make_agent(
+            batch_size=2,
+            demonstration_capacity=8,
+            demonstration_batch_fraction=fraction,
+        )
+
+
+def test_demonstration_batch_adds_large_margin_imitation_loss() -> None:
+    agent = make_agent(
+        n_step=1,
+        batch_size=4,
+        min_replay_size=4,
+        demonstration_capacity=16,
+        demonstration_batch_fraction=0.5,
+        elite_demonstration_batch_fraction=0.0,
+        demonstration_min_score=4,
+        demonstration_min_return=0,
+        imitation_loss_weight=0.5,
+        imitation_margin=0.8,
+    )
+    state = torch.zeros(agent.obs_shape)
+    for action in (0, 1):
+        agent.remember(state, action, 1.0, state, action == 1)
+    agent.finalize_trajectory(score=4, episode_return=5)
+    for action in (2, 3):
+        agent.remember(state, action, 0.0, state, True)
+        agent.finalize_trajectory(score=0, episode_return=-5)
+
+    metrics = agent.learn()
+
+    assert metrics is not None
+    assert metrics["imitation_loss"] > 0
+    assert metrics["demonstration_batch_fraction"] == pytest.approx(0.5)
+    assert metrics["loss"] == pytest.approx(
+        metrics["td_loss"] + 0.5 * metrics["imitation_loss"], rel=1e-5
+    )
+
+
+def test_terminal_failure_action_is_excluded_from_imitation_loss() -> None:
+    agent = make_agent(
+        n_step=1,
+        batch_size=2,
+        min_replay_size=2,
+        demonstration_capacity=8,
+        demonstration_batch_fraction=0.5,
+        demonstration_min_score=1,
+        demonstration_min_return=-10,
+        imitation_loss_weight=1.0,
+    )
+    state = torch.zeros(agent.obs_shape)
+    agent.remember(state, 0, -5.0, state, True)
+    agent.finalize_trajectory(score=4, episode_return=10)
+    agent.remember(state, 1, -5.0, state, True)
+    agent.finalize_trajectory(score=0, episode_return=-5)
+
+    metrics = agent.learn()
+
+    assert metrics is not None
+    assert metrics["demonstration_batch_fraction"] == pytest.approx(0.5)
+    assert metrics["imitation_loss"] == pytest.approx(0.0)
+
+
 def test_n_step_terminal_flush_emits_all_prefixes() -> None:
     agent = make_agent(gamma=0.5, n_step=3)
     states = [torch.full(agent.obs_shape, float(index)) for index in range(4)]

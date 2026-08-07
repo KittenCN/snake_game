@@ -172,37 +172,69 @@ transition，且在完成前强制 `collection_update_attempts=0`。之后标准
 `teacher_replay_warmup`，不消耗 LR/早停/退化耐心。它不会把历史 best 回滚进 policy，也不会改变
 immutable source。
 
-服务器 `stable_v2` 推荐命令：
+### 固定评估目标对齐：demonstration replay 与 imitation loss
+
+potential shaping 只保证在理想无限数据/精确求解条件下不改变最优策略；有限容量网络、n-step、PER、
+截断和小学习率共同存在时，TD loss 优化的是 shaped return，并不直接保证固定评估的原始 score 上升。
+因此训练器在完整 episode 终止后，用原始 `score` 与未 shaping 的环境 return 联合分层：同时超过
+success 门槛的轨迹晋升为 tier 1，同时超过更高 score/return 门槛的晋升为 elite tier 2。未完整结束、
+只满足一个门槛或 replay slot 已被覆盖的轨迹不会部分晋升。
+
+晋升轨迹原子复制到独立的 `demonstration_replay`，因此普通 replay 环形覆盖不会清除成功监督。
+每个 learner batch 保留固定 demo 配额，并在 demo 内按 success/elite 配额分层、在每层内部均匀
+无放回采样；普通 replay 继续使用 PER。demo action 使用 DQfD large-margin objective：正确行为的 Q 必须至少比其他动作高
+`--imitation-margin`；elite 样本权重为普通 success 的 1.5 倍。总损失为：
+
+`TD loss + policy_anchor_weight * anchor_loss + imitation_loss_weight * imitation_loss`
+
+这不是把固定评估 score 当作逐 transition reward，也不修改环境 MDP；它把已经由完整原始 score/return
+验证的成功行为作为额外监督，直接弥合 TD shaped-return 与固定评估 score 的有限样本偏差。teacher
+预热首先提供稳定 demo，之后当前策略自己的合格高分完整轨迹也能晋升并替换 demo 环中的较旧样本。
+终止/截断动作保留在完整 demo 轨迹中用于 TD，但通过独立 eligibility mask 排除在 imitation 外，避免
+负终局 TD 与成功动作 margin 发生梯度冲突。demo 采用无放回采样；unique transition 不足时只使用当前
+可用数量，其余 batch 回填普通 PER，随 demo 积累逐步达到目标配额。demo 不套用普通 PER importance
+公式，避免在优先级无放回抽样中使用错误的 inclusion probability；每个入选 demo 的 TD 权重均为 1。
+checkpoint 不保存两个大 replay；完整 resume 会从冻结 teacher 重新采集并重建 demo，所有门槛、batch
+占比、imitation 参数及累计晋升计数仍进入 checkpoint/sidecar 供身份校验与审计。
+
+服务器 `stable_v3` 推荐命令：
 
 ```bash
-mkdir -p runs/stable_v2_conservative_8x8
+mkdir -p runs/stable_v3_demonstration_8x8
 nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
-  --episodes 20000 \
+  --episodes 30000 \
   --warm-start-from models/dqn_snake_8x8_b512_best.pt \
   --width 8 --height 8 \
   --max-idle-steps 70 --idle-growth-per-food 2 \
   --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
   --batch-size 512 --min-replay 50000 --replay-capacity 100000 \
   --policy-anchor-weight 0.25 --teacher-replay-steps 50000 \
+  --demonstration-capacity 20000 \
+  --demonstration-batch-fraction 0.25 \
+  --elite-demonstration-batch-fraction 0.0625 \
+  --demonstration-min-score 4 --demonstration-min-return 5 \
+  --demonstration-elite-score 6 --demonstration-elite-return 20 \
+  --imitation-loss-weight 0.25 --imitation-margin 0.8 \
   --lr 0.000003125 \
-  --lr-plateau-patience 3 --lr-plateau-factor 0.5 \
-  --lr-plateau-min 0.000000390625 --early-stop-patience 5 \
+  --lr-plateau-patience 4 --lr-plateau-factor 0.5 \
+  --lr-plateau-min 0.0000001953125 --early-stop-patience 8 \
   --early-stop-delta 0.10 \
   --require-paired-promotion --paired-promotion-min-delta 0.10 \
   --regression-stop-patience 3 --regression-stop-delta 0.10 \
   --epsilon-start 0.02 --epsilon-final 0.01 --epsilon-decay-steps 600000 \
-  --eval-interval 100 --eval-episodes 50 --checkpoint-interval 100 \
+  --eval-interval 200 --eval-episodes 50 --checkpoint-interval 200 \
   --device cuda --allow-nondeterministic \
-  --output models/dqn_snake_8x8_stable_v2_best.pt \
-  --latest-output models/dqn_snake_8x8_stable_v2_latest.pt \
-  --log-dir runs/stable_v2_conservative_8x8 \
-  > runs/stable_v2_conservative_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+  --output models/dqn_snake_8x8_stable_v3_best.pt \
+  --latest-output models/dqn_snake_8x8_stable_v3_latest.pt \
+  --log-dir runs/stable_v3_demonstration_8x8 \
+  > runs/stable_v3_demonstration_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
-这组值直接针对服务器 `stable_v1` 的证据：原策略在 replay 未满时保持 3.54，开始更新后立即降至
-3.20/3.02。因此 v2 把初始 LR 设为旧运行的最低 LR，更新/collection 从 32 降到 8，先收集
-50,000 个 teacher transition，并用配对统计在三次明确退化后提前止损。不得从
-`dqn_snake_8x8_stable_v1_latest.pt` resume。
+这组值直接针对服务器 `stable_v2` 的证据：episode-0 固定评估为 3.54，学习期间虽比 v1 稳定，
+但 active evaluation 最高仅 3.38，说明 anchor 成功防止了大幅遗忘，却没有提供超越 immutable best 的
+直接监督。v3 保留低 LR、低 update/data ratio、teacher 和配对保护，同时用 25% demo batch（其中
+6.25% 为 elite）把原始 score/return 验证过的动作加入优化目标；LR 平台期与最小 LR 后耐心也适度拉长。
+必须继续从原始 immutable `dqn_snake_8x8_b512_best.pt` warm start，不得从 stable_v1/v2 latest resume。
 
 推荐每个课程阶段使用独立输出，例如 `6x6 -> 8x8 -> 10x10 -> 12x12`，并以上一阶段固定评估的
 best checkpoint 作为下一阶段 source；不要从 latest 迁移，也不要跨尺寸携带 replay。
@@ -216,4 +248,5 @@ best checkpoint 作为下一阶段 source；不要从 latest 迁移，也不要�
 - Latest 与 best checkpoint 保持分离，metadata 与 checkpoint 架构、步数、环境、评估套件和 best artifact 身份一致。
 - 单元测试覆盖 replay、n-step target、动作掩码、target 同步、截断和固定 seed 评估。
 - 保守 warm start 覆盖冻结 teacher、零更新 replay 预热、anchor checkpoint 恢复、配对晋升与退化停止。
+- demonstration 回归覆盖完整轨迹原子晋升、覆盖版本保护、success/elite 分层采样、large-margin imitation 和 resume 参数身份。
 - 确定性短训练 smoke test 无 NaN/Inf，能生成可恢复 latest checkpoint 与独立选出的 best checkpoint。

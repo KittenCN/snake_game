@@ -157,6 +157,11 @@ def test_paired_evaluation_and_anchor_loss_are_reported(tmp_path: Path) -> None:
                 "avg_loss": 0.2,
                 "avg_td_loss": 0.15,
                 "avg_anchor_loss": 0.2,
+                "avg_imitation_loss": 0.4,
+                "avg_demonstration_batch_fraction": 0.25,
+                "avg_elite_demonstration_batch_fraction": 0.125,
+                "demonstration_replay_size": 1200,
+                "demonstration_replay_elite_count": 300,
                 "convergence_decision": {
                     "decision": "paired_regression_patience",
                     "paired_promotion_eligible": False,
@@ -180,9 +185,14 @@ def test_paired_evaluation_and_anchor_loss_are_reported(tmp_path: Path) -> None:
     assert last["clear_regression"] is True
     assert report["td_loss"]["last"] == pytest.approx(0.15)
     assert report["anchor_loss"]["last"] == pytest.approx(0.2)
+    assert report["imitation_loss"]["last"] == pytest.approx(0.4)
+    assert report["demonstration_batch_fraction"]["last"] == pytest.approx(0.25)
+    assert report["demonstration_replay_size"]["last"] == pytest.approx(1200)
     rendered = analyze_training.format_human(report)
     assert "Paired evaluation:" in rendered
     assert "decision=paired_regression_patience" in rendered
+    assert "Demonstrations:" in rendered
+    assert "replay_size=1200.000" in rendered
 
 
 def test_paired_mode_best_ignores_unpromoted_raw_score(tmp_path: Path) -> None:

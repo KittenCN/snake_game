@@ -1,5 +1,13 @@
 # History
 
+## 0.5.0 - 2026-08-07
+
+- Added a dedicated demonstration replay that atomically promotes complete trajectories only after their raw score and environment return meet auditable success or elite thresholds.
+- Added fixed success/elite batch strata with uniform sampling without replacement inside each stratum, preventing high-score experience from being diluted, duplicated or overwritten by the ordinary replay ring.
+- Added DQfD-style large-margin successful-action imitation loss alongside TD and immutable policy-anchor losses.
+- Persisted all demonstration/imitation hyperparameters and lifetime counters in checkpoints/sidecars, validated them on resume, and exposed replay composition and imitation metrics in JSONL analysis.
+- Added overwrite-safe trajectory tokens, atomic capacity rejection, terminal-action imitation masks, unique-sample quota ramping, and unit/end-to-end regressions for promotion, stratified sampling, imitation loss and checkpoint metadata.
+
 ## 0.4.4 - 2026-08-07
 
 - Added a frozen warm-start policy teacher and configurable Q-value anchor loss to prevent destructive fine-tuning.

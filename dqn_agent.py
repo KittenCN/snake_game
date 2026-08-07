@@ -12,7 +12,7 @@ import tempfile
 import time
 import warnings
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Deque, Sequence, Tuple, Union
 
 import numpy as np
@@ -48,6 +48,11 @@ class ReplayBatch:
     weights: torch.Tensor
     indices: torch.Tensor
     next_action_masks: torch.Tensor | None
+    demonstration_mask: torch.Tensor
+    imitation_mask: torch.Tensor
+    quality_tiers: torch.Tensor
+    trajectory_scores: torch.Tensor
+    trajectory_returns: torch.Tensor
 
 
 class ReplayBuffer:
@@ -87,6 +92,21 @@ class ReplayBuffer:
         self._dones: torch.Tensor | None = None
         self._discounts: torch.Tensor | None = None
         self._next_action_masks: torch.Tensor | None = None
+        self._quality_tiers = torch.zeros(
+            self.capacity, dtype=torch.uint8, device="cpu"
+        )
+        self._trajectory_scores = torch.zeros(
+            self.capacity, dtype=torch.float32, device="cpu"
+        )
+        self._trajectory_returns = torch.zeros(
+            self.capacity, dtype=torch.float32, device="cpu"
+        )
+        self._slot_versions = torch.zeros(
+            self.capacity, dtype=torch.long, device="cpu"
+        )
+        self._imitation_eligible = torch.zeros(
+            self.capacity, dtype=torch.bool, device="cpu"
+        )
         self._priorities = torch.zeros(self.capacity, dtype=torch.float32, device="cpu")
         self._tree_capacity = 1 << (self.capacity - 1).bit_length()
         # The tree is tiny compared with observation storage. Float64 prevents
@@ -246,7 +266,15 @@ class ReplayBuffer:
         discount: torch.Tensor | float = 1.0,
         next_action_mask: torch.Tensor | Sequence[bool] | None = None,
         priority: float | None = None,
-    ) -> None:
+        quality_tier: int = 0,
+        trajectory_score: float = 0.0,
+        trajectory_return: float = 0.0,
+        imitation_eligible: bool = False,
+    ) -> tuple[int, int]:
+        if quality_tier not in (0, 1, 2):
+            raise ValueError("quality_tier must be 0 (regular), 1 (success), or 2 (elite)")
+        if not math.isfinite(trajectory_score) or not math.isfinite(trajectory_return):
+            raise ValueError("trajectory score and return must be finite")
         state_cpu = state.detach().to(device="cpu", dtype=torch.float16)
         next_state_cpu = next_state.detach().to(device="cpu", dtype=torch.float16)
         mask_cpu = (
@@ -274,6 +302,12 @@ class ReplayBuffer:
         self._rewards[idx] = self._cpu_scalar(reward, torch.float32)
         self._dones[idx] = self._cpu_scalar(done, torch.float32)
         self._discounts[idx] = self._cpu_scalar(discount, torch.float32)
+        self._quality_tiers[idx] = quality_tier
+        self._trajectory_scores[idx] = trajectory_score
+        self._trajectory_returns[idx] = trajectory_return
+        self._slot_versions[idx] += 1
+        self._imitation_eligible[idx] = bool(imitation_eligible)
+        slot_version = int(self._slot_versions[idx].item())
         if self._next_action_masks is not None:
             if mask_cpu is None:
                 self._next_action_masks[idx].fill_(True)
@@ -295,8 +329,129 @@ class ReplayBuffer:
         self._set_priority(idx, priority_value)
         self._position = (self._position + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
+        return idx, slot_version
 
-    def sample(self, batch_size: int, *, beta: float = 0.4) -> ReplayBatch:
+    @property
+    def demonstration_count(self) -> int:
+        if self._size == 0:
+            return 0
+        return int((self._quality_tiers[: self._size] > 0).sum().item())
+
+    @property
+    def elite_demonstration_count(self) -> int:
+        if self._size == 0:
+            return 0
+        return int((self._quality_tiers[: self._size] == 2).sum().item())
+
+    def copy_trajectory_to(
+        self,
+        tokens: Sequence[tuple[int, int]],
+        target: "ReplayBuffer",
+        *,
+        quality_tier: int,
+        trajectory_score: float,
+        trajectory_return: float,
+    ) -> int:
+        """Copy a completed trajectory if none of its ring slots were overwritten."""
+        if quality_tier not in (1, 2):
+            raise ValueError("demonstration trajectories require quality tier 1 or 2")
+        if not tokens:
+            return 0
+        if len(tokens) > target.capacity:
+            return 0
+        assert self._states is not None and self._next_states is not None
+        assert self._actions is not None and self._rewards is not None
+        assert self._dones is not None and self._discounts is not None
+        valid_indices: list[int] = []
+        for index, version in tokens:
+            if not 0 <= index < self._size:
+                return 0
+            if int(self._slot_versions[index].item()) != int(version):
+                return 0
+            valid_indices.append(index)
+
+        for index in valid_indices:
+            next_mask = (
+                self._next_action_masks[index]
+                if self._next_action_masks is not None
+                else None
+            )
+            target.push(
+                self._states[index],
+                self._actions[index],
+                self._rewards[index],
+                self._next_states[index],
+                self._dones[index],
+                discount=self._discounts[index],
+                next_action_mask=next_mask,
+                priority=float(self._priorities[index].item()),
+                quality_tier=quality_tier,
+                trajectory_score=trajectory_score,
+                trajectory_return=trajectory_return,
+                imitation_eligible=bool(self._imitation_eligible[index].item()),
+            )
+        return len(valid_indices)
+
+    def _build_batch(
+        self, indices_cpu: torch.Tensor, weights: torch.Tensor
+    ) -> ReplayBatch:
+        assert self._states is not None and self._next_states is not None
+        assert self._actions is not None and self._rewards is not None
+        assert self._dones is not None and self._discounts is not None
+        non_blocking = self.device.type == "cuda" and self.pin_memory
+        masks = None
+        if self._next_action_masks is not None:
+            masks = self._gather(
+                "next_action_masks", self._next_action_masks, indices_cpu
+            ).to(self.device, non_blocking=non_blocking)
+        quality_tiers = self._gather(
+            "quality_tiers", self._quality_tiers, indices_cpu
+        ).to(self.device, non_blocking=non_blocking)
+        return ReplayBatch(
+            states=self._gather("states", self._states, indices_cpu).to(
+                self.device, dtype=torch.float32, non_blocking=non_blocking
+            ),
+            actions=self._gather("actions", self._actions, indices_cpu).to(
+                self.device, non_blocking=non_blocking
+            ),
+            rewards=self._gather("rewards", self._rewards, indices_cpu).to(
+                self.device, non_blocking=non_blocking
+            ),
+            next_states=self._gather("next_states", self._next_states, indices_cpu).to(
+                self.device, dtype=torch.float32, non_blocking=non_blocking
+            ),
+            dones=self._gather("dones", self._dones, indices_cpu).to(
+                self.device, non_blocking=non_blocking
+            ),
+            discounts=self._gather("discounts", self._discounts, indices_cpu).to(
+                self.device, non_blocking=non_blocking
+            ),
+            weights=weights.to(
+                self.device, dtype=torch.float32, non_blocking=non_blocking
+            ),
+            indices=indices_cpu,
+            next_action_masks=masks,
+            demonstration_mask=quality_tiers > 0,
+            imitation_mask=(quality_tiers > 0)
+            & self._gather(
+                "imitation_eligible", self._imitation_eligible, indices_cpu
+            ).to(self.device, non_blocking=non_blocking),
+            quality_tiers=quality_tiers,
+            trajectory_scores=self._gather(
+                "trajectory_scores", self._trajectory_scores, indices_cpu
+            ).to(self.device, non_blocking=non_blocking),
+            trajectory_returns=self._gather(
+                "trajectory_returns", self._trajectory_returns, indices_cpu
+            ).to(self.device, non_blocking=non_blocking),
+        )
+
+    def sample(
+        self,
+        batch_size: int,
+        *,
+        beta: float = 0.4,
+        normalize_weights: bool = True,
+    ) -> ReplayBatch:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if self._size < batch_size:
@@ -340,39 +495,61 @@ class ReplayBuffer:
         leaf_priorities = self._priority_tree[tree_indices]
         sample_probabilities = leaf_priorities / total_priority
         weights = (self._size * sample_probabilities).pow(-max(0.0, float(beta)))
-        weights = weights / weights.max().clamp_min(1e-12)
+        if normalize_weights:
+            weights = weights / weights.max().clamp_min(1e-12)
 
-        non_blocking = self.device.type == "cuda" and self.pin_memory
-        masks = None
-        if self._next_action_masks is not None:
-            masks = self._gather(
-                "next_action_masks", self._next_action_masks, indices_cpu
-            ).to(self.device, non_blocking=non_blocking)
-        return ReplayBatch(
-            states=self._gather("states", self._states, indices_cpu).to(
-                self.device, dtype=torch.float32, non_blocking=non_blocking
-            ),
-            actions=self._gather("actions", self._actions, indices_cpu).to(
-                self.device, non_blocking=non_blocking
-            ),
-            rewards=self._gather("rewards", self._rewards, indices_cpu).to(
-                self.device, non_blocking=non_blocking
-            ),
-            next_states=self._gather("next_states", self._next_states, indices_cpu).to(
-                self.device, dtype=torch.float32, non_blocking=non_blocking
-            ),
-            dones=self._gather("dones", self._dones, indices_cpu).to(
-                self.device, non_blocking=non_blocking
-            ),
-            discounts=self._gather("discounts", self._discounts, indices_cpu).to(
-                self.device, non_blocking=non_blocking
-            ),
-            weights=weights.to(
-                self.device, dtype=torch.float32, non_blocking=non_blocking
-            ),
-            indices=indices_cpu,
-            next_action_masks=masks,
-        )
+        return self._build_batch(indices_cpu, weights)
+
+    def sample_demonstrations(
+        self,
+        batch_size: int,
+        *,
+        elite_count: int = 0,
+    ) -> ReplayBatch:
+        """Sample fixed success/elite quotas uniformly without replacement."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if not 0 <= elite_count <= batch_size:
+            raise ValueError("elite_count must be between zero and batch_size")
+        if self.demonstration_count == 0:
+            raise ValueError("demonstration replay is empty")
+
+        tiers = self._quality_tiers[: self._size]
+        success_pool = torch.nonzero(tiers == 1, as_tuple=False).flatten()
+        elite_pool = torch.nonzero(tiers == 2, as_tuple=False).flatten()
+        desired_elite_count = elite_count
+        elite_count = min(desired_elite_count, int(elite_pool.numel()))
+        success_count = min(batch_size - elite_count, int(success_pool.numel()))
+        remaining = batch_size - elite_count - success_count
+        if remaining > 0:
+            extra_elite = min(remaining, int(elite_pool.numel()) - elite_count)
+            elite_count += extra_elite
+            remaining -= extra_elite
+        if remaining > 0:
+            extra_success = min(
+                remaining, int(success_pool.numel()) - success_count
+            )
+            success_count += extra_success
+            remaining -= extra_success
+        if remaining > 0:
+            raise ValueError("not enough unique demonstration transitions")
+
+        def sample_pool(pool: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
+            if count == 0:
+                return (
+                    torch.empty(0, dtype=torch.long),
+                    torch.empty(0, dtype=torch.float64),
+                )
+            selected_positions = torch.randperm(pool.numel())[:count]
+            selected = pool[selected_positions]
+            importance = torch.ones(count, dtype=torch.float64)
+            return selected, importance
+
+        success_indices, success_weights = sample_pool(success_pool, success_count)
+        elite_indices, elite_weights = sample_pool(elite_pool, elite_count)
+        indices = torch.cat((success_indices, elite_indices))
+        weights = torch.cat((success_weights, elite_weights))
+        return self._build_batch(indices, weights)
 
     def update_priorities(
         self,
@@ -722,6 +899,15 @@ class DQNAgent:
         pin_memory: bool | None = None,
         policy_anchor_weight: float = 0.0,
         teacher_replay_steps: int = 0,
+        demonstration_capacity: int = 0,
+        demonstration_batch_fraction: float = 0.0,
+        elite_demonstration_batch_fraction: float = 0.0,
+        demonstration_min_score: float = 4.0,
+        demonstration_min_return: float = 0.0,
+        demonstration_elite_score: float = 6.0,
+        demonstration_elite_return: float = 20.0,
+        imitation_loss_weight: float = 0.0,
+        imitation_margin: float = 0.8,
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -764,8 +950,68 @@ class DQNAgent:
             raise ValueError("teacher_replay_steps must be non-negative")
         if teacher_replay_steps > replay_capacity:
             raise ValueError("teacher_replay_steps must not exceed replay_capacity")
+        if demonstration_capacity < 0:
+            raise ValueError("demonstration_capacity must be non-negative")
+        if not 0.0 <= demonstration_batch_fraction < 1.0:
+            raise ValueError("demonstration_batch_fraction must be in [0, 1)")
+        if not 0.0 <= elite_demonstration_batch_fraction <= demonstration_batch_fraction:
+            raise ValueError(
+                "elite_demonstration_batch_fraction must be between zero and "
+                "demonstration_batch_fraction"
+            )
+        requested_demo_rows = int(round(batch_size * demonstration_batch_fraction))
+        if demonstration_batch_fraction > 0 and not (
+            1 <= requested_demo_rows < batch_size
+        ):
+            raise ValueError(
+                "demonstration_batch_fraction must reserve at least one demo row "
+                "and one regular replay row for the configured batch_size"
+            )
+        requested_elite_rows = int(
+            round(batch_size * elite_demonstration_batch_fraction)
+        )
+        if elite_demonstration_batch_fraction > 0 and requested_elite_rows < 1:
+            raise ValueError(
+                "elite_demonstration_batch_fraction must reserve at least one row "
+                "for the configured batch_size"
+            )
+        trajectory_thresholds = (
+            demonstration_min_score,
+            demonstration_min_return,
+            demonstration_elite_score,
+            demonstration_elite_return,
+        )
+        if not all(math.isfinite(value) for value in trajectory_thresholds):
+            raise ValueError("demonstration score/return thresholds must be finite")
+        if demonstration_elite_score < demonstration_min_score:
+            raise ValueError("demonstration_elite_score must not be below the minimum")
+        if demonstration_elite_return < demonstration_min_return:
+            raise ValueError("demonstration_elite_return must not be below the minimum")
+        if not math.isfinite(imitation_loss_weight) or imitation_loss_weight < 0:
+            raise ValueError("imitation_loss_weight must be finite and non-negative")
+        if not math.isfinite(imitation_margin) or imitation_margin <= 0:
+            raise ValueError("imitation_margin must be finite and positive")
+        if demonstration_batch_fraction > 0 and demonstration_capacity == 0:
+            raise ValueError(
+                "demonstration_capacity must be positive when demonstration sampling is enabled"
+            )
+        if imitation_loss_weight > 0 and demonstration_batch_fraction == 0:
+            raise ValueError(
+                "demonstration_batch_fraction must be positive when imitation loss is enabled"
+            )
         self.policy_anchor_weight = float(policy_anchor_weight)
         self.teacher_replay_steps = int(teacher_replay_steps)
+        self.demonstration_capacity = int(demonstration_capacity)
+        self.demonstration_batch_fraction = float(demonstration_batch_fraction)
+        self.elite_demonstration_batch_fraction = float(
+            elite_demonstration_batch_fraction
+        )
+        self.demonstration_min_score = float(demonstration_min_score)
+        self.demonstration_min_return = float(demonstration_min_return)
+        self.demonstration_elite_score = float(demonstration_elite_score)
+        self.demonstration_elite_return = float(demonstration_elite_return)
+        self.imitation_loss_weight = float(imitation_loss_weight)
+        self.imitation_margin = float(imitation_margin)
         self._configure_amp(amp_enabled)
 
         if obs_shape is None:
@@ -800,6 +1046,16 @@ class DQNAgent:
             priority_epsilon=self.per_priority_epsilon,
             pin_memory=self.pin_memory,
         )
+        self.demonstration_replay: ReplayBuffer | None = None
+        if self.demonstration_capacity > 0:
+            self.demonstration_replay = ReplayBuffer(
+                self.demonstration_capacity,
+                self.device,
+                action_dim=action_dim,
+                alpha=self.per_alpha,
+                priority_epsilon=self.per_priority_epsilon,
+                pin_memory=self.pin_memory,
+            )
         self._n_step_buffers: dict[
             int,
             Deque[
@@ -816,6 +1072,9 @@ class DQNAgent:
         self._n_step_buffer: Deque[
             tuple[torch.Tensor, int, float, torch.Tensor, bool, torch.Tensor | None]
         ] = self._n_step_buffers.setdefault(0, deque())
+        self._episode_replay_tokens: dict[int, list[tuple[int, int]]] = {}
+        self.demonstration_trajectories_seen = 0
+        self.demonstration_transitions_promoted = 0
         self.replay_restored = False
         self.learn_step_counter = 0
 
@@ -839,6 +1098,9 @@ class DQNAgent:
         self.pin_memory = requested and self.device.type == "cuda"
         self.replay_buffer.pin_memory = self.pin_memory
         self.replay_buffer._staging.clear()
+        if self.demonstration_replay is not None:
+            self.demonstration_replay.pin_memory = self.pin_memory
+            self.demonstration_replay._staging.clear()
 
     def _configure_amp(self, enabled: bool | None) -> None:
         if enabled is None:
@@ -977,6 +1239,85 @@ class DQNAgent:
         elif len(stream_buffer) >= self.n_step:
             self._emit_n_step_transition(stream_id)
 
+    def finalize_trajectory(
+        self,
+        *,
+        score: float,
+        episode_return: float,
+        stream_id: int = 0,
+    ) -> dict[str, float]:
+        """Promote a completed high-score trajectory into persistent demo replay."""
+        if not math.isfinite(score) or not math.isfinite(episode_return):
+            raise ValueError("trajectory score and return must be finite")
+        stream_id = int(stream_id)
+        if self._n_step_buffers.get(stream_id):
+            raise RuntimeError("cannot finalize a trajectory before its n-step buffer is empty")
+        tokens = self._episode_replay_tokens.pop(stream_id, [])
+        quality_tier = 0
+        if (
+            score >= self.demonstration_min_score
+            and episode_return >= self.demonstration_min_return
+        ):
+            quality_tier = 1
+            if (
+                score >= self.demonstration_elite_score
+                and episode_return >= self.demonstration_elite_return
+            ):
+                quality_tier = 2
+
+        promoted = 0
+        if quality_tier > 0 and self.demonstration_replay is not None:
+            promoted = self.replay_buffer.copy_trajectory_to(
+                tokens,
+                self.demonstration_replay,
+                quality_tier=quality_tier,
+                trajectory_score=float(score),
+                trajectory_return=float(episode_return),
+            )
+            if promoted > 0:
+                self.demonstration_trajectories_seen += 1
+                self.demonstration_transitions_promoted += promoted
+        return {
+            "quality_tier": float(quality_tier if promoted > 0 else 0),
+            "promoted_transitions": float(promoted),
+        }
+
+    @staticmethod
+    def _concatenate_batches(first: ReplayBatch, second: ReplayBatch) -> ReplayBatch:
+        def concatenate_optional(
+            left: torch.Tensor | None, right: torch.Tensor | None
+        ) -> torch.Tensor | None:
+            if left is None and right is None:
+                return None
+            if left is None or right is None:
+                raise RuntimeError("replay batches disagree about action-mask storage")
+            return torch.cat((left, right), dim=0)
+
+        return ReplayBatch(
+            states=torch.cat((first.states, second.states), dim=0),
+            actions=torch.cat((first.actions, second.actions), dim=0),
+            rewards=torch.cat((first.rewards, second.rewards), dim=0),
+            next_states=torch.cat((first.next_states, second.next_states), dim=0),
+            dones=torch.cat((first.dones, second.dones), dim=0),
+            discounts=torch.cat((first.discounts, second.discounts), dim=0),
+            weights=torch.cat((first.weights, second.weights), dim=0),
+            indices=torch.cat((first.indices, second.indices), dim=0),
+            next_action_masks=concatenate_optional(
+                first.next_action_masks, second.next_action_masks
+            ),
+            demonstration_mask=torch.cat(
+                (first.demonstration_mask, second.demonstration_mask), dim=0
+            ),
+            imitation_mask=torch.cat((first.imitation_mask, second.imitation_mask), dim=0),
+            quality_tiers=torch.cat((first.quality_tiers, second.quality_tiers), dim=0),
+            trajectory_scores=torch.cat(
+                (first.trajectory_scores, second.trajectory_scores), dim=0
+            ),
+            trajectory_returns=torch.cat(
+                (first.trajectory_returns, second.trajectory_returns), dim=0
+            ),
+        )
+
     def learn(self) -> dict[str, float] | None:
         if len(self.replay_buffer) < max(self.batch_size, self.min_replay_size):
             return None
@@ -987,7 +1328,39 @@ class DQNAgent:
         beta_progress = min(1.0, self.learn_step_counter / self.per_beta_frames)
         beta = self.per_beta_start + beta_progress * (1.0 - self.per_beta_start)
         sampling_started = time.perf_counter()
-        batch = self.replay_buffer.sample(self.batch_size, beta=beta)
+        requested_demo_count = int(
+            round(self.batch_size * self.demonstration_batch_fraction)
+        )
+        available_demo_count = (
+            self.demonstration_replay.demonstration_count
+            if self.demonstration_replay is not None
+            else 0
+        )
+        # Ramp the quota with unique stored transitions. This prevents one new
+        # success from being duplicated across a large fraction of the batch.
+        demo_count = min(requested_demo_count, available_demo_count)
+        general_count = self.batch_size - demo_count
+        general_batch = self.replay_buffer.sample(
+            general_count, beta=beta, normalize_weights=False
+        )
+        demo_batch: ReplayBatch | None = None
+        if demo_count > 0:
+            assert self.demonstration_replay is not None
+            elite_count = min(
+                demo_count,
+                int(round(self.batch_size * self.elite_demonstration_batch_fraction)),
+            )
+            demo_batch = self.demonstration_replay.sample_demonstrations(
+                demo_count,
+                elite_count=elite_count,
+            )
+            batch = self._concatenate_batches(general_batch, demo_batch)
+        else:
+            batch = general_batch
+        batch = replace(
+            batch,
+            weights=batch.weights / batch.weights.max().clamp_min(1e-12),
+        )
         sampling_seconds = time.perf_counter() - sampling_started
 
         scaler = (
@@ -1041,7 +1414,33 @@ class DQNAgent:
                 )
             else:
                 anchor_loss = torch.zeros((), device=self.device, dtype=td_loss.dtype)
-            loss = td_loss + self.policy_anchor_weight * anchor_loss
+            if bool(batch.imitation_mask.any()):
+                demo_q_values = policy_q_values[batch.imitation_mask]
+                demo_actions = batch.actions[batch.imitation_mask].long()
+                margins = torch.full_like(demo_q_values, self.imitation_margin)
+                margins.scatter_(1, demo_actions.unsqueeze(1), 0.0)
+                competing_values = (demo_q_values + margins).max(dim=1).values
+                chosen_demo_values = demo_q_values.gather(
+                    1, demo_actions.unsqueeze(1)
+                ).squeeze(1)
+                imitation_elements = (competing_values - chosen_demo_values).clamp_min(0.0)
+                quality_weights = torch.where(
+                    batch.quality_tiers[batch.imitation_mask] == 2,
+                    torch.full_like(imitation_elements, 1.5),
+                    torch.ones_like(imitation_elements),
+                )
+                imitation_loss = (
+                    imitation_elements * quality_weights
+                ).sum() / quality_weights.sum().clamp_min(1.0)
+            else:
+                imitation_loss = torch.zeros(
+                    (), device=self.device, dtype=td_loss.dtype
+                )
+            loss = (
+                td_loss
+                + self.policy_anchor_weight * anchor_loss
+                + self.imitation_loss_weight * imitation_loss
+            )
 
         self.optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
@@ -1059,14 +1458,16 @@ class DQNAgent:
             )
             self.optimizer.step()
 
-        # PER already requires TD errors on the host. Measure this existing
-        # synchronization point rather than adding torch.cuda.synchronize().
+        # General replay PER already requires TD errors on the host. Measure this
+        # existing synchronization point rather than adding torch.cuda.synchronize().
         gpu_wait_started = time.perf_counter()
-        td_errors_cpu = td_errors.detach().abs().to(device="cpu", dtype=torch.float32)
+        absolute_td_errors = td_errors.detach().abs()
+        td_errors_cpu = absolute_td_errors.to(device="cpu", dtype=torch.float32)
         loss_value = float(loss.detach().cpu().item())
         td_loss_value = float(td_loss.detach().cpu().item())
         anchor_loss_value = float(anchor_loss.detach().cpu().item())
-        td_error_value = float(td_errors_cpu.mean().item())
+        imitation_loss_value = float(imitation_loss.detach().cpu().item())
+        td_error_value = float(absolute_td_errors.mean().detach().cpu().item())
         grad_norm_value = float(torch.as_tensor(grad_norm).detach().cpu().item())
         q_mean_value = float(q_values.detach().mean().cpu().item())
         gpu_wait_seconds = (
@@ -1075,8 +1476,8 @@ class DQNAgent:
             else 0.0
         )
         self.replay_buffer.update_priorities(
-            batch.indices,
-            td_errors_cpu,
+            general_batch.indices,
+            td_errors_cpu[:general_count],
         )
         self.learn_step_counter += 1
         self._update_target_network()
@@ -1085,6 +1486,13 @@ class DQNAgent:
             "td_loss": td_loss_value,
             "anchor_loss": anchor_loss_value,
             "anchor_weight": self.policy_anchor_weight,
+            "imitation_loss": imitation_loss_value,
+            "imitation_weight": self.imitation_loss_weight,
+            "demonstration_batch_fraction": demo_count / self.batch_size,
+            "elite_demonstration_batch_fraction": float(
+                (batch.quality_tiers == 2).sum().detach().cpu().item()
+            )
+            / self.batch_size,
             "td_error": td_error_value,
             "grad_norm": grad_norm_value,
             "q_mean": q_mean_value,
@@ -1097,7 +1505,7 @@ class DQNAgent:
     def save(self, path: str) -> None:
         numpy_state = np.random.get_state()
         checkpoint = {
-            "checkpoint_schema_version": 3,
+            "checkpoint_schema_version": 4,
             "policy_state_dict": self.policy_net.state_dict(),
             "target_state_dict": self.target_net.state_dict(),
             "policy_anchor_state_dict": (
@@ -1126,7 +1534,7 @@ class DQNAgent:
                 else [],
             },
             "metadata": {
-                "checkpoint_schema_version": 3,
+                "checkpoint_schema_version": 4,
                 "state_dim": self.state_dim,
                 "action_dim": self.action_dim,
                 "hidden_sizes": self.hidden_sizes,
@@ -1162,6 +1570,22 @@ class DQNAgent:
                 "network_version": self.network_version,
                 "policy_anchor_weight": self.policy_anchor_weight,
                 "teacher_replay_steps": self.teacher_replay_steps,
+                "demonstration_capacity": self.demonstration_capacity,
+                "demonstration_batch_fraction": self.demonstration_batch_fraction,
+                "elite_demonstration_batch_fraction": self.elite_demonstration_batch_fraction,
+                "demonstration_min_score": self.demonstration_min_score,
+                "demonstration_min_return": self.demonstration_min_return,
+                "demonstration_elite_score": self.demonstration_elite_score,
+                "demonstration_elite_return": self.demonstration_elite_return,
+                "imitation_loss_weight": self.imitation_loss_weight,
+                "imitation_margin": self.imitation_margin,
+                "demonstration_replay_size": (
+                    len(self.demonstration_replay)
+                    if self.demonstration_replay is not None
+                    else 0
+                ),
+                "demonstration_trajectories_seen": self.demonstration_trajectories_seen,
+                "demonstration_transitions_promoted": self.demonstration_transitions_promoted,
                 "policy_anchor_enabled": self.policy_anchor_net is not None,
                 "game_config": asdict(self.game_config) if self.game_config else None,
             },
@@ -1359,6 +1783,21 @@ class DQNAgent:
             pin_memory=None,
             policy_anchor_weight=metadata.get("policy_anchor_weight", 0.0),
             teacher_replay_steps=metadata.get("teacher_replay_steps", 0),
+            demonstration_capacity=metadata.get("demonstration_capacity", 0),
+            demonstration_batch_fraction=metadata.get(
+                "demonstration_batch_fraction", 0.0
+            ),
+            elite_demonstration_batch_fraction=metadata.get(
+                "elite_demonstration_batch_fraction", 0.0
+            ),
+            demonstration_min_score=metadata.get("demonstration_min_score", 4.0),
+            demonstration_min_return=metadata.get("demonstration_min_return", 0.0),
+            demonstration_elite_score=metadata.get("demonstration_elite_score", 6.0),
+            demonstration_elite_return=metadata.get(
+                "demonstration_elite_return", 20.0
+            ),
+            imitation_loss_weight=metadata.get("imitation_loss_weight", 0.0),
+            imitation_margin=metadata.get("imitation_margin", 0.8),
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(
@@ -1379,6 +1818,12 @@ class DQNAgent:
         if scaler_state is not None and agent.grad_scaler is not None:
             agent.grad_scaler.load_state_dict(scaler_state)
         agent.learn_step_counter = metadata.get("learn_step_counter", 0)
+        agent.demonstration_trajectories_seen = int(
+            metadata.get("demonstration_trajectories_seen", 0)
+        )
+        agent.demonstration_transitions_promoted = int(
+            metadata.get("demonstration_transitions_promoted", 0)
+        )
         agent.epsilon = metadata.get("epsilon", metadata.get("epsilon_final", 0.01))
         if "behavior_steps" in metadata:
             agent.behavior_steps = int(metadata["behavior_steps"])
@@ -1488,8 +1933,8 @@ class DQNAgent:
             final_mask = next_mask
             if done:
                 break
-        state, action, _, _, _, _ = stream_buffer[0]
-        self.replay_buffer.push(
+        state, action, _, _, action_was_terminal, _ = stream_buffer[0]
+        token = self.replay_buffer.push(
             state,
             action,
             accumulated_reward,
@@ -1497,7 +1942,10 @@ class DQNAgent:
             final_done,
             discount=self.gamma**steps,
             next_action_mask=final_mask,
+            imitation_eligible=not action_was_terminal,
         )
+        if self.demonstration_replay is not None:
+            self._episode_replay_tokens.setdefault(stream_id, []).append(token)
         stream_buffer.popleft()
         if not stream_buffer and stream_id != 0:
             del self._n_step_buffers[stream_id]

@@ -37,7 +37,7 @@ except ImportError:
     from env import Action, GameConfig, RelativeAction, SnakeGameEnv
 
 
-CHECKPOINT_FORMAT = 3
+CHECKPOINT_FORMAT = 4
 V3_OBSERVATION_CHANNELS = 20
 CONVERGENCE_CONTROLLER_VERSION = 2
 
@@ -430,6 +430,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Initial environment transitions collected greedily from the frozen teacher",
     )
     parser.add_argument(
+        "--demonstration-capacity",
+        type=int,
+        default=0,
+        help="Dedicated persistent replay capacity for completed high-score trajectories",
+    )
+    parser.add_argument(
+        "--demonstration-batch-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of each learner batch reserved for demonstration replay",
+    )
+    parser.add_argument(
+        "--elite-demonstration-batch-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of each full batch reserved for the elite score/return stratum",
+    )
+    parser.add_argument("--demonstration-min-score", type=float, default=4.0)
+    parser.add_argument("--demonstration-min-return", type=float, default=0.0)
+    parser.add_argument("--demonstration-elite-score", type=float, default=6.0)
+    parser.add_argument("--demonstration-elite-return", type=float, default=20.0)
+    parser.add_argument(
+        "--imitation-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for large-margin successful-action imitation loss",
+    )
+    parser.add_argument("--imitation-margin", type=float, default=0.8)
+    parser.add_argument(
         "--resume-epsilon",
         type=float,
         default=0.25,
@@ -575,6 +604,66 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("teacher-replay-steps must not exceed replay-capacity")
     if not math.isfinite(args.policy_anchor_weight) or args.policy_anchor_weight < 0:
         parser.error("policy-anchor-weight must be finite and non-negative")
+    if args.demonstration_capacity < 0:
+        parser.error("demonstration-capacity must be non-negative")
+    if not 0.0 <= args.demonstration_batch_fraction < 1.0:
+        parser.error("demonstration-batch-fraction must be in [0, 1)")
+    if not (
+        0.0
+        <= args.elite_demonstration_batch_fraction
+        <= args.demonstration_batch_fraction
+    ):
+        parser.error(
+            "elite-demonstration-batch-fraction must be between zero and "
+            "demonstration-batch-fraction"
+        )
+    requested_demo_rows = int(
+        round(args.batch_size * args.demonstration_batch_fraction)
+    )
+    if args.demonstration_batch_fraction > 0 and not (
+        1 <= requested_demo_rows < args.batch_size
+    ):
+        parser.error(
+            "demonstration-batch-fraction must reserve at least one demo row and "
+            "one regular replay row for the configured batch-size"
+        )
+    requested_elite_rows = int(
+        round(args.batch_size * args.elite_demonstration_batch_fraction)
+    )
+    if (
+        args.elite_demonstration_batch_fraction > 0
+        and requested_elite_rows < 1
+    ):
+        parser.error(
+            "elite-demonstration-batch-fraction must reserve at least one row for "
+            "the configured batch-size"
+        )
+    if args.demonstration_batch_fraction > 0 and args.demonstration_capacity == 0:
+        parser.error(
+            "demonstration-capacity must be positive when demonstration sampling is enabled"
+        )
+    if args.imitation_loss_weight > 0 and args.demonstration_batch_fraction == 0:
+        parser.error(
+            "demonstration-batch-fraction must be positive when imitation loss is enabled"
+        )
+    if not math.isfinite(args.imitation_loss_weight) or args.imitation_loss_weight < 0:
+        parser.error("imitation-loss-weight must be finite and non-negative")
+    if not math.isfinite(args.imitation_margin) or args.imitation_margin <= 0:
+        parser.error("imitation-margin must be finite and positive")
+    demonstration_thresholds = (
+        args.demonstration_min_score,
+        args.demonstration_min_return,
+        args.demonstration_elite_score,
+        args.demonstration_elite_return,
+    )
+    if not all(math.isfinite(value) for value in demonstration_thresholds):
+        parser.error("demonstration score/return thresholds must be finite")
+    if args.demonstration_elite_score < args.demonstration_min_score:
+        parser.error("demonstration-elite-score must not be below demonstration-min-score")
+    if args.demonstration_elite_return < args.demonstration_min_return:
+        parser.error(
+            "demonstration-elite-return must not be below demonstration-min-return"
+        )
     if args.early_stop_patience < 0 or args.lr_plateau_patience < 0:
         parser.error("early-stop-patience and lr-plateau-patience must be non-negative")
     if not math.isfinite(args.early_stop_delta) or args.early_stop_delta < 0:
@@ -964,6 +1053,15 @@ def effective_agent_config(agent: DQNAgent) -> dict[str, Any]:
         "epsilon_decay_steps": agent.epsilon_decay_steps,
         "policy_anchor_weight": agent.policy_anchor_weight,
         "teacher_replay_steps": agent.teacher_replay_steps,
+        "demonstration_capacity": agent.demonstration_capacity,
+        "demonstration_batch_fraction": agent.demonstration_batch_fraction,
+        "elite_demonstration_batch_fraction": agent.elite_demonstration_batch_fraction,
+        "demonstration_min_score": agent.demonstration_min_score,
+        "demonstration_min_return": agent.demonstration_min_return,
+        "demonstration_elite_score": agent.demonstration_elite_score,
+        "demonstration_elite_return": agent.demonstration_elite_return,
+        "imitation_loss_weight": agent.imitation_loss_weight,
+        "imitation_margin": agent.imitation_margin,
         "policy_anchor_enabled": agent.policy_anchor_enabled,
         "amp_enabled": agent.amp_enabled,
     }
@@ -1020,6 +1118,22 @@ def save_checkpoint(
         "learn_step_counter": agent.learn_step_counter,
         "epsilon": agent.epsilon,
         "replay_size_at_save": len(agent.replay_buffer),
+        "demonstration_replay_size_at_save": (
+            len(agent.demonstration_replay)
+            if agent.demonstration_replay is not None
+            else 0
+        ),
+        "demonstration_replay_elite_count_at_save": (
+            agent.demonstration_replay.elite_demonstration_count
+            if agent.demonstration_replay is not None
+            else 0
+        ),
+        "demonstration_trajectories_seen_lifetime": (
+            agent.demonstration_trajectories_seen
+        ),
+        "demonstration_transitions_promoted_lifetime": (
+            agent.demonstration_transitions_promoted
+        ),
         "replay_restored": False,
         "game_config": asdict(agent.game_config) if agent.game_config else None,
         "effective_agent_config": effective_agent_config(agent),
@@ -1208,6 +1322,39 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
             args.teacher_replay_steps,
             agent.teacher_replay_steps,
         ),
+        "--demonstration-capacity": (
+            args.demonstration_capacity,
+            agent.demonstration_capacity,
+        ),
+        "--demonstration-batch-fraction": (
+            args.demonstration_batch_fraction,
+            agent.demonstration_batch_fraction,
+        ),
+        "--elite-demonstration-batch-fraction": (
+            args.elite_demonstration_batch_fraction,
+            agent.elite_demonstration_batch_fraction,
+        ),
+        "--demonstration-min-score": (
+            args.demonstration_min_score,
+            agent.demonstration_min_score,
+        ),
+        "--demonstration-min-return": (
+            args.demonstration_min_return,
+            agent.demonstration_min_return,
+        ),
+        "--demonstration-elite-score": (
+            args.demonstration_elite_score,
+            agent.demonstration_elite_score,
+        ),
+        "--demonstration-elite-return": (
+            args.demonstration_elite_return,
+            agent.demonstration_elite_return,
+        ),
+        "--imitation-loss-weight": (
+            args.imitation_loss_weight,
+            agent.imitation_loss_weight,
+        ),
+        "--imitation-margin": (args.imitation_margin, agent.imitation_margin),
     }
     conflicts = {
         option: values
@@ -1482,6 +1629,15 @@ def _new_agent(
         amp_enabled=False if args.disable_amp else None,
         policy_anchor_weight=args.policy_anchor_weight,
         teacher_replay_steps=args.teacher_replay_steps,
+        demonstration_capacity=args.demonstration_capacity,
+        demonstration_batch_fraction=args.demonstration_batch_fraction,
+        elite_demonstration_batch_fraction=args.elite_demonstration_batch_fraction,
+        demonstration_min_score=args.demonstration_min_score,
+        demonstration_min_return=args.demonstration_min_return,
+        demonstration_elite_score=args.demonstration_elite_score,
+        demonstration_elite_return=args.demonstration_elite_return,
+        imitation_loss_weight=args.imitation_loss_weight,
+        imitation_margin=args.imitation_margin,
     )
 
 
@@ -1576,13 +1732,16 @@ def _train(args: argparse.Namespace) -> None:
         (
             args.policy_anchor_weight > 0,
             args.teacher_replay_steps > 0,
+            args.demonstration_batch_fraction > 0,
+            args.imitation_loss_weight > 0,
             args.require_paired_promotion,
             args.regression_stop_patience > 0,
         )
     )
     if resume_path is None and not args.warm_start_from and conservative_options_enabled:
         raise RuntimeError(
-            "Policy anchoring, teacher replay, and paired evaluation guards require "
+            "Policy anchoring, teacher/demonstration replay, imitation learning, and "
+            "paired evaluation guards require "
             "--warm-start-from (or a latest checkpoint that already contains them)."
         )
     if not args.warm_start_from:
@@ -1927,6 +2086,11 @@ def _train(args: argparse.Namespace) -> None:
                 terminal_event = (
                     str(info.get("event", "terminated")) if env_done else "truncated"
                 )
+                demonstration_result = agent.finalize_trajectory(
+                    score=slot.env.score,
+                    episode_return=slot.total_env_reward,
+                    stream_id=slot.stream_id,
+                )
                 episodes_completed += 1
                 final_episode = episodes_completed
                 rolling_scores.append(slot.env.score)
@@ -1945,6 +2109,12 @@ def _train(args: argparse.Namespace) -> None:
                         "terminal_event": terminal_event,
                         "terminated": env_done and not truncated,
                         "truncated": truncated,
+                        "demonstration_quality_tier": int(
+                            demonstration_result["quality_tier"]
+                        ),
+                        "demonstration_transitions_promoted": int(
+                            demonstration_result["promoted_transitions"]
+                        ),
                         "duration_seconds": time.perf_counter() - slot.started_at,
                         "render": (
                             slot.env.render(to_string=True)
@@ -2026,6 +2196,34 @@ def _train(args: argparse.Namespace) -> None:
             "avg_td_loss": metric_mean("td_loss"),
             "avg_anchor_loss": metric_mean("anchor_loss"),
             "policy_anchor_weight": agent.policy_anchor_weight,
+            "avg_imitation_loss": metric_mean("imitation_loss"),
+            "imitation_loss_weight": agent.imitation_loss_weight,
+            "avg_demonstration_batch_fraction": metric_mean(
+                "demonstration_batch_fraction"
+            ),
+            "avg_elite_demonstration_batch_fraction": metric_mean(
+                "elite_demonstration_batch_fraction"
+            ),
+            "demonstration_replay_size": (
+                len(agent.demonstration_replay)
+                if agent.demonstration_replay is not None
+                else 0
+            ),
+            "demonstration_replay_success_count": (
+                agent.demonstration_replay.demonstration_count
+                - agent.demonstration_replay.elite_demonstration_count
+                if agent.demonstration_replay is not None
+                else 0
+            ),
+            "demonstration_replay_elite_count": (
+                agent.demonstration_replay.elite_demonstration_count
+                if agent.demonstration_replay is not None
+                else 0
+            ),
+            "demonstration_trajectories_seen": agent.demonstration_trajectories_seen,
+            "demonstration_transitions_promoted_total": (
+                agent.demonstration_transitions_promoted
+            ),
             "avg_td_error": metric_mean("td_error"),
             "avg_grad_norm": metric_mean("grad_norm"),
             "avg_q_mean": metric_mean("q_mean"),

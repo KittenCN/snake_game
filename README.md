@@ -200,32 +200,47 @@ sidecar 都保存控制器配置/计数以及当前 LR。普通 resume 在这些
 `--warm-start-from`，不要使用普通 `--resume-from`：
 
 ```bash
-mkdir -p runs/stable_v2_conservative_8x8
+mkdir -p runs/stable_v3_demonstration_8x8
 nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
-  --episodes 20000 \
+  --episodes 30000 \
   --warm-start-from models/dqn_snake_8x8_b512_best.pt \
   --width 8 --height 8 \
   --max-idle-steps 70 --idle-growth-per-food 2 \
   --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
   --batch-size 512 --min-replay 50000 --replay-capacity 100000 \
   --policy-anchor-weight 0.25 --teacher-replay-steps 50000 \
-  --lr 0.000003125 --lr-plateau-patience 3 \
-  --lr-plateau-factor 0.5 --lr-plateau-min 0.000000390625 \
-  --early-stop-patience 5 --early-stop-delta 0.10 \
+  --demonstration-capacity 20000 \
+  --demonstration-batch-fraction 0.25 \
+  --elite-demonstration-batch-fraction 0.0625 \
+  --demonstration-min-score 4 --demonstration-min-return 5 \
+  --demonstration-elite-score 6 --demonstration-elite-return 20 \
+  --imitation-loss-weight 0.25 --imitation-margin 0.8 \
+  --lr 0.000003125 --lr-plateau-patience 4 \
+  --lr-plateau-factor 0.5 --lr-plateau-min 0.0000001953125 \
+  --early-stop-patience 8 --early-stop-delta 0.10 \
   --require-paired-promotion --paired-promotion-min-delta 0.10 \
   --regression-stop-patience 3 --regression-stop-delta 0.10 \
   --epsilon-start 0.02 --epsilon-final 0.01 --epsilon-decay-steps 600000 \
-  --eval-interval 100 --eval-episodes 50 --checkpoint-interval 100 \
+  --eval-interval 200 --eval-episodes 50 --checkpoint-interval 200 \
   --device cuda --allow-nondeterministic \
-  --output models/dqn_snake_8x8_stable_v2_best.pt \
-  --latest-output models/dqn_snake_8x8_stable_v2_latest.pt \
-  --log-dir runs/stable_v2_conservative_8x8 \
-  > runs/stable_v2_conservative_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+  --output models/dqn_snake_8x8_stable_v3_best.pt \
+  --latest-output models/dqn_snake_8x8_stable_v3_latest.pt \
+  --log-dir runs/stable_v3_demonstration_8x8 \
+  > runs/stable_v3_demonstration_8x8/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
 warm start 只迁移 `policy_net` 权重，并用其重新同步 target；启用保守参数后还会冻结同一 policy 作为
 teacher。前 `--teacher-replay-steps` 个 transition 使用 teacher 的贪心动作收集 replay，期间不执行任何
 梯度更新；之后 TD loss 叠加 `--policy-anchor-weight * anchor_loss`，限制 Q 值偏离 immutable best。
+每个完整 episode 结束后，训练器才按原始游戏 `score` 与未 shaping 的环境 return 联合判定轨迹质量；
+同时达到 success 或 elite 两组门槛的完整轨迹会原子复制进独立 demonstration replay。该 replay 不会
+被普通经验环形覆盖，batch 按 `--demonstration-batch-fraction` 固定混入成功轨迹，并以
+`--elite-demonstration-batch-fraction` 为高分/高回报层保留配额。demo 行为动作通过 DQfD 风格的大间隔
+`imitation_loss` 直接约束 Q 排名，最终目标为 `TD + anchor + imitation`，从而让固定评估 score 的成功
+行为不再只能经 shaped reward 间接反传。最新策略后续产生的合格完整轨迹也可晋升，形成自举式成功
+回放；造成终止/截断的最后动作只保留 TD 监督，不进入 imitation。demo 配额随当前 unique demo 数量
+逐步升高且每批无放回采样，不会用一个新 transition 复制填满 batch；低分、低回报、超过 demo 容量
+或源 replay 已发生覆盖的轨迹都不会部分写入 demo。
 完整 resume 因 replay 不持久化，会自动重新完成这一 teacher 预热，而不是在空 replay 上恢复更新。
 预热期固定评估仅记录，不累计学习率、早停或退化耐心。
 optimizer、AMP scaler、replay、
@@ -269,7 +284,8 @@ python analyze_training.py "runs/train_log_*.jsonl" --json
 ```
 
 工具会报告全局及最近 100/1,000/5,000 回合指标、best/last evaluation、epsilon floor、
-loss、终止事件和分数/蛇长分桶。平台期判断是诊断启发式，不是统计学证明。
+TD/anchor/imitation loss、demo batch 占比与 success/elite replay 规模、终止事件和分数/蛇长分桶。
+平台期判断是诊断启发式，不是统计学证明。
 episode-0 独立基线会参与 evaluation 汇总；配对模式还会记录逐 seed 样本、差值置信区间、晋升资格和
 明确退化计数。
 
