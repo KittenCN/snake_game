@@ -91,6 +91,9 @@ python -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.
 115 项项目测试和可保存/恢复 checkpoint 的多环境短训练；该移动 SKU 未被 AMD 7.14 硬件表单独点名，
 其他驱动组合仍应重复上述真机验收。ROCm 当前对 `adaptive_avg_pool2d_backward` 缺少确定性实现，
 默认 `warn_only=True` 会给出警告并继续，跨后端逐位复现不应据此承诺。
+0.5.0 的 demonstration/imitation 训练链另在服务器 RTX 3060、PyTorch `2.5.1+cu124` 上通过
+158 项测试及 CUDA AMP 真机反向 smoke：elite 轨迹完整晋升、终止动作 imitation mask、分层 batch、
+TD loss 与 large-margin imitation loss 均在 GPU 上实际执行。
 
 ## 开始新的 v3 训练
 
