@@ -157,6 +157,11 @@ def test_idle_limit_grows_after_eating() -> None:
     assert env.idle_limit == 5
     assert observation["idle_limit"] == 5
 
+    # Keep the randomly respawned food off the straight-line route so a second
+    # accidental meal cannot reset the idle counter and make this test flaky.
+    current_x, current_y = env.snake[0]
+    env._food = (current_x, (current_y + 2) % env.config.height)
+
     for _ in range(4):
         _, _, done, _ = env.step(Action.RIGHT)
         assert not done

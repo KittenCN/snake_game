@@ -1,5 +1,16 @@
 # History
 
+## 0.4.2 - 2026-08-07
+
+- Validated native Windows ROCm 7.14 training on an AMD Radeon RX 7600M XT (`gfx1102`).
+- Added runtime backend/device/version evidence to training logs and console startup output.
+- Made explicit unavailable accelerator requests fail instead of silently falling back to CPU.
+- Made checkpoint loading choose the current runtime device rather than inheriting a stale saved-device string.
+- Added explicit accelerator cleanup so native Windows ROCm training exits cleanly after saving checkpoints.
+- Documented isolated ROCm installation, verification, determinism boundaries, and the tested smoke profile.
+- Pinned Ruff to the validated 0.9 minor line after newer releases changed the effective default lint set.
+- Removed random food respawn from the idle-limit test so accelerator test runs are deterministic.
+
 ## 0.4.1 - 2026-08-06
 
 - Added SHA-validated policy-only warm starts for changing board and training configuration without restoring optimizer, replay, counters or best identity.

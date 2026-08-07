@@ -680,7 +680,11 @@ class DQNAgent:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         resolved = torch.device(device)
         if resolved.type == "cuda" and not torch.cuda.is_available():
-            return torch.device("cpu")
+            raise RuntimeError(
+                f"Accelerator device {resolved} was requested, but this PyTorch build "
+                "cannot access CUDA or ROCm. Install a matching accelerator build or "
+                "use --device cpu explicitly."
+            )
         return resolved
 
     def __init__(
@@ -1245,7 +1249,10 @@ class DQNAgent:
             # semantics instead of inheriting current dataclass defaults.
             game_config_data.setdefault("idle_growth_per_food", 0)
             game_config_data.setdefault("max_episode_steps", 0)
-        saved_device = device if device is not None else metadata.get("device")
+        # Checkpoint device strings describe the machine that created the artifact,
+        # not a portable runtime requirement. An omitted override follows the current
+        # machine's auto-detected device; an explicit override must be available.
+        runtime_device = cls._resolve_device(device)
         agent = cls(
             state_dim=metadata["state_dim"],
             action_dim=metadata["action_dim"],
@@ -1270,14 +1277,14 @@ class DQNAgent:
             per_beta_start=metadata.get("per_beta_start", 0.4),
             per_beta_frames=metadata.get("per_beta_frames", 500_000),
             per_priority_epsilon=metadata.get("per_priority_epsilon", 1e-5),
-            device=cls._resolve_device(saved_device),
+            device=runtime_device,
             game_config=GameConfig(**game_config_data) if game_config_data else None,
             obs_shape=obs_shape,
             network_version=metadata.get("network_version", 1),
             amp_enabled=metadata.get("amp_enabled"),
             # Pinned memory is a runtime/device property and replay is not
-            # restored. Explicit device migration therefore auto-configures it.
-            pin_memory=(None if device is not None else metadata.get("pin_memory")),
+            # restored, so configure it from the selected device every time.
+            pin_memory=None,
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(

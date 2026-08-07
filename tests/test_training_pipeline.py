@@ -3,15 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+import train_dqn as training_module
 
 from dqn_agent import DQNAgent, flatten_observation
 from env import Action, GameConfig, RelativeAction, SnakeGameEnv
 from play_dqn import absolute_action, run_episode
 from train_dqn import (
     _prepare_fresh_outputs,
+    _release_accelerator_resources,
+    accelerator_runtime_info,
     deterministic_episode_seed,
     evaluate_agent,
     load_resume_metadata,
@@ -42,6 +46,68 @@ def make_agent(config: GameConfig, action_dim: int = 3) -> DQNAgent:
         device="cpu",
         game_config=config,
     )
+
+
+def test_cpu_runtime_info_and_cleanup_are_safe() -> None:
+    info = accelerator_runtime_info(torch.device("cpu"))
+
+    assert info["device"] == "cpu"
+    assert info["backend"] == "cpu"
+    assert info["device_name"] is None
+    assert info["torch_version"] == torch.__version__
+    _release_accelerator_resources(torch.device("cpu"))
+
+
+def test_rocm_runtime_info_reports_actual_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.version, "hip", "7.14-test", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "Test Radeon")
+
+    info = accelerator_runtime_info(torch.device("cuda"))
+
+    assert info["backend"] == "rocm"
+    assert info["device_name"] == "Test Radeon"
+    assert info["hip_version"] == "7.14-test"
+
+
+def test_accelerator_cleanup_synchronizes_and_releases_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(training_module.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device: calls.append(("sync", device))
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+
+    _release_accelerator_resources(torch.device("cuda"))
+
+    assert calls == ["gc", ("sync", torch.device("cuda")), "empty"]
+
+
+def test_train_releases_accelerator_after_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    device = torch.device("cuda")
+    monkeypatch.setattr(DQNAgent, "_resolve_device", staticmethod(lambda _value: device))
+
+    def interrupt(_args: object) -> None:
+        calls.append("train")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(training_module, "_train", interrupt)
+    monkeypatch.setattr(
+        training_module,
+        "_release_accelerator_resources",
+        lambda value: calls.append(("release", value)),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        training_module.train(SimpleNamespace(device="cuda"))
+
+    assert calls == ["train", ("release", device)]
 
 
 def file_sha256(path: Path) -> str:

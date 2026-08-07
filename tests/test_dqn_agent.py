@@ -36,6 +36,38 @@ def make_agent(**overrides: object) -> DQNAgent:
     return DQNAgent(**options)
 
 
+def test_explicit_unavailable_accelerator_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert DQNAgent._resolve_device(None).type == "cpu"
+    with pytest.raises(RuntimeError, match="CUDA or ROCm"):
+        DQNAgent._resolve_device("cuda")
+
+
+def test_checkpoint_ignores_stale_saved_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "stale-device.pt"
+    make_agent().save(str(path))
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint["metadata"]["device"] = "cuda"
+    torch.save(checkpoint, path)
+    resolved_inputs: list[object] = []
+
+    def resolve_to_cpu(device: object) -> torch.device:
+        resolved_inputs.append(device)
+        return torch.device("cpu")
+
+    monkeypatch.setattr(DQNAgent, "_resolve_device", staticmethod(resolve_to_cpu))
+    loaded = DQNAgent.load(str(path))
+
+    assert loaded.device.type == "cpu"
+    assert resolved_inputs[0] is None
+    assert "cuda" not in resolved_inputs
+
+
 class FixedQ(nn.Module):
     def __init__(self, values: list[float]) -> None:
         super().__init__()

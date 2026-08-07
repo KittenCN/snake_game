@@ -44,12 +44,12 @@
 - `latest` 与 `best_eval` 分离、原子保存，并用 SHA-256 将 latest、best 及 sidecar 串成可验证身份；
 - 保存 optimizer、AMP scaler、Python/NumPy/Torch RNG 和探索进度；
 - replay 不写入 checkpoint，metadata 会明确标记 `replay_restored=false`。
-- 支持多环境批量采集、批量观测编码/动作前向，以及 CUDA pinned staging 与 non-blocking H2D；
+- 支持多环境批量采集、批量观测编码/动作前向，以及 CUDA/ROCm pinned staging 与 non-blocking H2D；
   具体的吞吐分解和 Ubuntu 运行方式见下文及 [docs/TRAINING_OPTIMIZATION.md](docs/TRAINING_OPTIMIZATION.md)。
 
 ## 安装
 
-推荐 Python 3.10–3.12：
+推荐 Python 3.10–3.13：
 
 ```powershell
 python -m venv .venv
@@ -59,6 +59,38 @@ python -m pip install -r requirements-dev.txt
 ```
 
 只运行程序可安装 `requirements.txt`；开发和测试使用 `requirements-dev.txt`。
+
+### Windows 11 原生 ROCm 7.14
+
+ROCm 版 PyTorch 继续使用 `torch.cuda` API，所以训练参数仍是 `--device cuda`，不能写成
+`rocm` 或 `hip`。AMD 官方要求 Windows 11 25H2、匹配的 AMD 驱动和 Python 3.11–3.14；
+以下示例针对 RDNA3 `gfx1102`，并使用独立环境保护已有 CPU/CUDA 安装：
+
+```powershell
+python -m venv .venv-rocm714
+.\.venv-rocm714\Scripts\Activate.ps1
+python -m pip install --upgrade pip wheel
+
+python -m pip install `
+  --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
+  "rocm[libraries,device-gfx1102]==7.14.0"
+
+python -m pip install `
+  --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
+  "torch[device-gfx1102]==2.12.0+rocm7.14.0"
+
+python -m pip install -r requirements-dev.txt
+rocm-sdk targets
+rocm-sdk test
+python -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+验收输出必须同时包含 `+rocm7.14.0`、非空 HIP 版本、`True` 和真实 AMD GPU 名称。
+显式传入 `--device cuda` 而后端不可用时，训练会直接失败，不会静默退回 CPU。2026-08-07
+已在 RX 7600M XT (`gfx1102`, 8 GiB) 上验证 SDK 19 项自检、GPU FP32/AMP 反向传播、
+115 项项目测试和可保存/恢复 checkpoint 的多环境短训练；该移动 SKU 未被 AMD 7.14 硬件表单独点名，
+其他驱动组合仍应重复上述真机验收。ROCm 当前对 `adaptive_avg_pool2d_backward` 缺少确定性实现，
+默认 `warn_only=True` 会给出警告并继续，跨后端逐位复现不应据此承诺。
 
 ## 开始新的 v3 训练
 
@@ -76,12 +108,12 @@ python train_dqn.py `
 - 对应 `.meta.json`：记录 checkpoint SHA-256、episode、架构和训练配置；
 - `runs/train_log_<timestamp>.jsonl`：逐回合指标与评估分布。
 
-若机器没有 CUDA，省略 `--device cuda`，程序会自动使用 CPU。
+若机器没有 CUDA/ROCm，省略 `--device cuda` 可自动使用 CPU；显式指定不可用的加速器会报错。
 
-## CUDA 批量训练与 Ubuntu 运行
+## CUDA/ROCm 批量训练与 Ubuntu 运行
 
 训练默认保持单环境兼容行为：`--num-envs 1`、`--rollout-steps 1`、
-`--updates-per-collection 0`。在 CUDA 设备上，观测编码和 replay 采样会使用可用的 pinned CPU
+`--updates-per-collection 0`。在 CUDA 或 ROCm 设备上，观测编码和 replay 采样会使用可用的 pinned CPU
 staging，并以 non-blocking H2D 传输完整 batch；策略网络会对活动环境的状态执行一次批量动作前向。
 这旨在减少小批量传输和逐状态前向的开销，但实际吞吐与 GPU 利用率取决于显卡、CPU、棋盘大小、
 batch 以及环境负载，应以 JSONL collection 指标实测为准。

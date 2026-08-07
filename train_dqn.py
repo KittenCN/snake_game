@@ -8,6 +8,7 @@ Version 3 deliberately separates resumable ``latest`` checkpoints from evaluated
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -270,6 +271,35 @@ def set_global_seed(seed: int) -> None:
     torch.manual_seed(seed32)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed32)
+
+
+def accelerator_runtime_info(device: torch.device) -> dict[str, Any]:
+    """Describe the actual PyTorch runtime selected for this training process."""
+    hip_version = getattr(torch.version, "hip", None)
+    cuda_version = getattr(torch.version, "cuda", None)
+    if device.type == "cuda":
+        backend = "rocm" if hip_version else "cuda"
+        device_name = torch.cuda.get_device_name(device)
+    else:
+        backend = device.type
+        device_name = None
+    return {
+        "device": str(device),
+        "backend": backend,
+        "device_name": device_name,
+        "torch_version": torch.__version__,
+        "hip_version": hip_version,
+        "cuda_version": cuda_version,
+    }
+
+
+def _release_accelerator_resources(device: torch.device) -> None:
+    """Release accelerator state before Windows tears the Python runtime down."""
+    if device.type != "cuda":
+        return
+    gc.collect()
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
 
 
 def deterministic_episode_seed(base_seed: int, episode: int, stream: int = 0) -> int:
@@ -965,8 +995,7 @@ class _TrainingSlot:
         self.active = True
 
 
-def train(args: argparse.Namespace | None = None) -> None:
-    args = args or parse_args()
+def _train(args: argparse.Namespace) -> None:
     set_global_seed(args.seed)
     torch.use_deterministic_algorithms(not args.allow_nondeterministic, warn_only=True)
     if torch.cuda.is_available():
@@ -1128,6 +1157,13 @@ def train(args: argparse.Namespace | None = None) -> None:
         channels=agent.obs_shape[0],
         pin_memory=agent.device.type == "cuda",
     )
+    runtime_info = accelerator_runtime_info(agent.device)
+    print(
+        "Training device: "
+        f"{runtime_info['device']} ({runtime_info['backend']}; "
+        f"{runtime_info['device_name'] or 'host CPU'}; torch {runtime_info['torch_version']}; "
+        f"HIP {runtime_info['hip_version'] or 'n/a'})."
+    )
 
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(
@@ -1144,6 +1180,7 @@ def train(args: argparse.Namespace | None = None) -> None:
                     "obs_shape": list(agent.obs_shape),
                     "step_limit": step_limit,
                     "observation_pinned": current_encoder.is_pinned,
+                    "runtime": runtime_info,
                     "eval_seeds": eval_seeds,
                     "args": vars(args),
                 }
@@ -1442,6 +1479,16 @@ def train(args: argparse.Namespace | None = None) -> None:
         f"best: {output_path if best_eval_episode is not None else 'not evaluated in this run'}; "
         f"log: {log_path}."
     )
+
+
+def train(args: argparse.Namespace | None = None) -> None:
+    """Run training and always release resources after its frame is gone."""
+    resolved_args = args or parse_args()
+    runtime_device = DQNAgent._resolve_device(resolved_args.device)
+    try:
+        _train(resolved_args)
+    finally:
+        _release_accelerator_resources(runtime_device)
 
 
 if __name__ == "__main__":

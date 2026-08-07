@@ -93,6 +93,28 @@ collection JSONL 记录可用于定位瓶颈：
 
 上述指标是工作负载与设备相关的测量值，不是吞吐或 GPU 利用率的保证。
 
+## Windows 原生 ROCm 7.14 验证
+
+PyTorch ROCm 复用 CUDA 设备接口，因此本项目无需维护另一套 `hip` device 分支，启动仍使用
+`--device cuda`。训练启动记录现在包含实际 device、后端（`cuda`/`rocm`）、设备名称、Torch、
+HIP 和 CUDA build 版本；显式请求不可用的加速器会失败，避免性能验收被静默 CPU 回退污染。
+
+2026-08-07 在 Windows 11 25H2、RX 7600M XT (`gfx1102`, 8 GiB)、ROCm 7.14.0、
+PyTorch 2.12.0+rocm7.14.0 和 Python 3.13 上完成：
+
+- `rocm-sdk test`：19/19；
+- GPU FP32 matmul backward 与 AMP Conv2d/GroupNorm/Adam backward；
+- 项目 pytest：115/115，CPU 与 ROCm 环境均通过；
+- 8 个并行环境的 40 回合吞吐 smoke：约 55–62 updates/s；修复后最终 smoke 可生成、加载
+  latest/best checkpoint 并干净退出；
+- 正常训练结束前显式 GC、设备同步和 allocator cache 释放，避免原生 Windows ROCm 在解释器
+  析构阶段长期占用 CPU。
+
+ROCm 会提示 `adaptive_avg_pool2d_backward_cuda` 尚无确定性实现。当前训练使用
+`torch.use_deterministic_algorithms(..., warn_only=True)`，因此警告不会中断训练，但 ROCm 与其他
+后端之间不具备逐位一致保证。`xnack 'Off'` 提示来自不支持 XNACK 的 `gfx1102` 设备库，本次验证中
+未影响前向、反向、保存或恢复。
+
 ## 并行恢复语义
 
 `--episodes` 表示本次 invocation 要完成的回合数。`episodes_started` 单独记录已分配 seed 的回合：若
