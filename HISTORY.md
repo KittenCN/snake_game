@@ -1,5 +1,14 @@
 # History
 
+## 0.5.2 - 2026-08-08
+
+- Added a single-read, optionally SHA-256-authenticated policy checkpoint factory that constructs a fresh target-map agent without restoring optimizer, replay, counters, scaler or RNG state.
+- Made cross-map transfer fail closed on unknown network versions and incompatible action/observation schemas, while preserving same-map policy-only compatibility for legacy v1/v2 checkpoints.
+- Added auditable source/target map provenance to checkpoint payloads, sidecars and resumed runs, including source sidecar role and digest identity checks.
+- Switched inference to policy-only construction for both same-map and cross-map play; target overrides now receive a target-sized episode horizon and report map, horizon and cross-map status.
+- Added explicit full-state `restore_training_checkpoint` and retained `load` as its compatibility alias.
+- Added 8x8-to-10x10 inference/training, 10x10 resume, invalid target, schema/version conflict and tampered-digest regressions.
+
 ## 0.5.1 - 2026-08-07
 
 - Added paired evaluation states for confirmed improvement, confirmed plateau, and inconclusive evidence; inconclusive results now defer every plateau/min-LR/early-stop action.

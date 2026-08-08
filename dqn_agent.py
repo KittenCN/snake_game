@@ -13,7 +13,7 @@ import time
 import warnings
 from collections import deque
 from dataclasses import asdict, dataclass, replace
-from typing import TYPE_CHECKING, Any, Deque, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Mapping, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -53,6 +53,42 @@ class ReplayBatch:
     quality_tiers: torch.Tensor
     trajectory_scores: torch.Tensor
     trajectory_returns: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PolicyCheckpointSnapshot:
+    """Authenticated, single-read policy checkpoint snapshot."""
+
+    checkpoint_bytes: bytes
+    checkpoint_sha256: str
+    checkpoint: Mapping[str, Any]
+    metadata: Mapping[str, Any]
+    policy_state_dict: Mapping[str, torch.Tensor]
+
+
+_NETWORK_SCHEMAS: dict[int, dict[str, Any]] = {
+    1: {
+        "observation_schema": "snake_grid_v1_3ch",
+        "observation_channels": 3,
+        "action_schema": "absolute_actions_v1",
+        "action_dim": 4,
+        "spatial_transfer_capable": False,
+    },
+    2: {
+        "observation_schema": "snake_grid_v2_17ch",
+        "observation_channels": 17,
+        "action_schema": "absolute_actions_v1",
+        "action_dim": 4,
+        "spatial_transfer_capable": False,
+    },
+    3: {
+        "observation_schema": "snake_grid_v3_20ch",
+        "observation_channels": 20,
+        "action_schema": "relative_actions_v1",
+        "action_dim": 3,
+        "spatial_transfer_capable": True,
+    },
+}
 
 
 class ReplayBuffer:
@@ -101,9 +137,7 @@ class ReplayBuffer:
         self._trajectory_returns = torch.zeros(
             self.capacity, dtype=torch.float32, device="cpu"
         )
-        self._slot_versions = torch.zeros(
-            self.capacity, dtype=torch.long, device="cpu"
-        )
+        self._slot_versions = torch.zeros(self.capacity, dtype=torch.long, device="cpu")
         self._imitation_eligible = torch.zeros(
             self.capacity, dtype=torch.bool, device="cpu"
         )
@@ -272,7 +306,9 @@ class ReplayBuffer:
         imitation_eligible: bool = False,
     ) -> tuple[int, int]:
         if quality_tier not in (0, 1, 2):
-            raise ValueError("quality_tier must be 0 (regular), 1 (success), or 2 (elite)")
+            raise ValueError(
+                "quality_tier must be 0 (regular), 1 (success), or 2 (elite)"
+            )
         if not math.isfinite(trajectory_score) or not math.isfinite(trajectory_return):
             raise ValueError("trajectory score and return must be finite")
         state_cpu = state.detach().to(device="cpu", dtype=torch.float16)
@@ -526,15 +562,15 @@ class ReplayBuffer:
             elite_count += extra_elite
             remaining -= extra_elite
         if remaining > 0:
-            extra_success = min(
-                remaining, int(success_pool.numel()) - success_count
-            )
+            extra_success = min(remaining, int(success_pool.numel()) - success_count)
             success_count += extra_success
             remaining -= extra_success
         if remaining > 0:
             raise ValueError("not enough unique demonstration transitions")
 
-        def sample_pool(pool: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
+        def sample_pool(
+            pool: torch.Tensor, count: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             if count == 0:
                 return (
                     torch.empty(0, dtype=torch.long),
@@ -943,6 +979,11 @@ class DQNAgent:
             self.device.type == "cuda" if pin_memory is None else bool(pin_memory)
         ) and self.device.type == "cuda"
         self.game_config = game_config
+        if network_version not in _NETWORK_SCHEMAS:
+            raise ValueError(
+                "network_version must be one of "
+                f"{sorted(_NETWORK_SCHEMAS)}; got {network_version!r}"
+            )
         self.network_version = network_version
         if not math.isfinite(policy_anchor_weight) or policy_anchor_weight < 0:
             raise ValueError("policy_anchor_weight must be finite and non-negative")
@@ -954,7 +995,11 @@ class DQNAgent:
             raise ValueError("demonstration_capacity must be non-negative")
         if not 0.0 <= demonstration_batch_fraction < 1.0:
             raise ValueError("demonstration_batch_fraction must be in [0, 1)")
-        if not 0.0 <= elite_demonstration_batch_fraction <= demonstration_batch_fraction:
+        if (
+            not 0.0
+            <= elite_demonstration_batch_fraction
+            <= demonstration_batch_fraction
+        ):
             raise ValueError(
                 "elite_demonstration_batch_fraction must be between zero and "
                 "demonstration_batch_fraction"
@@ -1021,11 +1066,11 @@ class DQNAgent:
         if self.target_update_tau <= 0.0 and self.hard_update_interval <= 0:
             self.hard_update_interval = self.target_update_interval
 
-        if self.network_version >= 3:
+        if self.network_version == 3:
             network_cls = SpatialGroupNormDuelingQNetwork
         elif self.network_version == 2:
             network_cls = EnhancedConvDuelingQNetwork
-        else:
+        else:  # network version 1
             network_cls = BaselineConvDuelingQNetwork
         self.policy_net = network_cls(
             self.obs_shape, action_dim, hidden_sizes, use_dueling=self.use_dueling
@@ -1077,6 +1122,7 @@ class DQNAgent:
         self.demonstration_transitions_promoted = 0
         self.replay_restored = False
         self.learn_step_counter = 0
+        self.policy_transfer_provenance: dict[str, Any] | None = None
 
     def snapshot_policy_anchor(self) -> None:
         """Freeze the current policy as an immutable teacher for conservative updates."""
@@ -1251,7 +1297,9 @@ class DQNAgent:
             raise ValueError("trajectory score and return must be finite")
         stream_id = int(stream_id)
         if self._n_step_buffers.get(stream_id):
-            raise RuntimeError("cannot finalize a trajectory before its n-step buffer is empty")
+            raise RuntimeError(
+                "cannot finalize a trajectory before its n-step buffer is empty"
+            )
         tokens = self._episode_replay_tokens.pop(stream_id, [])
         quality_tier = 0
         if (
@@ -1308,7 +1356,9 @@ class DQNAgent:
             demonstration_mask=torch.cat(
                 (first.demonstration_mask, second.demonstration_mask), dim=0
             ),
-            imitation_mask=torch.cat((first.imitation_mask, second.imitation_mask), dim=0),
+            imitation_mask=torch.cat(
+                (first.imitation_mask, second.imitation_mask), dim=0
+            ),
             quality_tiers=torch.cat((first.quality_tiers, second.quality_tiers), dim=0),
             trajectory_scores=torch.cat(
                 (first.trajectory_scores, second.trajectory_scores), dim=0
@@ -1423,7 +1473,9 @@ class DQNAgent:
                 chosen_demo_values = demo_q_values.gather(
                     1, demo_actions.unsqueeze(1)
                 ).squeeze(1)
-                imitation_elements = (competing_values - chosen_demo_values).clamp_min(0.0)
+                imitation_elements = (competing_values - chosen_demo_values).clamp_min(
+                    0.0
+                )
                 quality_weights = torch.where(
                     batch.quality_tiers[batch.imitation_mask] == 2,
                     torch.full_like(imitation_elements, 1.5),
@@ -1568,6 +1620,15 @@ class DQNAgent:
                 "learn_step_counter": self.learn_step_counter,
                 "obs_shape": self.obs_shape,
                 "network_version": self.network_version,
+                "observation_schema": _NETWORK_SCHEMAS[self.network_version][
+                    "observation_schema"
+                ],
+                "action_schema": _NETWORK_SCHEMAS[self.network_version][
+                    "action_schema"
+                ],
+                "spatial_transfer_capable": _NETWORK_SCHEMAS[self.network_version][
+                    "spatial_transfer_capable"
+                ],
                 "policy_anchor_weight": self.policy_anchor_weight,
                 "teacher_replay_steps": self.teacher_replay_steps,
                 "demonstration_capacity": self.demonstration_capacity,
@@ -1588,6 +1649,7 @@ class DQNAgent:
                 "demonstration_transitions_promoted": self.demonstration_transitions_promoted,
                 "policy_anchor_enabled": self.policy_anchor_net is not None,
                 "game_config": asdict(self.game_config) if self.game_config else None,
+                "policy_transfer_provenance": self.policy_transfer_provenance,
             },
         }
         target_path = os.path.abspath(os.fspath(path))
@@ -1607,23 +1669,27 @@ class DQNAgent:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-    def load_policy_weights(
-        self, path: str, *, expected_sha256: str | None = None
-    ) -> dict[str, Any]:
-        """Load only compatible policy weights from a training checkpoint.
-
-        This is intentionally distinct from :meth:`load`: warm starts retain all
-        runtime and optimization state belonging to this agent.  Checkpoint data
-        is validated in full before either network is modified.
-        """
+    @staticmethod
+    def _read_policy_checkpoint_snapshot(
+        path: str, *, expected_sha256: str | None = None
+    ) -> PolicyCheckpointSnapshot:
+        """Read and deserialize a policy source exactly once before validation."""
         with open(path, "rb") as stream:
             checkpoint_bytes = stream.read()
         actual_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
-        if expected_sha256 is not None and actual_sha256 != expected_sha256:
-            raise RuntimeError(
-                "warm-start checkpoint changed after metadata validation: "
-                f"expected SHA-256 {expected_sha256}, got {actual_sha256}"
-            )
+        if expected_sha256 is not None:
+            normalized_sha256 = expected_sha256.lower()
+            if len(normalized_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in normalized_sha256
+            ):
+                raise ValueError(
+                    "expected_sha256 must be a 64-character hexadecimal digest"
+                )
+            if actual_sha256 != normalized_sha256:
+                raise RuntimeError(
+                    "policy checkpoint failed SHA-256 authentication: "
+                    f"expected SHA-256 {normalized_sha256}, got {actual_sha256}"
+                )
         checkpoint_stream = io.BytesIO(checkpoint_bytes)
         try:
             checkpoint = torch.load(
@@ -1647,9 +1713,30 @@ class DQNAgent:
             raise RuntimeError(  # noqa: TRY004 - checkpoint incompatibility contract
                 "policy checkpoint is missing policy_state_dict"
             )
+        return PolicyCheckpointSnapshot(
+            checkpoint_bytes=checkpoint_bytes,
+            checkpoint_sha256=actual_sha256,
+            checkpoint=checkpoint,
+            metadata=metadata,
+            policy_state_dict=policy_state,
+        )
+
+    def _apply_policy_checkpoint_snapshot(
+        self, snapshot: PolicyCheckpointSnapshot
+    ) -> dict[str, Any]:
+        """Validate a snapshot fully, then atomically replace policy/target weights."""
+        metadata = snapshot.metadata
+        policy_state = snapshot.policy_state_dict
 
         incompatibilities: list[str] = []
         source_network_version = metadata.get("network_version")
+        source_schema = _NETWORK_SCHEMAS.get(source_network_version)
+        if source_schema is None:
+            incompatibilities.append(
+                "unsupported network_version "
+                f"{source_network_version!r}; supported versions are "
+                f"{sorted(_NETWORK_SCHEMAS)}"
+            )
         if source_network_version != self.network_version:
             incompatibilities.append(
                 "network_version "
@@ -1677,6 +1764,55 @@ class DQNAgent:
             incompatibilities.append(
                 f"obs channels {source_obs_shape[0]!r} != {self.obs_shape[0]!r}"
             )
+        is_cross_map = (
+            isinstance(source_obs_shape, (list, tuple))
+            and len(source_obs_shape) == 3
+            and tuple(source_obs_shape[1:]) != tuple(self.obs_shape[1:])
+        )
+        if (
+            is_cross_map
+            and source_schema is not None
+            and isinstance(source_obs_shape, (list, tuple))
+        ):
+            expected_action_dim = source_schema["action_dim"]
+            if source_action_dim != expected_action_dim:
+                incompatibilities.append(
+                    f"network v{source_network_version} action schema requires "
+                    f"action_dim={expected_action_dim}; got {source_action_dim!r}"
+                )
+            source_action_schema = metadata.get(
+                "action_schema", source_schema["action_schema"]
+            )
+            if source_action_schema != source_schema["action_schema"]:
+                incompatibilities.append(
+                    f"action_schema {source_action_schema!r} != "
+                    f"{source_schema['action_schema']!r}"
+                )
+            expected_channels = source_schema["observation_channels"]
+            if len(source_obs_shape) == 3 and source_obs_shape[0] != expected_channels:
+                incompatibilities.append(
+                    f"network v{source_network_version} observation schema requires "
+                    f"{expected_channels} channels; got {source_obs_shape[0]!r}"
+                )
+            source_observation_schema = metadata.get(
+                "observation_schema", source_schema["observation_schema"]
+            )
+            if source_observation_schema != source_schema["observation_schema"]:
+                incompatibilities.append(
+                    f"observation_schema {source_observation_schema!r} != "
+                    f"{source_schema['observation_schema']!r}"
+                )
+            if (
+                not source_schema["spatial_transfer_capable"]
+                or metadata.get(
+                    "spatial_transfer_capable",
+                    source_schema["spatial_transfer_capable"],
+                )
+                is not True
+            ):
+                incompatibilities.append(
+                    f"network_version {source_network_version} is not spatial-transfer capable"
+                )
 
         current_state = self.policy_net.state_dict()
         source_keys = set(policy_state)
@@ -1721,8 +1857,249 @@ class DQNAgent:
         self.target_net.eval()
         return dict(metadata)
 
+    def load_policy_weights(
+        self, path: str, *, expected_sha256: str | None = None
+    ) -> dict[str, Any]:
+        """Load policy weights into an already constructed compatible agent.
+
+        Prefer :meth:`from_policy_checkpoint` when the destination map or agent
+        does not already exist.  This compatibility method shares the same
+        single-read, SHA-authenticated validation contract.
+        """
+        snapshot = self._read_policy_checkpoint_snapshot(
+            path, expected_sha256=expected_sha256
+        )
+        return self._apply_policy_checkpoint_snapshot(snapshot)
+
+    @staticmethod
+    def _checkpoint_game_config(metadata: Mapping[str, Any]) -> GameConfig | None:
+        raw_config = metadata.get("game_config")
+        if not isinstance(raw_config, Mapping):
+            return None
+        config_data = dict(raw_config)
+        config_data.setdefault("idle_growth_per_food", 0)
+        config_data.setdefault("max_episode_steps", 0)
+        return GameConfig(**config_data)
+
     @classmethod
-    def load(cls, path: str, *, device: str | torch.device | None = None) -> "DQNAgent":
+    def from_policy_checkpoint(
+        cls,
+        path: str,
+        *,
+        target_game_config: GameConfig | None = None,
+        target_width: int | None = None,
+        target_height: int | None = None,
+        target_max_episode_steps: int | None = None,
+        device: str | torch.device | None = None,
+        expected_sha256: str | None = None,
+        agent_options: Mapping[str, Any] | None = None,
+    ) -> "DQNAgent":
+        """Construct a fresh target-map agent from policy weights only.
+
+        The checkpoint is captured as one immutable byte snapshot and optionally
+        SHA-authenticated.  Only architecture metadata and policy tensors cross
+        the boundary: optimizer/scaler state, replay, counters, exploration,
+        teacher state, and checkpoint RNG are never restored.
+        """
+        if (target_width is None) != (target_height is None):
+            raise ValueError("target_width and target_height must be provided together")
+        if target_game_config is not None and target_width is not None:
+            raise ValueError(
+                "Provide target_game_config or target_width/target_height, not both"
+            )
+        if target_game_config is not None and target_max_episode_steps is not None:
+            raise ValueError(
+                "target_max_episode_steps cannot be combined with target_game_config"
+            )
+        if target_max_episode_steps is not None and target_max_episode_steps <= 0:
+            raise ValueError("target_max_episode_steps must be positive")
+        snapshot = cls._read_policy_checkpoint_snapshot(
+            path, expected_sha256=expected_sha256
+        )
+        metadata = snapshot.metadata
+        source_obs_shape = metadata.get("obs_shape")
+        if (
+            not isinstance(source_obs_shape, (list, tuple))
+            or len(source_obs_shape) != 3
+            or any(
+                not isinstance(value, int) or value <= 0 for value in source_obs_shape
+            )
+        ):
+            raise RuntimeError("policy checkpoint obs_shape is missing or invalid")
+        source_config = cls._checkpoint_game_config(metadata)
+        if source_config is not None and (
+            source_config.width != int(source_obs_shape[2])
+            or source_config.height != int(source_obs_shape[1])
+        ):
+            raise RuntimeError(
+                "policy checkpoint game_config dimensions conflict with obs_shape: "
+                f"game_config={source_config.width}x{source_config.height}, "
+                f"obs_shape={source_obs_shape[2]}x{source_obs_shape[1]}"
+            )
+        if target_game_config is None:
+            base_config = source_config or GameConfig(
+                width=int(source_obs_shape[2]), height=int(source_obs_shape[1])
+            )
+            target_game_config = GameConfig(**asdict(base_config))
+            if target_width is not None and target_height is not None:
+                target_game_config.width = int(target_width)
+                target_game_config.height = int(target_height)
+                target_game_config.max_episode_steps = (
+                    int(target_max_episode_steps)
+                    if target_max_episode_steps is not None
+                    else int(target_width) * int(target_height) * 20
+                )
+            elif target_max_episode_steps is not None:
+                target_game_config.max_episode_steps = int(target_max_episode_steps)
+        target_game_config.validate()
+
+        structural_fields = {
+            "state_dim",
+            "action_dim",
+            "hidden_sizes",
+            "use_dueling",
+            "dueling_hidden",
+            "device",
+            "game_config",
+            "obs_shape",
+            "network_version",
+        }
+        options = dict(agent_options or {})
+        forbidden = sorted(structural_fields.intersection(options))
+        if forbidden:
+            raise ValueError(
+                "Policy transfer inherits checkpoint network structure; remove agent_options: "
+                + ", ".join(forbidden)
+            )
+        target_obs_shape = (
+            int(source_obs_shape[0]),
+            int(target_game_config.height),
+            int(target_game_config.width),
+        )
+        try:
+            action_dim = int(metadata["action_dim"])
+            hidden_sizes = tuple(int(value) for value in metadata["hidden_sizes"])
+            network_version = int(metadata["network_version"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "policy checkpoint network structure metadata is missing or invalid"
+            ) from exc
+        source_schema = _NETWORK_SCHEMAS.get(network_version)
+        if source_schema is None:
+            raise RuntimeError(
+                f"unsupported policy checkpoint network_version {network_version!r}; "
+                f"supported versions are {sorted(_NETWORK_SCHEMAS)}"
+            )
+        cross_map = int(target_game_config.width) != int(source_obs_shape[2]) or int(
+            target_game_config.height
+        ) != int(source_obs_shape[1])
+        if cross_map:
+            if not source_schema["spatial_transfer_capable"]:
+                raise RuntimeError(
+                    f"network_version {network_version} is not spatial-transfer capable; "
+                    "use the checkpoint's original map dimensions"
+                )
+            expected_action_dim = source_schema["action_dim"]
+            expected_channels = source_schema["observation_channels"]
+            source_action_schema = metadata.get(
+                "action_schema", source_schema["action_schema"]
+            )
+            source_observation_schema = metadata.get(
+                "observation_schema", source_schema["observation_schema"]
+            )
+            if (
+                action_dim != expected_action_dim
+                or int(source_obs_shape[0]) != expected_channels
+                or source_action_schema != source_schema["action_schema"]
+                or source_observation_schema != source_schema["observation_schema"]
+                or metadata.get("spatial_transfer_capable", True) is not True
+            ):
+                raise RuntimeError(
+                    "policy checkpoint does not satisfy its declared spatial-transfer "
+                    "action/observation schema"
+                )
+        agent = cls(
+            state_dim=int(np.prod(target_obs_shape)),
+            action_dim=action_dim,
+            hidden_sizes=hidden_sizes,
+            use_dueling=bool(metadata.get("use_dueling", True)),
+            dueling_hidden=metadata.get("dueling_hidden"),
+            device=device,
+            game_config=target_game_config,
+            obs_shape=target_obs_shape,
+            network_version=network_version,
+            **options,
+        )
+        embedded_metadata = agent._apply_policy_checkpoint_snapshot(snapshot)
+        source_map = {
+            "width": (
+                source_config.width if source_config else int(source_obs_shape[2])
+            ),
+            "height": (
+                source_config.height if source_config else int(source_obs_shape[1])
+            ),
+        }
+        target_map = {
+            "width": target_game_config.width,
+            "height": target_game_config.height,
+        }
+        agent.policy_transfer_provenance = {
+            "transfer_mode": "policy_only",
+            "source_path": os.path.abspath(os.fspath(path)),
+            "checkpoint_sha256": snapshot.checkpoint_sha256,
+            "sha256_verified": expected_sha256 is not None,
+            "source_checkpoint_schema_version": embedded_metadata.get(
+                "checkpoint_schema_version"
+            ),
+            "source_network_version": network_version,
+            "source_action_dim": action_dim,
+            "source_hidden_sizes": list(hidden_sizes),
+            "source_obs_shape": list(source_obs_shape),
+            "target_obs_shape": list(target_obs_shape),
+            "source_game_config": (
+                asdict(source_config) if source_config is not None else None
+            ),
+            "target_game_config": asdict(target_game_config),
+            "source_map": source_map,
+            "target_map": target_map,
+            "cross_map": source_map != target_map,
+            "optimizer_restored": False,
+            "replay_restored": False,
+            "rng_restored": False,
+        }
+        return agent
+
+    @classmethod
+    def validate_policy_sidecar_identity(
+        cls,
+        sidecar_metadata: Mapping[str, Any],
+        transfer_provenance: Mapping[str, Any],
+    ) -> None:
+        """Reject sidecar architecture claims that disagree with policy bytes."""
+        expected = {
+            "network_version": transfer_provenance.get("source_network_version"),
+            "action_dim": transfer_provenance.get("source_action_dim"),
+            "obs_shape": transfer_provenance.get("source_obs_shape"),
+        }
+        conflicts = {
+            key: (sidecar_metadata[key], value)
+            for key, value in expected.items()
+            if key in sidecar_metadata and sidecar_metadata[key] != value
+        }
+        if conflicts:
+            raise RuntimeError(
+                "Policy source sidecar conflicts with authenticated checkpoint bytes: "
+                + ", ".join(
+                    f"{key}=sidecar:{values[0]!r}/checkpoint:{values[1]!r}"
+                    for key, values in conflicts.items()
+                )
+            )
+
+    @classmethod
+    def restore_training_checkpoint(
+        cls, path: str, *, device: str | torch.device | None = None
+    ) -> "DQNAgent":
+        """Restore the complete resumable training state from a checkpoint."""
         # Loading to CPU first avoids inheriting a stale checkpoint device and
         # lets module/optimizer loading move state coherently to the requested device.
         resolved_device = (
@@ -1793,9 +2170,7 @@ class DQNAgent:
             demonstration_min_score=metadata.get("demonstration_min_score", 4.0),
             demonstration_min_return=metadata.get("demonstration_min_return", 0.0),
             demonstration_elite_score=metadata.get("demonstration_elite_score", 6.0),
-            demonstration_elite_return=metadata.get(
-                "demonstration_elite_return", 20.0
-            ),
+            demonstration_elite_return=metadata.get("demonstration_elite_return", 20.0),
             imitation_loss_weight=metadata.get("imitation_loss_weight", 0.0),
             imitation_margin=metadata.get("imitation_margin", 0.8),
         )
@@ -1824,6 +2199,12 @@ class DQNAgent:
         agent.demonstration_transitions_promoted = int(
             metadata.get("demonstration_transitions_promoted", 0)
         )
+        raw_transfer_provenance = metadata.get("policy_transfer_provenance")
+        agent.policy_transfer_provenance = (
+            dict(raw_transfer_provenance)
+            if isinstance(raw_transfer_provenance, Mapping)
+            else None
+        )
         agent.epsilon = metadata.get("epsilon", metadata.get("epsilon_final", 0.01))
         if "behavior_steps" in metadata:
             agent.behavior_steps = int(metadata["behavior_steps"])
@@ -1838,6 +2219,11 @@ class DQNAgent:
         agent.replay_restored = False
         agent._restore_rng_state(checkpoint.get("rng_state"))
         return agent
+
+    @classmethod
+    def load(cls, path: str, *, device: str | torch.device | None = None) -> "DQNAgent":
+        """Compatibility alias for :meth:`restore_training_checkpoint`."""
+        return cls.restore_training_checkpoint(path, device=device)
 
     # ------------------------------------------------------------------
     # Helpers

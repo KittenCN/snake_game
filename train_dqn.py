@@ -125,9 +125,7 @@ class EvaluationConvergenceController:
         ci95_high = mean + standard_margin
         adjusted_ci_low = mean - adjusted_margin
         adjusted_ci_high = mean + adjusted_margin
-        meaningful_delta = max(
-            self.early_stop_delta, self.paired_promotion_min_delta
-        )
+        meaningful_delta = max(self.early_stop_delta, self.paired_promotion_min_delta)
         confirmed_improvement = adjusted_ci_low > meaningful_delta
         confirmed_plateau = adjusted_ci_high < meaningful_delta
         statistical_state = (
@@ -302,9 +300,7 @@ class EvaluationConvergenceController:
             "significant_improvement": significant,
             "aggregate_significant_improvement": aggregate_significant,
             "paired_comparison": paired,
-            "paired_promotion_eligible": bool(
-                paired and paired["promotion_eligible"]
-            ),
+            "paired_promotion_eligible": bool(paired and paired["promotion_eligible"]),
             "clear_regression": clear_regression,
             "statistical_state": statistical_state,
             "patience_deferred": (
@@ -377,13 +373,9 @@ class EvaluationConvergenceController:
             paired_promotion_min_delta=float(
                 config.get("paired_promotion_min_delta", 0.0)
             ),
-            regression_stop_patience=int(
-                config.get("regression_stop_patience", 0)
-            ),
+            regression_stop_patience=int(config.get("regression_stop_patience", 0)),
             regression_stop_delta=float(config.get("regression_stop_delta", 0.0)),
-            adaptive_eval_max_episodes=int(
-                config.get("adaptive_eval_max_episodes", 0)
-            ),
+            adaptive_eval_max_episodes=int(config.get("adaptive_eval_max_episodes", 0)),
             adaptive_eval_growth_factor=float(
                 config.get("adaptive_eval_growth_factor", 2.0)
             ),
@@ -426,7 +418,9 @@ class EvaluationConvergenceController:
         if not math.isfinite(self.lr_plateau_min) or self.lr_plateau_min <= 0:
             raise RuntimeError("Controller minimum LR must be finite and positive")
         if not math.isfinite(self.early_stop_delta) or self.early_stop_delta < 0:
-            raise RuntimeError("Controller early-stop delta must be finite and non-negative")
+            raise RuntimeError(
+                "Controller early-stop delta must be finite and non-negative"
+            )
         if (
             not math.isfinite(self.paired_promotion_min_delta)
             or self.paired_promotion_min_delta < 0
@@ -436,12 +430,17 @@ class EvaluationConvergenceController:
             )
         if self.regression_stop_patience < 0:
             raise RuntimeError("Controller regression patience must be non-negative")
-        if not math.isfinite(self.regression_stop_delta) or self.regression_stop_delta < 0:
+        if (
+            not math.isfinite(self.regression_stop_delta)
+            or self.regression_stop_delta < 0
+        ):
             raise RuntimeError(
                 "Controller regression-stop delta must be finite and non-negative"
             )
         if self.adaptive_eval_max_episodes < 0:
-            raise RuntimeError("Controller adaptive evaluation maximum must be non-negative")
+            raise RuntimeError(
+                "Controller adaptive evaluation maximum must be non-negative"
+            )
         if (
             not math.isfinite(self.adaptive_eval_growth_factor)
             or self.adaptive_eval_growth_factor <= 1.0
@@ -456,13 +455,16 @@ class EvaluationConvergenceController:
             or not all(math.isfinite(value) for value in self.reference_scores)
         ):
             raise RuntimeError("Controller paired reference scores must be finite")
-        if min(
-            self.plateau_evaluations,
-            self.min_lr_evaluations,
-            self.regression_evaluations,
-            self.reductions,
-            self.evaluations,
-        ) < 0:
+        if (
+            min(
+                self.plateau_evaluations,
+                self.min_lr_evaluations,
+                self.regression_evaluations,
+                self.reductions,
+                self.evaluations,
+            )
+            < 0
+        ):
             raise RuntimeError("Controller counters must be non-negative")
 
 
@@ -738,10 +740,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     requested_elite_rows = int(
         round(args.batch_size * args.elite_demonstration_batch_fraction)
     )
-    if (
-        args.elite_demonstration_batch_fraction > 0
-        and requested_elite_rows < 1
-    ):
+    if args.elite_demonstration_batch_fraction > 0 and requested_elite_rows < 1:
         parser.error(
             "elite-demonstration-batch-fraction must reserve at least one row for "
             "the configured batch-size"
@@ -767,7 +766,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if not all(math.isfinite(value) for value in demonstration_thresholds):
         parser.error("demonstration score/return thresholds must be finite")
     if args.demonstration_elite_score < args.demonstration_min_score:
-        parser.error("demonstration-elite-score must not be below demonstration-min-score")
+        parser.error(
+            "demonstration-elite-score must not be below demonstration-min-score"
+        )
     if args.demonstration_elite_return < args.demonstration_min_return:
         parser.error(
             "demonstration-elite-return must not be below demonstration-min-return"
@@ -778,10 +779,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("early-stop-delta must be finite and non-negative")
     if args.regression_stop_patience < 0:
         parser.error("regression-stop-patience must be non-negative")
-    if (
-        not math.isfinite(args.regression_stop_delta)
-        or args.regression_stop_delta < 0
-    ):
+    if not math.isfinite(args.regression_stop_delta) or args.regression_stop_delta < 0:
         parser.error("regression-stop-delta must be finite and non-negative")
     if (
         not math.isfinite(args.paired_promotion_min_delta)
@@ -1089,9 +1087,7 @@ def evaluate_agent(
     }
 
 
-def evaluation_samples(
-    evaluation: dict[str, Any], group: str
-) -> list[float]:
+def evaluation_samples(evaluation: dict[str, Any], group: str) -> list[float]:
     """Read per-seed samples while remaining compatible with legacy test/eval payloads."""
     raw = evaluation.get(f"{group}_samples")
     if isinstance(raw, list) and raw:
@@ -1232,9 +1228,7 @@ def evaluate_adaptive_paired(
         ),
         "family_confidence": paired["family_confidence"] if paired else 0.95,
         "look_confidence": (
-            paired["look_confidence"]
-            if paired
-            else 1.0 - 0.05 / planned_looks
+            paired["look_confidence"] if paired else 1.0 - 0.05 / planned_looks
         ),
         "statistical_state": (
             paired["statistical_state"] if paired else "unpaired_reference"
@@ -1279,7 +1273,9 @@ def evaluation_identity(
 ) -> dict[str, Any]:
     identity = {
         "selection_metric": (
-            "paired_score_ci95" if train_args.require_paired_promotion else "raw_score_mean"
+            "paired_score_ci95"
+            if train_args.require_paired_promotion
+            else "raw_score_mean"
         ),
         "safety_fallback": False,
         "run_seed": train_args.seed,
@@ -1417,6 +1413,7 @@ def save_checkpoint(
         ),
         "train_args": vars(train_args),
         "warm_start_provenance": warm_start_provenance,
+        "policy_transfer_provenance": agent.policy_transfer_provenance,
     }
     _atomic_json(sidecar_path(path), payload)
 
@@ -1709,9 +1706,7 @@ def restore_convergence_controller(
                 "Warning: resume sidecar has no convergence controller state; "
                 "initializing from the saved best score with zero patience counters."
             )
-        return _new_convergence_controller(
-            args, reference_score=legacy_reference_score
-        )
+        return _new_convergence_controller(args, reference_score=legacy_reference_score)
     if not isinstance(payload, dict):
         raise RuntimeError("Resume convergence_controller must be a JSON object")
     restored = EvaluationConvergenceController.from_dict(payload)
@@ -1726,9 +1721,7 @@ def restore_convergence_controller(
         stored = getattr(restored, attribute)
         requested = getattr(args, attribute)
         if option in provided and requested != stored:
-            conflicts.append(
-                f"{option}=requested:{requested!r}/checkpoint:{stored!r}"
-            )
+            conflicts.append(f"{option}=requested:{requested!r}/checkpoint:{stored!r}")
         elif option not in provided:
             setattr(args, attribute, stored)
     if conflicts:
@@ -1919,7 +1912,7 @@ def _new_agent(
     game_config: GameConfig,
     train_env: SnakeGameEnv,
 ) -> DQNAgent:
-    initial_channels = 3 if args.network_version == 1 else None
+    initial_channels = {1: 3, 2: 17, 3: V3_OBSERVATION_CHANNELS}[args.network_version]
     initial_state = flatten_observation(
         train_env, device="cpu", expected_channels=initial_channels
     )
@@ -1928,40 +1921,75 @@ def _new_agent(
         state_dim=int(np.prod(obs_shape)),
         action_dim=len(RelativeAction) if args.network_version >= 3 else len(Action),
         hidden_sizes=tuple(args.hidden),
-        lr=args.lr,
-        gamma=args.gamma,
-        batch_size=args.batch_size,
-        replay_capacity=args.replay_capacity,
-        min_replay_size=args.min_replay,
-        target_update_interval=args.target_update,
-        target_update_tau=args.target_update_tau,
-        hard_update_interval=args.hard_update_interval,
-        use_double_dqn=not args.disable_double_dqn,
         use_dueling=not args.disable_dueling,
-        epsilon_start=args.epsilon_start,
-        epsilon_final=args.epsilon_final,
-        epsilon_decay_steps=args.epsilon_decay_steps,
-        n_step=args.n_step,
-        per_alpha=args.per_alpha,
-        per_beta_start=args.per_beta_start,
-        per_beta_frames=args.per_beta_frames,
         device=args.device,
         game_config=game_config,
         obs_shape=obs_shape,
         network_version=args.network_version,
-        amp_enabled=False if args.disable_amp else None,
-        policy_anchor_weight=args.policy_anchor_weight,
-        teacher_replay_steps=args.teacher_replay_steps,
-        demonstration_capacity=args.demonstration_capacity,
-        demonstration_batch_fraction=args.demonstration_batch_fraction,
-        elite_demonstration_batch_fraction=args.elite_demonstration_batch_fraction,
-        demonstration_min_score=args.demonstration_min_score,
-        demonstration_min_return=args.demonstration_min_return,
-        demonstration_elite_score=args.demonstration_elite_score,
-        demonstration_elite_return=args.demonstration_elite_return,
-        imitation_loss_weight=args.imitation_loss_weight,
-        imitation_margin=args.imitation_margin,
+        **_agent_training_options(args),
     )
+
+
+def _agent_training_options(args: argparse.Namespace) -> dict[str, Any]:
+    """Return fresh-run controls that policy transfer may safely override."""
+    return {
+        "lr": args.lr,
+        "gamma": args.gamma,
+        "batch_size": args.batch_size,
+        "replay_capacity": args.replay_capacity,
+        "min_replay_size": args.min_replay,
+        "target_update_interval": args.target_update,
+        "target_update_tau": args.target_update_tau,
+        "hard_update_interval": args.hard_update_interval,
+        "use_double_dqn": not args.disable_double_dqn,
+        "epsilon_start": args.epsilon_start,
+        "epsilon_final": args.epsilon_final,
+        "epsilon_decay_steps": args.epsilon_decay_steps,
+        "n_step": args.n_step,
+        "per_alpha": args.per_alpha,
+        "per_beta_start": args.per_beta_start,
+        "per_beta_frames": args.per_beta_frames,
+        "amp_enabled": False if args.disable_amp else None,
+        "policy_anchor_weight": args.policy_anchor_weight,
+        "teacher_replay_steps": args.teacher_replay_steps,
+        "demonstration_capacity": args.demonstration_capacity,
+        "demonstration_batch_fraction": args.demonstration_batch_fraction,
+        "elite_demonstration_batch_fraction": args.elite_demonstration_batch_fraction,
+        "demonstration_min_score": args.demonstration_min_score,
+        "demonstration_min_return": args.demonstration_min_return,
+        "demonstration_elite_score": args.demonstration_elite_score,
+        "demonstration_elite_return": args.demonstration_elite_return,
+        "imitation_loss_weight": args.imitation_loss_weight,
+        "imitation_margin": args.imitation_margin,
+    }
+
+
+def _adopt_or_validate_warm_start_structure(
+    args: argparse.Namespace, agent: DQNAgent
+) -> None:
+    """Make implicit structure truthful and reject explicit source conflicts."""
+    provided = set(getattr(args, "_provided_options", ()))
+    checks: dict[str, tuple[Any, Any]] = {
+        "--network-version": (args.network_version, agent.network_version),
+        "--hidden": (tuple(args.hidden), tuple(agent.hidden_sizes)),
+        "--disable-dueling": (not args.disable_dueling, agent.use_dueling),
+    }
+    conflicts = {
+        option: values
+        for option, values in checks.items()
+        if option in provided and values[0] != values[1]
+    }
+    if conflicts:
+        raise RuntimeError(
+            "Explicit warm-start network options conflict with the authenticated source: "
+            + ", ".join(
+                f"{option}=requested:{values[0]!r}/source:{values[1]!r}"
+                for option, values in conflicts.items()
+            )
+        )
+    args.network_version = agent.network_version
+    args.hidden = list(agent.hidden_sizes)
+    args.disable_dueling = not agent.use_dueling
 
 
 def _prepare_fresh_outputs(args: argparse.Namespace, resume_path: Path | None) -> None:
@@ -2047,7 +2075,10 @@ def _train(args: argparse.Namespace) -> None:
     resume_path = _resume_path(args)
     output_path = Path(args.output)
     latest_path = Path(args.latest_output)
-    if resume_path is None:
+    if resume_path is None and (
+        not args.warm_start_from
+        or "--network-version" in set(getattr(args, "_provided_options", ()))
+    ):
         _validate_output_network_identity(
             args.network_version, output_path, latest_path
         )
@@ -2061,7 +2092,11 @@ def _train(args: argparse.Namespace) -> None:
             args.regression_stop_patience > 0,
         )
     )
-    if resume_path is None and not args.warm_start_from and conservative_options_enabled:
+    if (
+        resume_path is None
+        and not args.warm_start_from
+        and conservative_options_enabled
+    ):
         raise RuntimeError(
             "Policy anchoring, teacher/demonstration replay, imitation learning, and "
             "paired evaluation guards require "
@@ -2079,7 +2114,9 @@ def _train(args: argparse.Namespace) -> None:
         metadata = load_resume_metadata(
             resume_path, ignore_mismatch=args.ignore_resume_metadata
         )
-        agent = DQNAgent.load(str(resume_path), device=args.device)
+        agent = DQNAgent.restore_training_checkpoint(
+            str(resume_path), device=args.device
+        )
         validate_resume_identity(metadata, agent)
         validate_resume_seed(metadata, args)
         validate_resume_agent_options(args, agent)
@@ -2094,9 +2131,8 @@ def _train(args: argparse.Namespace) -> None:
         agent.configure_amp(False if args.disable_amp else None)
         agent.configure_replay_pin_memory()
         if (
-            (agent.policy_anchor_weight > 0 or agent.teacher_replay_steps > 0)
-            and not agent.policy_anchor_enabled
-        ):
+            agent.policy_anchor_weight > 0 or agent.teacher_replay_steps > 0
+        ) and not agent.policy_anchor_enabled:
             raise RuntimeError(
                 "Resume checkpoint requires a frozen policy anchor, but none was restored."
             )
@@ -2137,7 +2173,6 @@ def _train(args: argparse.Namespace) -> None:
             f"epsilon is {agent.epsilon:.3f}."
         )
     else:
-        agent = _new_agent(args, game_config, train_env)
         controller = _new_convergence_controller(args)
         if args.warm_start_from:
             source = Path(args.warm_start_from)
@@ -2148,23 +2183,57 @@ def _train(args: argparse.Namespace) -> None:
             ) = load_warm_start_metadata(
                 source, ignore_mismatch=args.ignore_warm_start_metadata
             )
-            embedded_metadata = agent.load_policy_weights(
-                str(source), expected_sha256=source_checkpoint_sha256
+            agent = DQNAgent.from_policy_checkpoint(
+                str(source),
+                target_game_config=game_config,
+                device=args.device,
+                expected_sha256=source_checkpoint_sha256,
+                agent_options=_agent_training_options(args),
+            )
+            DQNAgent.validate_policy_sidecar_identity(
+                source_metadata, agent.policy_transfer_provenance or {}
+            )
+            _adopt_or_validate_warm_start_structure(args, agent)
+            validate_v3_contract(agent)
+            _validate_output_network_identity(
+                agent.network_version, output_path, latest_path
             )
             if agent.policy_anchor_weight > 0 or agent.teacher_replay_steps > 0:
                 agent.snapshot_policy_anchor()
-            embedded_obs_shape = embedded_metadata.get("obs_shape")
-            warm_start_provenance = {
-                "source_path": str(source.resolve()),
-                "checkpoint_sha256": source_checkpoint_sha256,
-                "sidecar_role": source_metadata.get("checkpoint_role"),
-                "sidecar_episode": source_metadata.get("episodes_completed"),
-                "embedded_network_version": embedded_metadata.get("network_version"),
-                "embedded_obs_shape": (
-                    list(embedded_obs_shape) if embedded_obs_shape is not None else None
-                ),
-                "source_sidecar_verified": source_sidecar_verified,
-            }
+            warm_start_provenance = dict(agent.policy_transfer_provenance or {})
+            if (
+                warm_start_provenance.get("cross_map")
+                and source_metadata.get("checkpoint_role") != "best_eval"
+            ):
+                message = (
+                    "Cross-map warm start requires an authenticated best_eval source "
+                    "sidecar by default."
+                )
+                if not args.ignore_warm_start_metadata:
+                    raise RuntimeError(
+                        message
+                        + " Use --ignore-warm-start-metadata only for an intentional "
+                        "legacy/non-best transfer."
+                    )
+                print(
+                    "Warning:",
+                    message,
+                    "Proceeding because --ignore-warm-start-metadata was supplied.",
+                )
+            warm_start_provenance.update(
+                {
+                    "sidecar_role": source_metadata.get("checkpoint_role"),
+                    "sidecar_episode": source_metadata.get("episodes_completed"),
+                    "source_sidecar_role": source_metadata.get("checkpoint_role"),
+                    "source_sidecar_episode": source_metadata.get("episodes_completed"),
+                    "source_sidecar_verified": source_sidecar_verified,
+                    "source_sidecar_path": str(sidecar_path(source).resolve()),
+                    "source_sidecar_checkpoint_sha256": source_metadata.get(
+                        "checkpoint_sha256"
+                    ),
+                }
+            )
+            agent.policy_transfer_provenance = warm_start_provenance
             # Preserve existing destinations until source authentication and policy
             # compatibility have both succeeded.
             _prepare_fresh_outputs(args, None)
@@ -2173,6 +2242,8 @@ def _train(args: argparse.Namespace) -> None:
                 "synchronized from that policy, while optimizer, scaler, replay, "
                 "epsilon, counters, seeds, best identity, and outputs are fresh."
             )
+        else:
+            agent = _new_agent(args, game_config, train_env)
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -2328,17 +2399,11 @@ def _train(args: argparse.Namespace) -> None:
             "eval_expansion_stage": 1,
             "eval_planned_looks": len(eval_plan),
             "eval_statistical_method": (
-                "paired_normal_bonferroni_v1"
-                if args.require_paired_promotion
-                else None
+                "paired_normal_bonferroni_v1" if args.require_paired_promotion else None
             ),
-            "eval_family_confidence": (
-                0.95 if args.require_paired_promotion else None
-            ),
+            "eval_family_confidence": (0.95 if args.require_paired_promotion else None),
             "eval_look_confidence": (
-                1.0 - 0.05 / len(eval_plan)
-                if args.require_paired_promotion
-                else None
+                1.0 - 0.05 / len(eval_plan) if args.require_paired_promotion else None
             ),
             "eval_statistical_state": controller_decision["statistical_state"],
             "eval_patience_deferred": controller_decision["patience_deferred"],
@@ -2349,9 +2414,7 @@ def _train(args: argparse.Namespace) -> None:
         baseline_record["eval_terminal_events"] = baseline["terminal_events"]
         baseline_record["eval_truncated_count"] = baseline["truncated_count"]
         baseline_record["eval_seeds"] = baseline.get("seeds", eval_seeds)
-        baseline_record["eval_reward_samples"] = evaluation_samples(
-            baseline, "reward"
-        )
+        baseline_record["eval_reward_samples"] = evaluation_samples(baseline, "reward")
         baseline_record["eval_score_samples"] = baseline_score_samples
         baseline_record["eval_step_samples"] = evaluation_samples(baseline, "step")
         with log_path.open("a", encoding="utf-8") as stream:
@@ -2505,9 +2568,7 @@ def _train(args: argparse.Namespace) -> None:
                     slot.active = False
 
         collection_seconds = max(time.perf_counter() - collection_started, 1e-12)
-        teacher_replay_complete = (
-            len(agent.replay_buffer) >= agent.teacher_replay_steps
-        )
+        teacher_replay_complete = len(agent.replay_buffer) >= agent.teacher_replay_steps
         if not teacher_replay_complete:
             update_attempts = 0
         elif args.updates_per_collection > 0:
@@ -2623,7 +2684,8 @@ def _train(args: argparse.Namespace) -> None:
                     max_episodes=eval_max_episodes,
                     growth_factor=args.adaptive_eval_growth_factor,
                     adaptive_enabled=(
-                        teacher_replay_complete and eval_max_episodes > args.eval_episodes
+                        teacher_replay_complete
+                        and eval_max_episodes > args.eval_episodes
                     ),
                 )
             else:
@@ -2650,9 +2712,7 @@ def _train(args: argparse.Namespace) -> None:
             metrics["eval_truncated_count"] = evaluation["truncated_count"]
             score_samples = evaluation_samples(evaluation, "score")
             metrics["eval_seeds"] = evaluation.get("seeds", eval_seeds)
-            metrics["eval_reward_samples"] = evaluation_samples(
-                evaluation, "reward"
-            )
+            metrics["eval_reward_samples"] = evaluation_samples(evaluation, "reward")
             metrics["eval_score_samples"] = score_samples
             metrics["eval_step_samples"] = evaluation_samples(evaluation, "step")
             metrics["eval_episodes_actual"] = adaptive_metadata["actual_episodes"]
@@ -2661,15 +2721,9 @@ def _train(args: argparse.Namespace) -> None:
             metrics["eval_expansion_stage"] = adaptive_metadata["expansion_stage"]
             metrics["eval_planned_looks"] = adaptive_metadata["planned_looks"]
             metrics["eval_adaptive_stages"] = adaptive_metadata["stages"]
-            metrics["eval_statistical_method"] = adaptive_metadata[
-                "statistical_method"
-            ]
-            metrics["eval_family_confidence"] = adaptive_metadata[
-                "family_confidence"
-            ]
-            metrics["eval_look_confidence"] = adaptive_metadata[
-                "look_confidence"
-            ]
+            metrics["eval_statistical_method"] = adaptive_metadata["statistical_method"]
+            metrics["eval_family_confidence"] = adaptive_metadata["family_confidence"]
+            metrics["eval_look_confidence"] = adaptive_metadata["look_confidence"]
             average_score = float(evaluation["score"]["mean"])
             previous_best = best_eval_score
             had_paired_reference = controller.reference_scores is not None
@@ -2682,12 +2736,8 @@ def _train(args: argparse.Namespace) -> None:
                 ),
                 planned_looks=int(adaptive_metadata["planned_looks"]),
             )
-            metrics["eval_statistical_state"] = controller_decision[
-                "statistical_state"
-            ]
-            metrics["eval_patience_deferred"] = controller_decision[
-                "patience_deferred"
-            ]
+            metrics["eval_statistical_state"] = controller_decision["statistical_state"]
+            metrics["eval_patience_deferred"] = controller_decision["patience_deferred"]
             improved = teacher_replay_complete and (
                 (
                     not had_paired_reference
@@ -2723,7 +2773,10 @@ def _train(args: argparse.Namespace) -> None:
             if improved:
                 best_eval_score = average_score
                 best_eval_episode = episodes_completed
-                if controller.require_paired_promotion and len(score_samples) != eval_max_episodes:
+                if (
+                    controller.require_paired_promotion
+                    and len(score_samples) != eval_max_episodes
+                ):
                     raise RuntimeError(
                         "Paired promotion requires a complete maximum-sized reference"
                     )

@@ -162,13 +162,18 @@ v1/v2；由于旧 paired CI 可能已让 inconclusive 错误消耗耐心，迁�
 
 普通 `--resume-from` 用于延续同一训练身份，因此必须保留 checkpoint 绑定的网络、optimizer、
 batch、replay 和环境契约。课程训练或吞吐基准需要改变地图、batch、学习率或 replay 时，应改用
-`--warm-start-from SOURCE.pt`：新 agent 先按当前 CLI 完整创建，再只加载 source 的 policy 权重并
-重新同步 target。optimizer、AMP scaler、replay、n-step、epsilon、计数、seed 流与 best 阈值均从
+`--warm-start-from SOURCE.pt`：`DQNAgent.from_policy_checkpoint(...)` 从一次性读取并可选 SHA-256
+认证的 source 字节快照直接构造目标地图 agent；网络结构继承 source，目标 `GameConfig`/`obs_shape`
+来自新地图，并只加载 policy 权重、重新同步 target。optimizer、AMP scaler、replay、n-step、epsilon、计数、seed 流与 best 阈值均从
 零开始，旧训练的退化状态不会冒充新阶段的可恢复进度。
 
 迁移前默认校验 source sidecar 与 checkpoint SHA-256；新输出不得覆盖 source。v3 的 3x3 adaptive
-pool 允许观测高宽变化，但 network version、action dimension、观测通道、hidden sizes 以及每个
-state-dict tensor 的 key/shape/dtype 必须完全兼容。新 latest/best sidecar 保存 warm-start provenance，
+pool 允许观测高宽变化，但跨图会严格校验已知 network version、relative-action schema、20-channel
+observation schema、hidden sizes 以及每个 state-dict tensor 的 key/shape/dtype；未知/未来 version
+fail closed。same-map policy-only factory 仍按 checkpoint 实际 action/obs 形状兼容 v1/v2。
+新 checkpoint 与 latest/best sidecar 保存 source/target map、`cross_map`、source sidecar role/SHA 及 warm-start provenance。
+跨图训练默认要求 SHA 匹配且 role 为 `best_eval` 的 source sidecar；只有显式
+`--ignore-warm-start-metadata` 才允许 intentional legacy/non-best 例外并输出警告。
 后续普通 resume 继续携带该来源。`--ignore-warm-start-metadata` 只为人工确认过的 legacy source
 提供显式逃生口，不放宽权重结构检查。
 
@@ -212,7 +217,51 @@ success 门槛的轨迹晋升为 tier 1，同时超过更高 score/return 门槛
 checkpoint 不保存两个大 replay；完整 resume 会从冻结 teacher 重新采集并重建 demo，所有门槛、batch
 占比、imitation 参数及累计晋升计数仍进入 checkpoint/sidecar 供身份校验与审计。
 
-从服务器 `stable_v3_latest` 开始的新 adaptive paired 推荐命令：
+从 immutable `stable_v5_best` 迁移到 10x10 的新推荐命令：
+
+```bash
+mkdir -p runs/stable_v6_transfer_10x10
+nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
+  --episodes 50000 --seed 20260809 \
+  --warm-start-from models/dqn_snake_8x8_stable_v5_best.pt \
+  --width 10 --height 10 --initial-length 3 --max-steps 0 \
+  --reward-step -0.003 --reward-food 5 --reward-death -5 \
+  --reward-shaping-scale 1 --max-idle-steps 90 \
+  --idle-growth-per-food 2 --idle-penalty -5 \
+  --network-version 3 --hidden 256 256 \
+  --gamma 0.99 --n-step 3 --per-alpha 0.6 \
+  --per-beta-start 0.4 --per-beta-frames 500000 \
+  --target-update 5000 --target-update-tau 0.005 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
+  --batch-size 512 --min-replay 50000 --replay-capacity 100000 \
+  --policy-anchor-weight 0.20 --teacher-replay-steps 50000 \
+  --demonstration-capacity 20000 --demonstration-batch-fraction 0.20 \
+  --elite-demonstration-batch-fraction 0.05 \
+  --demonstration-min-score 4 --demonstration-min-return 10 \
+  --demonstration-elite-score 7 --demonstration-elite-return 25 \
+  --imitation-loss-weight 0.15 --imitation-margin 0.8 \
+  --lr 0.0000015625 --lr-plateau-patience 4 \
+  --lr-plateau-factor 0.5 --lr-plateau-min 0.00000009765625 \
+  --early-stop-patience 8 --early-stop-delta 0.10 \
+  --require-paired-promotion --paired-promotion-min-delta 0.10 \
+  --regression-stop-patience 3 --regression-stop-delta 0.20 \
+  --epsilon-start 0.05 --epsilon-final 0.01 --epsilon-decay-steps 1000000 \
+  --eval-interval 400 --eval-episodes 100 \
+  --adaptive-eval-max-episodes 600 --adaptive-eval-growth-factor 2 \
+  --eval-seed-base 900000 --checkpoint-interval 400 \
+  --device cuda --allow-nondeterministic \
+  --output models/dqn_snake_10x10_stable_v6_transfer_best.pt \
+  --latest-output models/dqn_snake_10x10_stable_v6_transfer_latest.pt \
+  --log-dir runs/stable_v6_transfer_10x10 \
+  > runs/stable_v6_transfer_10x10/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+这条命令使用 adaptive paired base=100、max=600、growth=2 与未被 v5 使用的新 seed base=900000，
+并使用全新的 stable_v6 目标，不会覆盖 v4/v5 artifact。相对 v5 的 8x8 微调，它提高探索率和
+update ratio、降低 anchor 强度，并下调 demonstration 门槛以适应 10x10 初期较低的 score 分布；
+源应为 SHA-256 sidecar 已验证且角色为 `best_eval` 的 immutable v5 best。
+
+历史 `stable_v3_latest` 8x8 adaptive 命令：
 
 ```bash
 mkdir -p runs/stable_v4_adaptive_8x8

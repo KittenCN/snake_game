@@ -53,23 +53,42 @@ from train_dqn import (
         ["--teacher-replay-steps", "-1"],
         ["--teacher-replay-steps", "101", "--replay-capacity", "100"],
         [
-            "--batch-size", "2", "--demonstration-capacity", "8",
-            "--demonstration-batch-fraction", "0.1",
+            "--batch-size",
+            "2",
+            "--demonstration-capacity",
+            "8",
+            "--demonstration-batch-fraction",
+            "0.1",
         ],
         [
-            "--batch-size", "2", "--demonstration-capacity", "8",
-            "--demonstration-batch-fraction", "0.75",
+            "--batch-size",
+            "2",
+            "--demonstration-capacity",
+            "8",
+            "--demonstration-batch-fraction",
+            "0.75",
         ],
         [
-            "--batch-size", "2", "--demonstration-capacity", "8",
-            "--demonstration-batch-fraction", "0.5",
-            "--elite-demonstration-batch-fraction", "0.1",
+            "--batch-size",
+            "2",
+            "--demonstration-capacity",
+            "8",
+            "--demonstration-batch-fraction",
+            "0.5",
+            "--elite-demonstration-batch-fraction",
+            "0.1",
         ],
         ["--paired-promotion-min-delta", "-0.1"],
         ["--regression-stop-patience", "-1"],
         ["--regression-stop-delta", "-0.1"],
         ["--adaptive-eval-max-episodes", "-1"],
-        ["--eval-episodes", "4", "--adaptive-eval-max-episodes", "2", "--require-paired-promotion"],
+        [
+            "--eval-episodes",
+            "4",
+            "--adaptive-eval-max-episodes",
+            "2",
+            "--require-paired-promotion",
+        ],
         ["--adaptive-eval-max-episodes", "8"],
         ["--adaptive-eval-growth-factor", "1"],
         ["--adaptive-eval-growth-factor", "nan"],
@@ -257,8 +276,15 @@ def _evaluation_payload(seeds: list[int], score: float) -> dict[str, object]:
     count = len(seeds)
     samples = [score] * count
     distribution = {
-        "mean": score, "std": 0.0, "ci95_low": score, "ci95_high": score,
-        "median": score, "p10": score, "p90": score, "min": score, "max": score,
+        "mean": score,
+        "std": 0.0,
+        "ci95_low": score,
+        "ci95_high": score,
+        "median": score,
+        "p10": score,
+        "p90": score,
+        "min": score,
+        "max": score,
     }
     return {
         "reward": dict(distribution),
@@ -285,7 +311,11 @@ def test_adaptive_paired_evaluation_uses_disjoint_chunks_and_full_promotion(
 ) -> None:
     agent = make_agent(GameConfig(width=5, height=5))
     controller = EvaluationConvergenceController(
-        2, 0.5, 0.001, 2, 0.25,
+        2,
+        0.5,
+        0.001,
+        2,
+        0.25,
         require_paired_promotion=True,
         paired_promotion_min_delta=0.1,
         reference_score=0.0,
@@ -365,9 +395,16 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     checkpoint = tmp_path / "latest.pt"
     args = parse_args(
         [
-            "--width", "5", "--height", "5", "--max-steps", "2",
-            "--output", str(tmp_path / "best.pt"),
-            "--latest-output", str(checkpoint),
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "2",
+            "--output",
+            str(tmp_path / "best.pt"),
+            "--latest-output",
+            str(checkpoint),
         ]
     )
     save_checkpoint(
@@ -385,9 +422,12 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     loaded_agent = DQNAgent.load(str(checkpoint), device="cpu")
     resume_args = parse_args(
         [
-            "--resume-from", str(checkpoint),
-            "--output", str(tmp_path / "best.pt"),
-            "--latest-output", str(checkpoint),
+            "--resume-from",
+            str(checkpoint),
+            "--output",
+            str(tmp_path / "best.pt"),
+            "--latest-output",
+            str(checkpoint),
         ]
     )
     restored = restore_convergence_controller(
@@ -406,9 +446,12 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     ]
     corrupted_args = parse_args(
         [
-            "--resume-from", str(checkpoint),
-            "--output", str(tmp_path / "best.pt"),
-            "--latest-output", str(checkpoint),
+            "--resume-from",
+            str(checkpoint),
+            "--output",
+            str(tmp_path / "best.pt"),
+            "--latest-output",
+            str(checkpoint),
         ]
     )
     with pytest.raises(RuntimeError, match="reference cache length"):
@@ -425,9 +468,12 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     ] * 8
     wrong_mean_args = parse_args(
         [
-            "--resume-from", str(checkpoint),
-            "--output", str(tmp_path / "best.pt"),
-            "--latest-output", str(checkpoint),
+            "--resume-from",
+            str(checkpoint),
+            "--output",
+            str(tmp_path / "best.pt"),
+            "--latest-output",
+            str(checkpoint),
         ]
     )
     with pytest.raises(RuntimeError, match="sample mean"):
@@ -439,19 +485,19 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
         )
 
     reset_metadata = json.loads(json.dumps(metadata))
-    reset_metadata["convergence_controller"]["config"][
-        "adaptive_eval_max_episodes"
-    ] = 0
-    reset_metadata["convergence_controller"]["state"]["reference_scores"] = [
-        3.0
-    ] * 50
+    reset_metadata["convergence_controller"]["config"]["adaptive_eval_max_episodes"] = 0
+    reset_metadata["convergence_controller"]["state"]["reference_scores"] = [3.0] * 50
     reset_args = parse_args(
         [
-            "--resume-from", str(checkpoint),
+            "--resume-from",
+            str(checkpoint),
             "--reset-best-evaluation",
-            "--eval-episodes", "60",
-            "--output", str(tmp_path / "best.pt"),
-            "--latest-output", str(checkpoint),
+            "--eval-episodes",
+            "60",
+            "--output",
+            str(tmp_path / "best.pt"),
+            "--latest-output",
+            str(checkpoint),
         ]
     )
     reset_controller = restore_convergence_controller(
@@ -466,10 +512,14 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
 
     conflict_args = parse_args(
         [
-            "--resume-from", str(checkpoint),
-            "--lr-plateau-factor", "0.25",
-            "--output", str(tmp_path / "best.pt"),
-            "--latest-output", str(checkpoint),
+            "--resume-from",
+            str(checkpoint),
+            "--lr-plateau-factor",
+            "0.25",
+            "--output",
+            str(tmp_path / "best.pt"),
+            "--latest-output",
+            str(checkpoint),
         ]
     )
     with pytest.raises(RuntimeError, match="scheduler/early-stop options conflict"):
@@ -548,7 +598,9 @@ def test_train_releases_accelerator_after_interrupt(
 ) -> None:
     calls: list[object] = []
     device = torch.device("cuda")
-    monkeypatch.setattr(DQNAgent, "_resolve_device", staticmethod(lambda _value: device))
+    monkeypatch.setattr(
+        DQNAgent, "_resolve_device", staticmethod(lambda _value: device)
+    )
 
     def interrupt(_args: object) -> None:
         calls.append("train")
@@ -571,8 +623,14 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def save_source_checkpoint(path: Path, *, episode: int = 17) -> DQNAgent:
-    config = GameConfig(width=5, height=5, max_episode_steps=2)
+def save_source_checkpoint(
+    path: Path,
+    *,
+    episode: int = 17,
+    config: GameConfig | None = None,
+    checkpoint_role: str = "latest",
+) -> DQNAgent:
+    config = config or GameConfig(width=5, height=5, max_episode_steps=2)
     agent = make_agent(config)
     agent.behavior_steps = 321
     agent.learn_step_counter = 45
@@ -580,11 +638,11 @@ def save_source_checkpoint(path: Path, *, episode: int = 17) -> DQNAgent:
     args = parse_args(
         [
             "--width",
-            "5",
+            str(config.width),
             "--height",
-            "5",
+            str(config.height),
             "--max-steps",
-            "2",
+            str(config.max_episode_steps),
             "--hidden",
             "16",
             "--output",
@@ -601,7 +659,7 @@ def save_source_checkpoint(path: Path, *, episode: int = 17) -> DQNAgent:
         best_eval_score=None,
         best_eval_episode=None,
         train_args=args,
-        checkpoint_role="latest",
+        checkpoint_role=checkpoint_role,
         episodes_started=episode,
     )
     return agent
@@ -657,9 +715,12 @@ def test_resume_source_cannot_be_the_best_output(
     with pytest.raises(SystemExit):
         parse_args(
             [
-                "--resume-from", str(source),
-                "--output", str(source),
-                "--latest-output", str(tmp_path / "latest.pt"),
+                "--resume-from",
+                str(source),
+                "--output",
+                str(source),
+                "--latest-output",
+                str(tmp_path / "latest.pt"),
             ]
         )
     assert "immutable best" in capsys.readouterr().err
@@ -788,9 +849,7 @@ def test_fixed_seed_evaluation_is_repeatable() -> None:
     assert first == second
     assert first["seeds"] == [10, 11, 12]
     assert len(first["score_samples"]) == 3
-    assert first["score"]["mean"] == pytest.approx(
-        sum(first["score_samples"]) / 3
-    )
+    assert first["score"]["mean"] == pytest.approx(sum(first["score_samples"]) / 3)
 
 
 def test_fixed_evaluation_counts_environment_time_limit() -> None:
@@ -949,10 +1008,45 @@ def test_invalid_warm_start_never_deletes_existing_outputs(tmp_path: Path) -> No
             "--disable-amp",
         ]
     )
-    with pytest.raises(RuntimeError, match="incompatible policy checkpoint"):
+    with pytest.raises(
+        RuntimeError, match="Explicit warm-start network options conflict"
+    ):
         train(args)
     assert file_sha256(best) == best_hash
     assert file_sha256(latest) == latest_hash
+
+
+def test_cross_map_training_requires_best_eval_source_sidecar(tmp_path: Path) -> None:
+    source = tmp_path / "latest.pt"
+    save_source_checkpoint(source, checkpoint_role="latest")
+    args = parse_args(
+        [
+            "--episodes",
+            "1",
+            "--width",
+            "6",
+            "--height",
+            "6",
+            "--max-steps",
+            "1",
+            "--hidden",
+            "16",
+            "--warm-start-from",
+            str(source),
+            "--output",
+            str(tmp_path / "new-best.pt"),
+            "--latest-output",
+            str(tmp_path / "new-latest.pt"),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--device",
+            "cpu",
+            "--disable-amp",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="requires an authenticated best_eval"):
+        train(args)
 
 
 def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
@@ -960,7 +1054,11 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "source.pt"
-    save_source_checkpoint(source)
+    save_source_checkpoint(
+        source,
+        config=GameConfig(width=8, height=8, max_episode_steps=2),
+        checkpoint_role="best_eval",
+    )
     source_sidecar = source.with_suffix(".meta.json")
     source_hash = file_sha256(source)
     source_sidecar_hash = file_sha256(source_sidecar)
@@ -975,9 +1073,9 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
             "--episodes",
             "2",
             "--width",
-            "6",
+            "10",
             "--height",
-            "7",
+            "10",
             "--max-steps",
             "2",
             "--eval-interval",
@@ -1013,7 +1111,9 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
     original_evaluate = training_module.evaluate_agent
     baseline_calls: list[tuple[int, int]] = []
 
-    def checked_evaluate(*call_args: object, **call_kwargs: object) -> dict[str, object]:
+    def checked_evaluate(
+        *call_args: object, **call_kwargs: object
+    ) -> dict[str, object]:
         evaluated_agent = call_args[0]
         assert isinstance(evaluated_agent, DQNAgent)
         baseline_calls.append(
@@ -1035,16 +1135,24 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
     assert metadata["learn_step_counter"] == 0
     assert metadata["effective_agent_config"]["batch_size"] == 2
     assert metadata["effective_agent_config"]["lr"] == [0.003]
-    assert metadata["obs_shape"] == [20, 7, 6]
-    assert provenance == {
-        "source_path": str(source.resolve()),
-        "checkpoint_sha256": source_hash,
-        "sidecar_role": "latest",
-        "sidecar_episode": 17,
-        "embedded_network_version": 3,
-        "embedded_obs_shape": [20, 5, 5],
-        "source_sidecar_verified": True,
-    }
+    assert metadata["obs_shape"] == [20, 10, 10]
+    assert provenance["source_path"] == str(source.resolve())
+    assert provenance["checkpoint_sha256"] == source_hash
+    assert provenance["sidecar_role"] == "best_eval"
+    assert provenance["sidecar_episode"] == 17
+    assert provenance["source_sidecar_role"] == "best_eval"
+    assert provenance["source_sidecar_episode"] == 17
+    assert provenance["source_network_version"] == 3
+    assert provenance["source_obs_shape"] == [20, 8, 8]
+    assert provenance["target_obs_shape"] == [20, 10, 10]
+    assert provenance["source_map"] == {"width": 8, "height": 8}
+    assert provenance["target_map"] == {"width": 10, "height": 10}
+    assert provenance["cross_map"] is True
+    assert provenance["source_sidecar_verified"] is True
+    assert provenance["optimizer_restored"] is False
+    assert provenance["replay_restored"] is False
+    assert provenance["rng_restored"] is False
+    assert metadata["policy_transfer_provenance"] == provenance
     log_path = next(logs.glob("train_log_*.jsonl"))
     records = [json.loads(line) for line in log_path.read_text("utf-8").splitlines()]
     run_start = next(
@@ -1062,16 +1170,20 @@ def test_warm_start_is_fresh_cross_map_training_and_resume_keeps_provenance(
     assert baseline["eval_score_mean"] == metadata["best_eval_score"]
     assert baseline["convergence_decision"]["significant_improvement"] is True
     assert baseline["current_learning_rates"] == [0.003]
-    assert all(record.get("episode") != 0 for record in records if record["record_type"] == "episode")
+    assert all(
+        record.get("episode") != 0
+        for record in records
+        if record["record_type"] == "episode"
+    )
 
     resume_args = parse_args(
         [
             "--episodes",
             "1",
             "--width",
-            "6",
+            "10",
             "--height",
-            "7",
+            "10",
             "--max-steps",
             "2",
             "--eval-interval",
@@ -1137,16 +1249,49 @@ def test_warm_start_baseline_survives_regression_and_min_lr_stops_training(
     monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
     args = parse_args(
         [
-            "--episodes", "10", "--width", "5", "--height", "5",
-            "--max-steps", "1", "--eval-interval", "1", "--eval-episodes", "1",
-            "--checkpoint-interval", "1", "--batch-size", "2", "--min-replay", "32",
-            "--replay-capacity", "64", "--hidden", "16",
-            "--lr-plateau-patience", "1", "--lr-plateau-factor", "0.5",
-            "--lr-plateau-min", "0.0001", "--early-stop-patience", "1",
-            "--early-stop-delta", "1.0",
-            "--warm-start-from", str(source), "--output", str(best),
-            "--latest-output", str(latest), "--log-dir", str(tmp_path / "logs"),
-            "--device", "cpu", "--disable-amp",
+            "--episodes",
+            "10",
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "1",
+            "--eval-interval",
+            "1",
+            "--eval-episodes",
+            "1",
+            "--checkpoint-interval",
+            "1",
+            "--batch-size",
+            "2",
+            "--min-replay",
+            "32",
+            "--replay-capacity",
+            "64",
+            "--hidden",
+            "16",
+            "--lr-plateau-patience",
+            "1",
+            "--lr-plateau-factor",
+            "0.5",
+            "--lr-plateau-min",
+            "0.0001",
+            "--early-stop-patience",
+            "1",
+            "--early-stop-delta",
+            "1.0",
+            "--warm-start-from",
+            str(source),
+            "--output",
+            str(best),
+            "--latest-output",
+            str(latest),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--device",
+            "cpu",
+            "--disable-amp",
         ]
     )
 
@@ -1189,15 +1334,46 @@ def test_adaptive_warm_start_promotion_and_resume_keep_full_reference(
 
     monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
     common = [
-        "--width", "5", "--height", "5", "--max-steps", "1",
-        "--eval-interval", "1", "--eval-episodes", "2",
-        "--eval-seed-base", "300000", "--adaptive-eval-max-episodes", "6",
-        "--adaptive-eval-growth-factor", "2", "--checkpoint-interval", "1",
-        "--batch-size", "2", "--min-replay", "32", "--replay-capacity", "64",
-        "--hidden", "16", "--require-paired-promotion",
-        "--paired-promotion-min-delta", "0.1", "--early-stop-delta", "0.25",
-        "--output", str(best), "--latest-output", str(latest),
-        "--log-dir", str(logs), "--device", "cpu", "--disable-amp",
+        "--width",
+        "5",
+        "--height",
+        "5",
+        "--max-steps",
+        "1",
+        "--eval-interval",
+        "1",
+        "--eval-episodes",
+        "2",
+        "--eval-seed-base",
+        "300000",
+        "--adaptive-eval-max-episodes",
+        "6",
+        "--adaptive-eval-growth-factor",
+        "2",
+        "--checkpoint-interval",
+        "1",
+        "--batch-size",
+        "2",
+        "--min-replay",
+        "32",
+        "--replay-capacity",
+        "64",
+        "--hidden",
+        "16",
+        "--require-paired-promotion",
+        "--paired-promotion-min-delta",
+        "0.1",
+        "--early-stop-delta",
+        "0.25",
+        "--output",
+        str(best),
+        "--latest-output",
+        str(latest),
+        "--log-dir",
+        str(logs),
+        "--device",
+        "cpu",
+        "--disable-amp",
     ]
     train(parse_args(["--episodes", "1", "--warm-start-from", str(source), *common]))
 
@@ -1231,13 +1407,41 @@ def test_adaptive_warm_start_promotion_and_resume_keep_full_reference(
 
     resume_args = parse_args(
         [
-            "--episodes", "1", "--width", "5", "--height", "5",
-            "--max-steps", "1", "--eval-interval", "1", "--eval-episodes", "2",
-            "--eval-seed-base", "300000", "--checkpoint-interval", "1",
-            "--batch-size", "2", "--min-replay", "32", "--replay-capacity", "64",
-            "--hidden", "16", "--resume-from", str(latest),
-            "--output", str(best), "--latest-output", str(latest),
-            "--log-dir", str(logs), "--device", "cpu", "--disable-amp",
+            "--episodes",
+            "1",
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "1",
+            "--eval-interval",
+            "1",
+            "--eval-episodes",
+            "2",
+            "--eval-seed-base",
+            "300000",
+            "--checkpoint-interval",
+            "1",
+            "--batch-size",
+            "2",
+            "--min-replay",
+            "32",
+            "--replay-capacity",
+            "64",
+            "--hidden",
+            "16",
+            "--resume-from",
+            str(latest),
+            "--output",
+            str(best),
+            "--latest-output",
+            str(latest),
+            "--log-dir",
+            str(logs),
+            "--device",
+            "cpu",
+            "--disable-amp",
         ]
     )
     train(resume_args)
@@ -1287,24 +1491,68 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
     monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
     args = parse_args(
         [
-            "--episodes", "10", "--width", "5", "--height", "5",
-            "--max-steps", "1", "--eval-interval", "1", "--eval-episodes", "4",
-            "--checkpoint-interval", "1", "--batch-size", "2", "--min-replay", "2",
-            "--replay-capacity", "64", "--hidden", "16",
-            "--policy-anchor-weight", "0.5", "--teacher-replay-steps", "2",
-            "--demonstration-capacity", "16",
-            "--demonstration-batch-fraction", "0.5",
-            "--elite-demonstration-batch-fraction", "0.5",
-            "--demonstration-min-score", "0",
-            "--demonstration-min-return", "-100",
-            "--demonstration-elite-score", "0",
-            "--demonstration-elite-return", "-100",
-            "--imitation-loss-weight", "0.5", "--imitation-margin", "0.8",
-            "--require-paired-promotion", "--paired-promotion-min-delta", "0.1",
-            "--regression-stop-patience", "2", "--regression-stop-delta", "0.1",
-            "--warm-start-from", str(source), "--output", str(best),
-            "--latest-output", str(latest), "--log-dir", str(tmp_path / "logs"),
-            "--device", "cpu", "--disable-amp",
+            "--episodes",
+            "10",
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "1",
+            "--eval-interval",
+            "1",
+            "--eval-episodes",
+            "4",
+            "--checkpoint-interval",
+            "1",
+            "--batch-size",
+            "2",
+            "--min-replay",
+            "2",
+            "--replay-capacity",
+            "64",
+            "--hidden",
+            "16",
+            "--policy-anchor-weight",
+            "0.5",
+            "--teacher-replay-steps",
+            "2",
+            "--demonstration-capacity",
+            "16",
+            "--demonstration-batch-fraction",
+            "0.5",
+            "--elite-demonstration-batch-fraction",
+            "0.5",
+            "--demonstration-min-score",
+            "0",
+            "--demonstration-min-return",
+            "-100",
+            "--demonstration-elite-score",
+            "0",
+            "--demonstration-elite-return",
+            "-100",
+            "--imitation-loss-weight",
+            "0.5",
+            "--imitation-margin",
+            "0.8",
+            "--require-paired-promotion",
+            "--paired-promotion-min-delta",
+            "0.1",
+            "--regression-stop-patience",
+            "2",
+            "--regression-stop-delta",
+            "0.1",
+            "--warm-start-from",
+            str(source),
+            "--output",
+            str(best),
+            "--latest-output",
+            str(latest),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--device",
+            "cpu",
+            "--disable-amp",
         ]
     )
 
@@ -1326,14 +1574,15 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
     assert latest_metadata["demonstration_replay_elite_count_at_save"] > 0
     assert latest_metadata["demonstration_trajectories_seen_lifetime"] > 0
     assert latest_metadata["demonstration_transitions_promoted_lifetime"] > 0
-    assert latest_metadata["convergence_controller"]["state"][
-        "regression_evaluations"
-    ] == 2
+    assert (
+        latest_metadata["convergence_controller"]["state"]["regression_evaluations"]
+        == 2
+    )
     records = [
         json.loads(line)
-        for line in next((tmp_path / "logs").glob("train_log_*.jsonl")).read_text(
-            "utf-8"
-        ).splitlines()
+        for line in next((tmp_path / "logs").glob("train_log_*.jsonl"))
+        .read_text("utf-8")
+        .splitlines()
     ]
     assert any(
         record.get("convergence_decision", {}).get("decision")
@@ -1360,14 +1609,16 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
         and record.get("collection_updates", 0) > 0
     ]
     assert learned_collections
-    assert all(record["avg_imitation_loss"] is not None for record in learned_collections)
+    assert all(
+        record["avg_imitation_loss"] is not None for record in learned_collections
+    )
     assert all(
         record["avg_demonstration_batch_fraction"] == pytest.approx(0.5)
         for record in learned_collections
     )
-    assert max(
-        record.get("demonstration_replay_elite_count", 0) for record in records
-    ) > 0
+    assert (
+        max(record.get("demonstration_replay_elite_count", 0) for record in records) > 0
+    )
 
 
 def test_short_training_creates_distinct_latest_and_best(tmp_path: Path) -> None:

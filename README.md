@@ -210,7 +210,52 @@ clear regression 可提前结束。多次 look 使用固定计划数的 `paired_
 ## 仅迁移网络权重
 
 当需要保留已学策略、同时更换地图尺寸、batch、学习率或 replay 配置时，使用
-`--warm-start-from`，不要使用普通 `--resume-from`：
+`--warm-start-from`，不要使用普通 `--resume-from`。训练器通过
+`DQNAgent.from_policy_checkpoint(...)` 从一次性读取的 checkpoint 字节快照构造目标地图 agent；
+网络结构继承 source，目标 `obs_shape`/`GameConfig` 由新地图决定，不恢复 optimizer、replay、AMP、
+计数或 RNG。跨图只接受具备明确 spatial-transfer 契约的 v3 relative-action/20-channel checkpoint；
+未知 network version、action/observation schema 冲突或 sidecar 身份冲突均会在创建输出前失败。
+
+从 immutable `stable_v5_best` 迁移到 10x10 的推荐命令（使用独立 stable_v6 输出，不覆盖 v4/v5）：
+
+```bash
+mkdir -p runs/stable_v6_transfer_10x10
+nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
+  --episodes 50000 --seed 20260809 \
+  --warm-start-from models/dqn_snake_8x8_stable_v5_best.pt \
+  --width 10 --height 10 --initial-length 3 --max-steps 0 \
+  --reward-step -0.003 --reward-food 5 --reward-death -5 \
+  --reward-shaping-scale 1 --max-idle-steps 90 \
+  --idle-growth-per-food 2 --idle-penalty -5 \
+  --network-version 3 --hidden 256 256 \
+  --gamma 0.99 --n-step 3 --per-alpha 0.6 \
+  --per-beta-start 0.4 --per-beta-frames 500000 \
+  --target-update 5000 --target-update-tau 0.005 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
+  --batch-size 512 --min-replay 50000 --replay-capacity 100000 \
+  --policy-anchor-weight 0.20 --teacher-replay-steps 50000 \
+  --demonstration-capacity 20000 --demonstration-batch-fraction 0.20 \
+  --elite-demonstration-batch-fraction 0.05 \
+  --demonstration-min-score 4 --demonstration-min-return 10 \
+  --demonstration-elite-score 7 --demonstration-elite-return 25 \
+  --imitation-loss-weight 0.15 --imitation-margin 0.8 \
+  --lr 0.0000015625 --lr-plateau-patience 4 \
+  --lr-plateau-factor 0.5 --lr-plateau-min 0.00000009765625 \
+  --early-stop-patience 8 --early-stop-delta 0.10 \
+  --require-paired-promotion --paired-promotion-min-delta 0.10 \
+  --regression-stop-patience 3 --regression-stop-delta 0.20 \
+  --epsilon-start 0.05 --epsilon-final 0.01 --epsilon-decay-steps 1000000 \
+  --eval-interval 400 --eval-episodes 100 \
+  --adaptive-eval-max-episodes 600 --adaptive-eval-growth-factor 2 \
+  --eval-seed-base 900000 --checkpoint-interval 400 \
+  --device cuda --allow-nondeterministic \
+  --output models/dqn_snake_10x10_stable_v6_transfer_best.pt \
+  --latest-output models/dqn_snake_10x10_stable_v6_transfer_latest.pt \
+  --log-dir runs/stable_v6_transfer_10x10 \
+  > runs/stable_v6_transfer_10x10/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+历史 8x8 adaptive 示例：
 
 ```bash
 mkdir -p runs/stable_v4_adaptive_8x8
@@ -266,8 +311,9 @@ optimizer、AMP scaler、replay、
 n-step 队列、epsilon、行为/学习计数、训练 seed 流以及 best 评估身份都从新配置重新开始。源
 checkpoint 默认必须带有 SHA-256 匹配的 sidecar，且源文件不能与新 best/latest 输出同名；
 `--ignore-warm-start-metadata` 只用于经过人工确认的旧 checkpoint。网络版本、动作空间、观测
-通道和隐藏层必须兼容，但 v3 网络允许地图高宽变化。新 sidecar 会持续记录迁移来源、SHA-256、
-源回合和源观测形状。每次 warm start 都会在任何训练环境 step 或梯度更新之前运行固定评估套件，
+通道和隐藏层必须兼容，但只有具备明确 schema 的 v3 网络允许地图高宽变化。新 checkpoint 与 sidecar
+会持续记录 source/target map、`cross_map`、SHA-256、sidecar role、源回合及源/目标观测形状；普通
+resume 会保留这些 provenance。每次 warm start 都会在任何训练环境 step 或梯度更新之前运行固定评估套件，
 写入 episode 0 的独立 JSONL evaluation，并原子保存全新的 episode-0 best/latest；源 checkpoint 与
 sidecar 保持字节不变，因此务必像上例一样使用唯一的新输出名。
 
@@ -291,6 +337,20 @@ python play_dqn.py `
   --model models/dqn_snake_v3_best.pt `
   --console --render --episodes 5 --seed 42
 ```
+
+推理也始终使用 policy-only factory，因此不会恢复训练 RNG/optimizer。显式跨到 10x10：
+
+```powershell
+python play_dqn.py `
+  --model models/dqn_snake_8x8_stable_v5_best.pt `
+  --width 10 --height 10 --console --episodes 5 --seed 42
+```
+
+跨图默认要求 SHA-256 匹配且 `checkpoint_role=best_eval` 的 sidecar；只有命令行 SHA、但没有可证明
+best 身份的 sidecar 仍会拒绝。仅诊断 latest/legacy source 可显式加 `--allow-non-best-transfer`。
+训练跨图遵循相同 best_eval 默认门槛，只有明确的 `--ignore-warm-start-metadata` 才允许 legacy/non-best
+例外并打印警告。未传 `--max-steps` 时，新地图时域为 `width*height*20`，不会继承
+源地图较短的截断上限。启动输出会显示 target map、step limit 与 `cross_map`。
 
 默认安全回退会避开立即碰撞；`--disable-safety-check` 用于评估原始策略。固定 seed 现在会
 产生可复现但连续不同的多局序列，不再每局重播完全相同的食物顺序。

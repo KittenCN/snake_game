@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -39,7 +40,7 @@ DEFAULT_MODEL_PATH = Path("models/dqn_snake_v3_best.pt")
 LEGACY_MODEL_PATH = Path("models/dqn_snake.pt")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run inference for a trained DQN snake agent"
     )
@@ -85,7 +86,115 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override device for inference (cpu/cuda)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Target map width for policy-only spatial transfer (requires --height)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Target map height for policy-only spatial transfer (requires --width)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="Target episode step limit; 0 uses width*height*20 for a map override",
+    )
+    parser.add_argument(
+        "--model-sha256",
+        type=str,
+        default=None,
+        help="Optional expected checkpoint SHA-256 (sidecar SHA is used automatically)",
+    )
+    parser.add_argument(
+        "--allow-non-best-transfer",
+        action="store_true",
+        help="Allow cross-map play from a sidecar role other than immutable best_eval",
+    )
+    args = parser.parse_args(argv)
+    if (args.width is None) != (args.height is None):
+        parser.error("--width and --height must be provided together")
+    if args.width is not None and (args.width <= 0 or args.height <= 0):
+        parser.error("--width and --height must be positive")
+    if args.max_steps < 0:
+        parser.error("--max-steps must be non-negative")
+    if args.model_sha256 is not None and (
+        len(args.model_sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF" for character in args.model_sha256
+        )
+    ):
+        parser.error("--model-sha256 must be a 64-character hexadecimal digest")
+    return args
+
+
+def _sidecar_path(model_path: Path) -> Path:
+    return model_path.with_suffix(".meta.json")
+
+
+def load_inference_agent(
+    model_path: Path, args: argparse.Namespace
+) -> tuple[DQNAgent, dict[str, object]]:
+    """Authenticate metadata when available and construct a policy-only agent."""
+    expected_sha256 = args.model_sha256.lower() if args.model_sha256 else None
+    sidecar = _sidecar_path(model_path)
+    sidecar_metadata: dict[str, object] = {}
+    if sidecar.exists():
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Checkpoint sidecar is unreadable: {sidecar}: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Checkpoint sidecar must be a JSON object: {sidecar}")
+        sidecar_metadata = payload
+        sidecar_sha = payload.get("checkpoint_sha256")
+        if not isinstance(sidecar_sha, str) or len(sidecar_sha) != 64:
+            raise RuntimeError(f"Checkpoint sidecar has no valid SHA-256: {sidecar}")
+        if expected_sha256 is not None and sidecar_sha.lower() != expected_sha256:
+            raise RuntimeError(
+                "--model-sha256 conflicts with the checkpoint sidecar SHA-256"
+            )
+        expected_sha256 = sidecar_sha.lower()
+
+    agent = DQNAgent.from_policy_checkpoint(
+        str(model_path),
+        target_width=args.width,
+        target_height=args.height,
+        target_max_episode_steps=args.max_steps if args.max_steps > 0 else None,
+        device=args.device,
+        expected_sha256=expected_sha256,
+    )
+    provenance = dict(agent.policy_transfer_provenance or {})
+    DQNAgent.validate_policy_sidecar_identity(sidecar_metadata, provenance)
+    if provenance.get("cross_map"):
+        if expected_sha256 is None:
+            raise RuntimeError(
+                "Cross-map inference requires a sidecar SHA-256 or --model-sha256"
+            )
+        sidecar_role = sidecar_metadata.get("checkpoint_role")
+        if sidecar_role != "best_eval" and not args.allow_non_best_transfer:
+            raise RuntimeError(
+                "Cross-map inference requires an authenticated best_eval sidecar by default; "
+                "use --allow-non-best-transfer only for an intentional diagnostic"
+            )
+    provenance.update(
+        {
+            "source_sidecar_path": str(sidecar.resolve()) if sidecar.exists() else None,
+            "source_sidecar_role": sidecar_metadata.get("checkpoint_role"),
+            "source_sidecar_checkpoint_sha256": sidecar_metadata.get(
+                "checkpoint_sha256"
+            ),
+            "source_sidecar_verified": sidecar.exists(),
+        }
+    )
+    agent.policy_transfer_provenance = provenance
+    return agent, provenance
 
 
 def build_env_from_metadata(agent: DQNAgent, seed: int | None) -> SnakeGameEnv:
@@ -183,12 +292,18 @@ def main() -> None:
         print(f"Model file not found: {model_path}")
         return
 
-    agent = DQNAgent.load(str(model_path), device=args.device)
+    agent, transfer_provenance = load_inference_agent(model_path, args)
     agent.policy_net.eval()
     agent.target_net.eval()
     env = build_env_from_metadata(agent, args.seed)
 
-    print(f"Loaded model from {model_path.resolve()}")
+    print(f"Loaded policy from {model_path.resolve()}")
+    print(
+        "Inference target: "
+        f"{env.config.width}x{env.config.height}, "
+        f"step_limit={env.config.max_episode_steps}, "
+        f"cross_map={transfer_provenance['cross_map']}"
+    )
 
     if args.console:
         print(

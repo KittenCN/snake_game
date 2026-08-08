@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,6 +67,215 @@ def test_checkpoint_ignores_stale_saved_device(
     assert loaded.device.type == "cpu"
     assert resolved_inputs[0] is None
     assert "cuda" not in resolved_inputs
+
+
+def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> None:
+    source_config = GameConfig(width=8, height=8, max_episode_steps=40)
+    source = make_agent(
+        state_dim=20 * 8 * 8,
+        action_dim=3,
+        obs_shape=(20, 8, 8),
+        game_config=source_config,
+        lr=0.003,
+    )
+    source.behavior_steps = 123
+    source.learn_step_counter = 17
+    source.replay_buffer.push(
+        torch.zeros(20, 8, 8),
+        0,
+        1.0,
+        torch.zeros(20, 8, 8),
+        False,
+        discount=0.99,
+    )
+    path = tmp_path / "source-8x8.pt"
+    source.save(str(path))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    target_config = GameConfig(width=10, height=10, max_episode_steps=60)
+
+    transferred = DQNAgent.from_policy_checkpoint(
+        str(path),
+        target_game_config=target_config,
+        expected_sha256=digest,
+        device="cpu",
+        agent_options={"lr": 0.0004, "batch_size": 4, "replay_capacity": 64},
+    )
+
+    assert transferred.obs_shape == (20, 10, 10)
+    assert transferred.state_dim == 20 * 10 * 10
+    assert transferred.game_config == target_config
+    assert transferred.hidden_sizes == source.hidden_sizes
+    assert transferred.network_version == source.network_version
+    assert transferred.lr == pytest.approx(0.0004)
+    assert transferred.optimizer.state_dict()["state"] == {}
+    assert len(transferred.replay_buffer) == 0
+    assert transferred.behavior_steps == 0
+    assert transferred.learn_step_counter == 0
+    assert transferred.replay_restored is False
+    for key, value in source.policy_net.state_dict().items():
+        assert torch.equal(transferred.policy_net.state_dict()[key], value)
+        assert torch.equal(transferred.target_net.state_dict()[key], value)
+    provenance = transferred.policy_transfer_provenance
+    assert provenance is not None
+    assert provenance["source_map"] == {"width": 8, "height": 8}
+    assert provenance["target_map"] == {"width": 10, "height": 10}
+    assert provenance["cross_map"] is True
+    assert provenance["sha256_verified"] is True
+    assert provenance["optimizer_restored"] is False
+    assert provenance["rng_restored"] is False
+
+    transferred_path = tmp_path / "transferred-10x10.pt"
+    transferred.save(str(transferred_path))
+    resumed = DQNAgent.load(str(transferred_path), device="cpu")
+    assert resumed.obs_shape == (20, 10, 10)
+    assert resumed.policy_transfer_provenance == provenance
+
+
+def test_policy_checkpoint_sha_and_structure_fail_before_transfer(
+    tmp_path: Path,
+) -> None:
+    source = make_agent(
+        state_dim=20 * 8 * 8,
+        action_dim=3,
+        obs_shape=(20, 8, 8),
+        game_config=GameConfig(width=8, height=8),
+    )
+    path = tmp_path / "source.pt"
+    source.save(str(path))
+
+    with pytest.raises(RuntimeError, match="expected SHA-256"):
+        DQNAgent.from_policy_checkpoint(
+            str(path),
+            target_game_config=GameConfig(width=10, height=10),
+            expected_sha256="0" * 64,
+            device="cpu",
+        )
+
+    transferred = DQNAgent.from_policy_checkpoint(
+        str(path),
+        target_game_config=GameConfig(width=10, height=10),
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest().upper(),
+        device="cpu",
+    )
+    assert transferred.obs_shape == (20, 10, 10)
+
+    with pytest.raises(ValueError, match="64-character hexadecimal"):
+        DQNAgent.from_policy_checkpoint(
+            str(path),
+            target_game_config=GameConfig(width=10, height=10),
+            expected_sha256="not-a-digest",
+            device="cpu",
+        )
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint["metadata"]["hidden_sizes"] = (99,)
+    torch.save(checkpoint, path)
+    with pytest.raises(RuntimeError, match="incompatible policy checkpoint"):
+        DQNAgent.from_policy_checkpoint(
+            str(path),
+            target_game_config=GameConfig(width=10, height=10),
+            device="cpu",
+        )
+
+
+def test_policy_checkpoint_rejects_game_config_obs_shape_conflict(
+    tmp_path: Path,
+) -> None:
+    source = make_agent(
+        state_dim=20 * 8 * 8,
+        action_dim=3,
+        obs_shape=(20, 8, 8),
+        game_config=GameConfig(width=8, height=8),
+    )
+    path = tmp_path / "source.pt"
+    source.save(str(path))
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint["metadata"]["game_config"]["width"] = 9
+    torch.save(checkpoint, path)
+
+    with pytest.raises(RuntimeError, match="game_config dimensions conflict"):
+        DQNAgent.from_policy_checkpoint(str(path), device="cpu")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [GameConfig(width=2, height=10), GameConfig(width=3, height=10, initial_length=3)],
+)
+def test_policy_checkpoint_rejects_invalid_target_game_config(
+    tmp_path: Path, target: GameConfig
+) -> None:
+    source = make_agent(
+        state_dim=20 * 8 * 8,
+        action_dim=3,
+        obs_shape=(20, 8, 8),
+        game_config=GameConfig(width=8, height=8),
+    )
+    path = tmp_path / "source.pt"
+    source.save(str(path))
+
+    with pytest.raises(ValueError):
+        DQNAgent.from_policy_checkpoint(
+            str(path), target_game_config=target, device="cpu"
+        )
+
+
+def test_policy_checkpoint_rejects_unknown_version_and_cross_map_schema(
+    tmp_path: Path,
+) -> None:
+    source = make_agent(
+        state_dim=20 * 8 * 8,
+        action_dim=3,
+        obs_shape=(20, 8, 8),
+        game_config=GameConfig(width=8, height=8),
+    )
+    path = tmp_path / "source.pt"
+    source.save(str(path))
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+
+    checkpoint["metadata"]["network_version"] = 99
+    torch.save(checkpoint, path)
+    with pytest.raises(
+        RuntimeError, match="unsupported policy checkpoint network_version"
+    ):
+        DQNAgent.from_policy_checkpoint(
+            str(path), target_game_config=GameConfig(width=10, height=10), device="cpu"
+        )
+
+    source.save(str(path))
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint["metadata"]["action_schema"] = "absolute_actions_v1"
+    torch.save(checkpoint, path)
+    with pytest.raises(
+        RuntimeError, match="spatial-transfer action/observation schema"
+    ):
+        DQNAgent.from_policy_checkpoint(
+            str(path), target_game_config=GameConfig(width=10, height=10), device="cpu"
+        )
+
+
+def test_legacy_policy_factory_supports_same_map_but_rejects_cross_map(
+    tmp_path: Path,
+) -> None:
+    source = make_agent(
+        state_dim=17 * 8 * 8,
+        action_dim=4,
+        obs_shape=(17, 8, 8),
+        network_version=2,
+        game_config=GameConfig(width=8, height=8),
+    )
+    path = tmp_path / "legacy-v2.pt"
+    source.save(str(path))
+
+    same_map = DQNAgent.from_policy_checkpoint(str(path), device="cpu")
+    assert same_map.obs_shape == (17, 8, 8)
+    assert same_map.action_dim == 4
+    assert same_map.policy_transfer_provenance is not None
+    assert same_map.policy_transfer_provenance["cross_map"] is False
+
+    with pytest.raises(RuntimeError, match="not spatial-transfer capable"):
+        DQNAgent.from_policy_checkpoint(
+            str(path), target_game_config=GameConfig(width=10, height=10), device="cpu"
+        )
 
 
 class FixedQ(nn.Module):
@@ -766,7 +976,7 @@ def test_checkpoint_is_atomic_and_restores_exploration_state(tmp_path: Path) -> 
 def test_policy_warm_start_migrates_weights_only_across_board_sizes(
     tmp_path: Path,
 ) -> None:
-    source = make_agent(epsilon_start=0.99, lr=1e-3, n_step=2)
+    source = make_agent(action_dim=3, epsilon_start=0.99, lr=1e-3, n_step=2)
     for parameter in source.policy_net.parameters():
         parameter.grad = torch.ones_like(parameter)
     source.optimizer.step()
@@ -782,6 +992,7 @@ def test_policy_warm_start_migrates_weights_only_across_board_sizes(
 
     target = make_agent(
         state_dim=20 * 18 * 16,
+        action_dim=3,
         obs_shape=(20, 18, 16),
         epsilon_start=0.73,
         lr=7e-4,
@@ -839,14 +1050,14 @@ def test_policy_warm_start_rejects_incompatible_metadata_without_modification(
     incompatible_value: object,
     error_match: str,
 ) -> None:
-    source = make_agent()
+    source = make_agent(action_dim=3)
     source_path = tmp_path / "source.pt"
     source.save(str(source_path))
     checkpoint = torch.load(source_path, map_location="cpu", weights_only=True)
     checkpoint["metadata"][metadata_key] = incompatible_value
     incompatible_path = tmp_path / f"incompatible-{metadata_key}.pt"
     torch.save(checkpoint, incompatible_path)
-    target = make_agent()
+    target = make_agent(action_dim=3)
     before = {
         key: value.clone() for key, value in target.policy_net.state_dict().items()
     }
@@ -862,7 +1073,7 @@ def test_policy_warm_start_rejects_incompatible_metadata_without_modification(
 def test_policy_warm_start_validates_all_tensors_before_modifying_policy(
     tmp_path: Path, corruption: str
 ) -> None:
-    source = make_agent()
+    source = make_agent(action_dim=3)
     source_path = tmp_path / "source.pt"
     source.save(str(source_path))
     checkpoint = torch.load(source_path, map_location="cpu", weights_only=True)
@@ -882,7 +1093,7 @@ def test_policy_warm_start_validates_all_tensors_before_modifying_policy(
         )
     incompatible_path = tmp_path / f"incompatible-{corruption}.pt"
     torch.save(checkpoint, incompatible_path)
-    target = make_agent()
+    target = make_agent(action_dim=3)
     before = {
         key: value.clone() for key, value in target.policy_net.state_dict().items()
     }
@@ -897,15 +1108,15 @@ def test_policy_warm_start_validates_all_tensors_before_modifying_policy(
 def test_policy_warm_start_rejects_source_changed_after_hash_validation(
     tmp_path: Path,
 ) -> None:
-    source = make_agent()
+    source = make_agent(action_dim=3)
     source_path = tmp_path / "source.pt"
     source.save(str(source_path))
-    target = make_agent()
+    target = make_agent(action_dim=3)
     before = {
         key: value.clone() for key, value in target.policy_net.state_dict().items()
     }
 
-    with pytest.raises(RuntimeError, match="changed after metadata validation"):
+    with pytest.raises(RuntimeError, match="SHA-256 authentication"):
         target.load_policy_weights(str(source_path), expected_sha256="0" * 64)
 
     for key, value in target.policy_net.state_dict().items():
