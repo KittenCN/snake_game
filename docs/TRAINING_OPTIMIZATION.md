@@ -223,7 +223,7 @@ checkpoint 不保存两个大 replay；完整 resume 会从冻结 teacher 重新
 mkdir -p runs/stable_v6_transfer_10x10
 nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   --episodes 50000 --seed 20260809 \
-  --warm-start-from models/dqn_snake_8x8_stable_v5_best.pt \
+  --warm-start-from models/dqn_snake_8x8_stable_v5_finetune_best.pt \
   --width 10 --height 10 --initial-length 3 --max-steps 0 \
   --reward-step -0.003 --reward-food 5 --reward-death -5 \
   --reward-shaping-scale 1 --max-idle-steps 90 \

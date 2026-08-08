@@ -222,7 +222,7 @@ clear regression 可提前结束。多次 look 使用固定计划数的 `paired_
 mkdir -p runs/stable_v6_transfer_10x10
 nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   --episodes 50000 --seed 20260809 \
-  --warm-start-from models/dqn_snake_8x8_stable_v5_best.pt \
+  --warm-start-from models/dqn_snake_8x8_stable_v5_finetune_best.pt \
   --width 10 --height 10 --initial-length 3 --max-steps 0 \
   --reward-step -0.003 --reward-food 5 --reward-death -5 \
   --reward-shaping-scale 1 --max-idle-steps 90 \
@@ -342,7 +342,7 @@ python play_dqn.py `
 
 ```powershell
 python play_dqn.py `
-  --model models/dqn_snake_8x8_stable_v5_best.pt `
+  --model models/dqn_snake_8x8_stable_v5_finetune_best.pt `
   --width 10 --height 10 --console --episodes 5 --seed 42
 ```
 
