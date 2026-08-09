@@ -85,6 +85,7 @@ class GameConfig:
     max_idle_steps: int = 0
     idle_penalty: float = -1.0
     idle_growth_per_food: int = 2
+    idle_limit_floor_steps: int = 0
     max_episode_steps: int = 0
 
     def validate(self) -> None:
@@ -98,6 +99,12 @@ class GameConfig:
             raise ValueError("max_idle_steps must be non-negative")
         if self.idle_growth_per_food < 0:
             raise ValueError("idle_growth_per_food must be non-negative")
+        if self.idle_limit_floor_steps < 0:
+            raise ValueError("idle_limit_floor_steps must be non-negative")
+        if self.max_idle_steps == 0 and self.idle_limit_floor_steps > 0:
+            raise ValueError(
+                "idle_limit_floor_steps requires max_idle_steps to be positive"
+            )
         if self.max_episode_steps < 0:
             raise ValueError("max_episode_steps must be non-negative")
 
@@ -260,11 +267,20 @@ class SnakeGameEnv:
 
     @property
     def idle_limit(self) -> int:
-        if self.config.max_idle_steps <= 0:
-            return 0
-        return (
+        dynamic_limit = (
             self.config.max_idle_steps + self._score * self.config.idle_growth_per_food
+            if self.config.max_idle_steps > 0
+            else 0
         )
+        return max(dynamic_limit, self.config.idle_limit_floor_steps)
+
+    def relative_survival_mask(self) -> Tuple[bool, ...]:
+        """Return non-fatal relative actions, or all actions when death is forced."""
+        mask = tuple(
+            self.is_safe_action(relative_to_absolute(self._direction, relative))
+            for relative in RelativeAction
+        )
+        return mask if any(mask) else tuple(True for _ in RelativeAction)
 
     @property
     def done(self) -> bool:

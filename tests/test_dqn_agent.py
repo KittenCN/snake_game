@@ -70,13 +70,20 @@ def test_checkpoint_ignores_stale_saved_device(
 
 
 def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> None:
-    source_config = GameConfig(width=8, height=8, max_episode_steps=40)
+    source_config = GameConfig(
+        width=8,
+        height=8,
+        max_idle_steps=90,
+        idle_limit_floor_steps=64,
+        max_episode_steps=40,
+    )
     source = make_agent(
         state_dim=20 * 8 * 8,
         action_dim=3,
         obs_shape=(20, 8, 8),
         game_config=source_config,
         lr=0.003,
+        action_mask_mode="one_step_survival_v1",
     )
     source.behavior_steps = 123
     source.learn_step_counter = 17
@@ -91,7 +98,13 @@ def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> N
     path = tmp_path / "source-8x8.pt"
     source.save(str(path))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    target_config = GameConfig(width=10, height=10, max_episode_steps=60)
+    target_config = GameConfig(
+        width=10,
+        height=10,
+        max_idle_steps=90,
+        idle_limit_floor_steps=100,
+        max_episode_steps=60,
+    )
 
     transferred = DQNAgent.from_policy_checkpoint(
         str(path),
@@ -106,6 +119,7 @@ def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> N
     assert transferred.game_config == target_config
     assert transferred.hidden_sizes == source.hidden_sizes
     assert transferred.network_version == source.network_version
+    assert transferred.action_mask_mode == "one_step_survival_v1"
     assert transferred.lr == pytest.approx(0.0004)
     assert transferred.optimizer.state_dict()["state"] == {}
     assert len(transferred.replay_buffer) == 0
@@ -128,6 +142,8 @@ def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> N
     transferred.save(str(transferred_path))
     resumed = DQNAgent.load(str(transferred_path), device="cpu")
     assert resumed.obs_shape == (20, 10, 10)
+    assert resumed.game_config is not None
+    assert resumed.game_config.idle_limit_floor_steps == 100
     assert resumed.policy_transfer_provenance == provenance
 
 
@@ -433,6 +449,33 @@ def test_anchor_loss_and_teacher_state_survive_checkpoint_round_trip(
         assert torch.equal(loaded.policy_anchor_net.state_dict()[key], expected)
 
 
+def test_policy_anchor_decays_after_teacher_replay_and_restores_progress(
+    tmp_path: Path,
+) -> None:
+    agent = make_agent(
+        policy_anchor_weight=0.5,
+        policy_anchor_final_weight=0.1,
+        policy_anchor_decay_steps=100,
+        teacher_replay_steps=20,
+    )
+    agent.behavior_steps = 20
+    assert agent.effective_policy_anchor_weight == pytest.approx(0.5)
+    agent.behavior_steps = 70
+    assert agent.effective_policy_anchor_weight == pytest.approx(0.3)
+    agent.behavior_steps = 140
+    assert agent.effective_policy_anchor_weight == pytest.approx(0.1)
+
+    agent.action_mask_mode = "legal_v1"
+    path = tmp_path / "decaying-anchor.pt"
+    agent.save(str(path))
+    loaded = DQNAgent.load(str(path), device="cpu")
+
+    assert loaded.policy_anchor_final_weight == pytest.approx(0.1)
+    assert loaded.policy_anchor_decay_steps == 100
+    assert loaded.behavior_steps == 140
+    assert loaded.effective_policy_anchor_weight == pytest.approx(0.1)
+
+
 def test_anchor_weight_fails_closed_without_frozen_teacher() -> None:
     agent = make_agent(n_step=1, policy_anchor_weight=0.5)
     state = torch.zeros(agent.obs_shape)
@@ -534,6 +577,90 @@ def test_trajectory_larger_than_demo_capacity_is_rejected_atomically() -> None:
 
     assert copied == 0
     assert len(target) == 0
+
+
+def test_demo_replay_rejects_weaker_trajectory_without_partial_overwrite() -> None:
+    source = ReplayBuffer(8, torch.device("cpu"), action_dim=2)
+    target = ReplayBuffer(2, torch.device("cpu"), action_dim=2)
+    state = torch.zeros((1, 2, 2))
+    elite_tokens = [source.push(state, action, 1.0, state, False) for action in (0, 1)]
+    assert (
+        source.copy_trajectory_to(
+            elite_tokens,
+            target,
+            quality_tier=2,
+            trajectory_score=8,
+            trajectory_return=30,
+        )
+        == 2
+    )
+    before = target.sample_demonstrations(2)
+
+    success_tokens = [
+        source.push(state, action, 1.0, state, False) for action in (0, 1)
+    ]
+    assert (
+        source.copy_trajectory_to(
+            success_tokens,
+            target,
+            quality_tier=1,
+            trajectory_score=20,
+            trajectory_return=100,
+        )
+        == 0
+    )
+    after = target.sample_demonstrations(2)
+
+    assert after.quality_tiers.tolist() == [2, 2]
+    assert after.trajectory_scores.tolist() == before.trajectory_scores.tolist()
+    assert after.trajectory_returns.tolist() == before.trajectory_returns.tolist()
+
+
+def test_demo_replay_replaces_only_strictly_weaker_quality() -> None:
+    source = ReplayBuffer(8, torch.device("cpu"), action_dim=2)
+    target = ReplayBuffer(2, torch.device("cpu"), action_dim=2)
+    state = torch.zeros((1, 2, 2))
+    low_tokens = [source.push(state, action, 1.0, state, False) for action in (0, 1)]
+    source.copy_trajectory_to(
+        low_tokens,
+        target,
+        quality_tier=1,
+        trajectory_score=4,
+        trajectory_return=10,
+    )
+    high_token = [source.push(state, 1, 1.0, state, False)]
+
+    assert (
+        source.copy_trajectory_to(
+            high_token,
+            target,
+            quality_tier=1,
+            trajectory_score=5,
+            trajectory_return=9,
+        )
+        == 1
+    )
+    batch = target.sample_demonstrations(2)
+    assert sorted(batch.trajectory_scores.tolist()) == [4.0, 5.0]
+
+
+def test_demonstration_excludes_configured_terminal_prefix_from_imitation() -> None:
+    agent = make_agent(
+        n_step=1,
+        demonstration_capacity=8,
+        demonstration_min_score=1,
+        demonstration_min_return=-10,
+        demonstration_terminal_exclusion_steps=2,
+    )
+    state = torch.zeros(agent.obs_shape)
+    for index in range(4):
+        agent.remember(state, index % 4, 1.0, state, index == 3)
+
+    result = agent.finalize_trajectory(score=4, episode_return=4)
+    assert result["promoted_transitions"] == 4
+    assert agent.demonstration_replay is not None
+    batch = agent.demonstration_replay.sample_demonstrations(4)
+    assert batch.imitation_mask.sum().item() == 2
 
 
 def test_full_demo_stratum_is_uniform_without_replacement_or_fake_is_weights() -> None:
@@ -647,6 +774,24 @@ def test_n_step_terminal_flush_emits_all_prefixes() -> None:
         [0.125, 0.25, 0.5]
     )
     assert agent.replay_buffer._dones[:3].tolist() == [1.0, 1.0, 1.0]
+
+
+def test_terminal_next_action_mask_is_canonical_all_true() -> None:
+    agent = make_agent(action_dim=3, n_step=1)
+    state = torch.zeros(agent.obs_shape)
+
+    agent.remember(
+        state,
+        0,
+        -1.0,
+        state,
+        True,
+        next_action_mask=[False, False, False],
+    )
+    batch = agent.replay_buffer.sample(1)
+
+    assert batch.next_action_masks is not None
+    assert batch.next_action_masks[0].tolist() == [True, True, True]
 
 
 def test_parallel_n_step_streams_do_not_mix_transitions() -> None:

@@ -524,6 +524,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Smooth-L1 weight that anchors Q values to the frozen warm-start policy",
     )
     parser.add_argument(
+        "--policy-anchor-final-weight",
+        type=float,
+        default=None,
+        help=(
+            "Final policy-anchor weight after linear behavior-step decay; omitted "
+            "keeps the initial weight"
+        ),
+    )
+    parser.add_argument(
+        "--policy-anchor-decay-steps",
+        type=int,
+        default=0,
+        help="Behavior steps for linear anchor decay; 0 keeps a constant weight",
+    )
+    parser.add_argument(
         "--teacher-replay-steps",
         type=int,
         default=0,
@@ -558,6 +573,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Weight for large-margin successful-action imitation loss",
     )
     parser.add_argument("--imitation-margin", type=float, default=0.8)
+    parser.add_argument(
+        "--demonstration-terminal-exclusion-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of final trajectory actions excluded from imitation; 1 preserves "
+            "the historical terminal-action exclusion"
+        ),
+    )
     parser.add_argument(
         "--resume-epsilon",
         type=float,
@@ -598,6 +622,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-idle-steps", type=int, default=90)
     parser.add_argument("--idle-growth-per-food", type=int, default=2)
+    parser.add_argument(
+        "--idle-limit-floor-steps",
+        type=int,
+        default=0,
+        help=(
+            "Minimum idle budget independent of score; use width*height (144 on "
+            "12x12) to permit a full safe board traversal"
+        ),
+    )
     parser.add_argument("--idle-penalty", type=float, default=-5.0)
     parser.add_argument("--hidden", type=int, nargs="*", default=[256, 256])
     parser.add_argument("--device", type=str, default=None)
@@ -608,6 +641,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Allow faster but potentially non-reproducible backend algorithms",
     )
     parser.add_argument("--network-version", type=int, choices=[1, 2, 3], default=3)
+    parser.add_argument(
+        "--action-mask-mode",
+        choices=["legal_v1", "one_step_survival_v1"],
+        default="one_step_survival_v1",
+        help="Versioned behavior/target action-mask contract",
+    )
     parser.add_argument("--output", default="models/dqn_snake_v3_best.pt")
     parser.add_argument("--latest-output", default="models/dqn_snake_v3_latest.pt")
     initialization = parser.add_mutually_exclusive_group()
@@ -698,6 +737,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args._provided_options = sorted(
         {token.split("=", 1)[0] for token in raw_argv if token.startswith("--")}
     )
+    if args.network_version < 3:
+        if (
+            "--action-mask-mode" in args._provided_options
+            and args.action_mask_mode != "legal_v1"
+        ):
+            parser.error("one_step_survival_v1 requires network-version 3")
+        args.action_mask_mode = "legal_v1"
     if args.episodes <= 0 or args.eval_episodes <= 0:
         parser.error("episodes and eval-episodes must be positive")
     if args.eval_interval <= 0 or args.checkpoint_interval <= 0:
@@ -712,10 +758,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("teacher-replay-steps must be non-negative")
     if args.teacher_replay_steps > args.replay_capacity:
         parser.error("teacher-replay-steps must not exceed replay-capacity")
+    if args.idle_limit_floor_steps < 0:
+        parser.error("idle-limit-floor-steps must be non-negative")
+    if args.max_idle_steps == 0 and args.idle_limit_floor_steps > 0:
+        parser.error("idle-limit-floor-steps requires max-idle-steps to be positive")
     if not math.isfinite(args.policy_anchor_weight) or args.policy_anchor_weight < 0:
         parser.error("policy-anchor-weight must be finite and non-negative")
+    if args.policy_anchor_final_weight is None:
+        args.policy_anchor_final_weight = args.policy_anchor_weight
+    if (
+        not math.isfinite(args.policy_anchor_final_weight)
+        or args.policy_anchor_final_weight < 0
+        or args.policy_anchor_final_weight > args.policy_anchor_weight
+    ):
+        parser.error(
+            "policy-anchor-final-weight must be finite and between zero and "
+            "policy-anchor-weight"
+        )
+    if args.policy_anchor_decay_steps < 0:
+        parser.error("policy-anchor-decay-steps must be non-negative")
     if args.demonstration_capacity < 0:
         parser.error("demonstration-capacity must be non-negative")
+    if args.demonstration_terminal_exclusion_steps < 0:
+        parser.error("demonstration-terminal-exclusion-steps must be non-negative")
     if not 0.0 <= args.demonstration_batch_fraction < 1.0:
         parser.error("demonstration-batch-fraction must be in [0, 1)")
     if not (
@@ -992,6 +1057,8 @@ def potential_shaping(
 
 def action_mask(agent: DQNAgent, env: SnakeGameEnv) -> list[bool]:
     if agent.action_dim == len(RelativeAction):
+        if agent.action_mask_mode == "one_step_survival_v1":
+            return list(env.relative_survival_mask())
         return [True] * agent.action_dim
     if agent.action_dim == len(Action):
         legal = set(env.legal_actions())
@@ -1284,6 +1351,7 @@ def evaluation_identity(
         "adaptive_eval_max_episodes": train_args.adaptive_eval_max_episodes,
         "adaptive_eval_growth_factor": train_args.adaptive_eval_growth_factor,
         "game_config": asdict(game_config),
+        "action_mask_mode": train_args.action_mask_mode,
     }
     if train_args.require_paired_promotion:
         identity["paired_promotion_min_delta"] = train_args.paired_promotion_min_delta
@@ -1294,6 +1362,7 @@ def effective_agent_config(agent: DQNAgent) -> dict[str, Any]:
     learning_rates = [float(group["lr"]) for group in agent.optimizer.param_groups]
     return {
         "network_version": agent.network_version,
+        "action_mask_mode": agent.action_mask_mode,
         "hidden_sizes": list(agent.hidden_sizes),
         "base_lr": float(agent.lr),
         # Kept for sidecar compatibility; this field has historically held the
@@ -1317,6 +1386,9 @@ def effective_agent_config(agent: DQNAgent) -> dict[str, Any]:
         "epsilon_final": agent.epsilon_final,
         "epsilon_decay_steps": agent.epsilon_decay_steps,
         "policy_anchor_weight": agent.policy_anchor_weight,
+        "policy_anchor_final_weight": agent.policy_anchor_final_weight,
+        "policy_anchor_decay_steps": agent.policy_anchor_decay_steps,
+        "effective_policy_anchor_weight": agent.effective_policy_anchor_weight,
         "teacher_replay_steps": agent.teacher_replay_steps,
         "demonstration_capacity": agent.demonstration_capacity,
         "demonstration_batch_fraction": agent.demonstration_batch_fraction,
@@ -1327,6 +1399,9 @@ def effective_agent_config(agent: DQNAgent) -> dict[str, Any]:
         "demonstration_elite_return": agent.demonstration_elite_return,
         "imitation_loss_weight": agent.imitation_loss_weight,
         "imitation_margin": agent.imitation_margin,
+        "demonstration_terminal_exclusion_steps": (
+            agent.demonstration_terminal_exclusion_steps
+        ),
         "policy_anchor_enabled": agent.policy_anchor_enabled,
         "amp_enabled": agent.amp_enabled,
     }
@@ -1378,6 +1453,7 @@ def save_checkpoint(
         ),
         "network_version": agent.network_version,
         "action_dim": agent.action_dim,
+        "action_mask_mode": agent.action_mask_mode,
         "obs_shape": list(agent.obs_shape),
         "behavior_steps": agent.behavior_steps,
         "learn_step_counter": agent.learn_step_counter,
@@ -1513,6 +1589,7 @@ def validate_resume_identity(metadata: dict[str, Any], agent: DQNAgent) -> None:
     expected = {
         "network_version": agent.network_version,
         "action_dim": agent.action_dim,
+        "action_mask_mode": agent.action_mask_mode,
         "obs_shape": list(agent.obs_shape),
         "behavior_steps": agent.behavior_steps,
         "learn_step_counter": agent.learn_step_counter,
@@ -1520,7 +1597,8 @@ def validate_resume_identity(metadata: dict[str, Any], agent: DQNAgent) -> None:
     mismatches = {
         key: (metadata.get(key), value)
         for key, value in expected.items()
-        if metadata.get(key) != value
+        if metadata.get(key, "legal_v1" if key == "action_mask_mode" else None)
+        != value
     }
     if mismatches:
         raise RuntimeError(
@@ -1559,6 +1637,7 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
     provided = set(getattr(args, "_provided_options", ()))
     checks: dict[str, tuple[Any, Any]] = {
         "--network-version": (args.network_version, agent.network_version),
+        "--action-mask-mode": (args.action_mask_mode, agent.action_mask_mode),
         "--hidden": (tuple(args.hidden), tuple(agent.hidden_sizes)),
         "--lr": (float(args.lr), float(agent.lr)),
         "--gamma": (args.gamma, agent.gamma),
@@ -1583,6 +1662,14 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
         "--policy-anchor-weight": (
             args.policy_anchor_weight,
             agent.policy_anchor_weight,
+        ),
+        "--policy-anchor-final-weight": (
+            args.policy_anchor_final_weight,
+            agent.policy_anchor_final_weight,
+        ),
+        "--policy-anchor-decay-steps": (
+            args.policy_anchor_decay_steps,
+            agent.policy_anchor_decay_steps,
         ),
         "--teacher-replay-steps": (
             args.teacher_replay_steps,
@@ -1621,6 +1708,10 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
             agent.imitation_loss_weight,
         ),
         "--imitation-margin": (args.imitation_margin, agent.imitation_margin),
+        "--demonstration-terminal-exclusion-steps": (
+            args.demonstration_terminal_exclusion_steps,
+            agent.demonstration_terminal_exclusion_steps,
+        ),
     }
     conflicts = {
         option: values
@@ -1637,6 +1728,18 @@ def validate_resume_agent_options(args: argparse.Namespace, agent: DQNAgent) -> 
             + detail
             + ". Start a fresh run for a new optimizer/agent configuration."
         )
+    if "--policy-anchor-weight" not in provided:
+        args.policy_anchor_weight = agent.policy_anchor_weight
+    if "--policy-anchor-final-weight" not in provided:
+        args.policy_anchor_final_weight = agent.policy_anchor_final_weight
+    if "--policy-anchor-decay-steps" not in provided:
+        args.policy_anchor_decay_steps = agent.policy_anchor_decay_steps
+    if "--demonstration-terminal-exclusion-steps" not in provided:
+        args.demonstration_terminal_exclusion_steps = (
+            agent.demonstration_terminal_exclusion_steps
+        )
+    if "--action-mask-mode" not in provided:
+        args.action_mask_mode = agent.action_mask_mode
 
 
 _CONTROLLER_OPTIONS = {
@@ -1835,6 +1938,12 @@ def validate_resume_best(
         # unchanged single-look defaults, not an unknown evaluation identity.
         normalized.setdefault("adaptive_eval_max_episodes", 0)
         normalized.setdefault("adaptive_eval_growth_factor", 2.0)
+        normalized.setdefault("action_mask_mode", "legal_v1")
+        game_identity = normalized.get("game_config")
+        if isinstance(game_identity, dict):
+            game_identity = dict(game_identity)
+            game_identity.setdefault("idle_limit_floor_steps", 0)
+            normalized["game_config"] = game_identity
         return normalized
 
     stored_identity = compatible_identity(metadata.get("evaluation_identity"))
@@ -1951,6 +2060,8 @@ def _agent_training_options(args: argparse.Namespace) -> dict[str, Any]:
         "per_beta_frames": args.per_beta_frames,
         "amp_enabled": False if args.disable_amp else None,
         "policy_anchor_weight": args.policy_anchor_weight,
+        "policy_anchor_final_weight": args.policy_anchor_final_weight,
+        "policy_anchor_decay_steps": args.policy_anchor_decay_steps,
         "teacher_replay_steps": args.teacher_replay_steps,
         "demonstration_capacity": args.demonstration_capacity,
         "demonstration_batch_fraction": args.demonstration_batch_fraction,
@@ -1961,6 +2072,10 @@ def _agent_training_options(args: argparse.Namespace) -> dict[str, Any]:
         "demonstration_elite_return": args.demonstration_elite_return,
         "imitation_loss_weight": args.imitation_loss_weight,
         "imitation_margin": args.imitation_margin,
+        "demonstration_terminal_exclusion_steps": (
+            args.demonstration_terminal_exclusion_steps
+        ),
+        "action_mask_mode": args.action_mask_mode,
     }
 
 
@@ -2066,6 +2181,7 @@ def _train(args: argparse.Namespace) -> None:
         max_idle_steps=args.max_idle_steps,
         idle_penalty=args.idle_penalty,
         idle_growth_per_food=args.idle_growth_per_food,
+        idle_limit_floor_steps=args.idle_limit_floor_steps,
         max_episode_steps=configured_step_limit,
     )
     train_env = SnakeGameEnv(game_config)
@@ -2310,8 +2426,13 @@ def _train(args: argparse.Namespace) -> None:
                     "warm_start_provenance": warm_start_provenance,
                     "network_version": agent.network_version,
                     "action_dim": agent.action_dim,
+                    "action_mask_mode": agent.action_mask_mode,
                     "obs_shape": list(agent.obs_shape),
                     "step_limit": step_limit,
+                    "idle_limit_floor_steps": game_config.idle_limit_floor_steps,
+                    "effective_policy_anchor_weight": (
+                        agent.effective_policy_anchor_weight
+                    ),
                     "observation_pinned": current_encoder.is_pinned,
                     "runtime": runtime_info,
                     "eval_seeds": eval_seeds,
@@ -2391,6 +2512,7 @@ def _train(args: argparse.Namespace) -> None:
             "best_eval_score": best_eval_score,
             "best_eval_episode": best_eval_episode,
             "current_learning_rates": controller.learning_rates(agent.optimizer),
+            "effective_policy_anchor_weight": agent.effective_policy_anchor_weight,
             "convergence_decision": controller_decision,
             "convergence_controller": controller.to_dict(),
             "eval_episodes_actual": len(baseline_score_samples),
@@ -2508,7 +2630,11 @@ def _train(args: argparse.Namespace) -> None:
                     shaped_reward,
                     next_states[batch_index],
                     replay_done,
-                    next_action_mask=action_mask(agent, slot.env),
+                    next_action_mask=(
+                        [True] * agent.action_dim
+                        if replay_done
+                        else action_mask(agent, slot.env)
+                    ),
                     stream_id=slot.stream_id,
                 )
                 collection_transitions += 1
@@ -2629,6 +2755,7 @@ def _train(args: argparse.Namespace) -> None:
             "avg_td_loss": metric_mean("td_loss"),
             "avg_anchor_loss": metric_mean("anchor_loss"),
             "policy_anchor_weight": agent.policy_anchor_weight,
+            "effective_policy_anchor_weight": agent.effective_policy_anchor_weight,
             "avg_imitation_loss": metric_mean("imitation_loss"),
             "imitation_loss_weight": agent.imitation_loss_weight,
             "avg_demonstration_batch_fraction": metric_mean(

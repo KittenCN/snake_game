@@ -255,6 +255,57 @@ nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
   > runs/stable_v6_transfer_10x10/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 ```
 
+### 固定 12x12 的 v8 提分阶段
+
+`stable_v7_transfer_12x12` 的 immutable best 为 `9.432 @ episode 11200`，而训练在 episode 25200
+于最小学习率平台期停止。后续阶段不再扩大地图，而是从该 best 做新的 policy-only warm start；不能用
+v7 latest 普通 resume，因为新的动作生存掩码和 idle 下限改变了训练/评估身份。推荐完整命令：
+
+```bash
+mkdir -p runs/stable_v8_score_12x12
+nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
+  --episodes 100000 --seed 20260811 \
+  --warm-start-from models/dqn_snake_12x12_stable_v7_transfer_best.pt \
+  --width 12 --height 12 --initial-length 3 --max-steps 0 \
+  --reward-step -0.003 --reward-food 5 --reward-death -5 \
+  --reward-shaping-scale 1 --max-idle-steps 90 \
+  --idle-growth-per-food 2 --idle-limit-floor-steps 144 --idle-penalty -5 \
+  --network-version 3 --hidden 256 256 \
+  --action-mask-mode one_step_survival_v1 \
+  --gamma 0.99 --n-step 3 --per-alpha 0.6 \
+  --per-beta-start 0.4 --per-beta-frames 800000 \
+  --target-update 5000 --target-update-tau 0.005 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 10 \
+  --batch-size 512 --min-replay 50000 --replay-capacity 100000 \
+  --policy-anchor-weight 0.20 --policy-anchor-final-weight 0.03 \
+  --policy-anchor-decay-steps 800000 --teacher-replay-steps 50000 \
+  --demonstration-capacity 20000 --demonstration-batch-fraction 0.25 \
+  --elite-demonstration-batch-fraction 0.10 \
+  --demonstration-min-score 8 --demonstration-min-return 30 \
+  --demonstration-elite-score 14 --demonstration-elite-return 60 \
+  --demonstration-terminal-exclusion-steps 3 \
+  --imitation-loss-weight 0.15 --imitation-margin 0.8 \
+  --lr 0.00000078125 --lr-plateau-patience 5 \
+  --lr-plateau-factor 0.5 --lr-plateau-min 0.000000048828125 \
+  --early-stop-patience 10 --early-stop-delta 0.10 \
+  --require-paired-promotion --paired-promotion-min-delta 0.10 \
+  --regression-stop-patience 3 --regression-stop-delta 0.20 \
+  --epsilon-start 0.025 --epsilon-final 0.005 --epsilon-decay-steps 1000000 \
+  --eval-interval 400 --eval-episodes 100 \
+  --adaptive-eval-max-episodes 600 --adaptive-eval-growth-factor 2 \
+  --eval-seed-base 1700000 --checkpoint-interval 400 \
+  --device cuda --allow-nondeterministic \
+  --output models/dqn_snake_12x12_stable_v8_score_best.pt \
+  --latest-output models/dqn_snake_12x12_stable_v8_score_latest.pt \
+  --log-dir runs/stable_v8_score_12x12 \
+  > runs/stable_v8_score_12x12/console_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+```
+
+v8 的 episode-0 分数是在新约束身份下重新评估 v7 权重，不应直接与 v7 的 `9.432` 横向比较；之后
+best 晋升、学习率和停止决策只比较 v8 内相同 seed、相同掩码和相同 idle 规则的 paired evaluation。
+训练器会用 source sidecar 自动认证 checkpoint；启动前可另行核对 v7 best SHA-256 为
+`1cf8438c41a0a4b99e424a470779fc99daf9aca1888eef4d9a4f383bf6ed0027`。
+
 历史 8x8 adaptive 示例：
 
 ```bash
@@ -295,14 +346,18 @@ nohup env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
 
 warm start 只迁移 `policy_net` 权重，并用其重新同步 target；启用保守参数后还会冻结同一 policy 作为
 teacher。前 `--teacher-replay-steps` 个 transition 使用 teacher 的贪心动作收集 replay，期间不执行任何
-梯度更新；之后 TD loss 叠加 `--policy-anchor-weight * anchor_loss`，限制 Q 值偏离 immutable best。
+梯度更新；之后 TD loss 叠加有效 anchor 权重。`--policy-anchor-final-weight` 与
+`--policy-anchor-decay-steps` 可在 teacher 预热后把 anchor 从初值线性退火到终值，前期限制灾难性遗忘、
+后期允许策略超过 source；decay 为 0 时保持旧版常量语义。
 每个完整 episode 结束后，训练器才按原始游戏 `score` 与未 shaping 的环境 return 联合判定轨迹质量；
 同时达到 success 或 elite 两组门槛的完整轨迹会原子复制进独立 demonstration replay。该 replay 不会
 被普通经验环形覆盖，batch 按 `--demonstration-batch-fraction` 固定混入成功轨迹，并以
 `--elite-demonstration-batch-fraction` 为高分/高回报层保留配额。demo 行为动作通过 DQfD 风格的大间隔
 `imitation_loss` 直接约束 Q 排名，最终目标为 `TD + anchor + imitation`，从而让固定评估 score 的成功
 行为不再只能经 shaped reward 间接反传。最新策略后续产生的合格完整轨迹也可晋升，形成自举式成功
-回放；造成终止/截断的最后动作只保留 TD 监督，不进入 imitation。demo 配额随当前 unique demo 数量
+回放；达到容量后，只有质量元组 `(tier, score, return)` 严格更强的完整轨迹才能原子替换更弱样本，
+success 不会覆盖 elite，拒绝的轨迹也不会部分写入。造成终止/截断的最后
+`--demonstration-terminal-exclusion-steps` 个动作只保留 TD 监督，不进入 imitation。demo 配额随当前 unique demo 数量
 逐步升高且每批无放回采样，不会用一个新 transition 复制填满 batch；低分、低回报、超过 demo 容量
 或源 replay 已发生覆盖的轨迹都不会部分写入 demo。
 完整 resume 因 replay 不持久化，会自动重新完成这一 teacher 预热，而不是在空 replay 上恢复更新。
@@ -375,8 +430,8 @@ python -m pytest -q
 python -m ruff check .
 ```
 
-测试覆盖环境状态不变量、尾格移动、随机多 seed、相对动作、动态 idle、seed 序列、PER、
-n-step、epsilon、action mask、target buffer 同步、冻结 teacher/anchor loss、旧 checkpoint、tail/body-order 观测、
+测试覆盖环境状态不变量、尾格移动、随机多 seed、相对动作、动态 idle/下限、seed 序列、PER、
+n-step、epsilon、合法/一步生存 action mask、target buffer 同步、anchor 退火、demo 质量替换、冻结 teacher、旧 checkpoint、tail/body-order 观测、
 固定评估、有限时域、checkpoint 身份校验、防止 fresh 混写和短训练闭环。GitHub Actions
 会运行同样的 pytest 门槛。
 

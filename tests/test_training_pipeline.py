@@ -17,6 +17,7 @@ from train_dqn import (
     _prepare_fresh_outputs,
     _release_accelerator_resources,
     accelerator_runtime_info,
+    action_mask,
     adaptive_evaluation_plan,
     deterministic_episode_seed,
     evaluate_agent,
@@ -52,6 +53,12 @@ from train_dqn import (
         ["--policy-anchor-weight", "nan"],
         ["--teacher-replay-steps", "-1"],
         ["--teacher-replay-steps", "101", "--replay-capacity", "100"],
+        ["--idle-limit-floor-steps", "-1"],
+        ["--max-idle-steps", "0", "--idle-limit-floor-steps", "1"],
+        ["--policy-anchor-weight", "0.1", "--policy-anchor-final-weight", "0.2"],
+        ["--policy-anchor-decay-steps", "-1"],
+        ["--demonstration-terminal-exclusion-steps", "-1"],
+        ["--network-version", "2", "--action-mask-mode", "one_step_survival_v1"],
         [
             "--batch-size",
             "2",
@@ -537,6 +544,33 @@ def test_resume_lr_option_compares_base_lr_not_scheduled_optimizer_lr() -> None:
         validate_resume_agent_options(parse_args(["--lr", "0.0003"]), agent)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--action-mask-mode", "legal_v1"],
+        [
+            "--policy-anchor-weight",
+            "0.5",
+            "--policy-anchor-final-weight",
+            "0.1",
+        ],
+        ["--policy-anchor-decay-steps", "10"],
+        ["--demonstration-terminal-exclusion-steps", "2"],
+    ],
+)
+def test_resume_rejects_explicit_behavior_policy_conflicts(
+    options: list[str],
+) -> None:
+    agent = make_agent(GameConfig(width=5, height=5))
+    agent.policy_anchor_weight = 0.5
+    agent.policy_anchor_final_weight = 0.2
+    agent.policy_anchor_decay_steps = 100
+    agent.demonstration_terminal_exclusion_steps = 3
+
+    with pytest.raises(RuntimeError, match="hyperparameters conflict"):
+        validate_resume_agent_options(parse_args(options), agent)
+
+
 def make_agent(config: GameConfig, action_dim: int = 3) -> DQNAgent:
     env = SnakeGameEnv(config)
     env.reset(seed=7)
@@ -550,9 +584,33 @@ def make_agent(config: GameConfig, action_dim: int = 3) -> DQNAgent:
         min_replay_size=4,
         obs_shape=tuple(state.shape),
         network_version=3,
+        action_mask_mode=(
+            "one_step_survival_v1" if action_dim == len(RelativeAction) else "legal_v1"
+        ),
         device="cpu",
         game_config=config,
     )
+
+
+def test_new_training_defaults_use_survival_mask_with_legacy_safe_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = parse_args([])
+    assert args.action_mask_mode == "one_step_survival_v1"
+    assert args.idle_limit_floor_steps == 0
+    assert args.policy_anchor_final_weight == pytest.approx(args.policy_anchor_weight)
+    assert args.policy_anchor_decay_steps == 0
+    assert args.demonstration_terminal_exclusion_steps == 1
+
+    legacy_args = parse_args(["--network-version", "2"])
+    assert legacy_args.action_mask_mode == "legal_v1"
+
+    env = SnakeGameEnv(GameConfig(width=5, height=5))
+    agent = make_agent(env.config)
+    monkeypatch.setattr(env, "relative_survival_mask", lambda: (False, True, False))
+    assert action_mask(agent, env) == [False, True, False]
+    agent.action_mask_mode = "legal_v1"
+    assert action_mask(agent, env) == [True, True, True]
 
 
 def test_cpu_runtime_info_and_cleanup_are_safe() -> None:
@@ -677,6 +735,7 @@ def test_full_resume_rejects_best_checkpoint_role() -> None:
         "checkpoint_role": "best_eval",
         "network_version": agent.network_version,
         "action_dim": agent.action_dim,
+        "action_mask_mode": agent.action_mask_mode,
         "obs_shape": list(agent.obs_shape),
         "behavior_steps": agent.behavior_steps,
         "learn_step_counter": agent.learn_step_counter,
@@ -1563,7 +1622,15 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
     assert latest_metadata["learn_step_counter"] == 2
     assert latest_metadata["best_eval_score"] == pytest.approx(5.0)
     assert latest_metadata["best_eval_episode"] == 0
+    assert latest_metadata["action_mask_mode"] == "one_step_survival_v1"
     assert latest_metadata["effective_agent_config"]["policy_anchor_enabled"] is True
+    assert latest_metadata["effective_agent_config"][
+        "policy_anchor_final_weight"
+    ] == pytest.approx(0.5)
+    assert latest_metadata["effective_agent_config"]["policy_anchor_decay_steps"] == 0
+    assert latest_metadata["effective_agent_config"][
+        "demonstration_terminal_exclusion_steps"
+    ] == 1
     assert latest_metadata["effective_agent_config"][
         "demonstration_batch_fraction"
     ] == pytest.approx(0.5)
@@ -1614,6 +1681,10 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
     )
     assert all(
         record["avg_demonstration_batch_fraction"] == pytest.approx(0.5)
+        for record in learned_collections
+    )
+    assert all(
+        "effective_policy_anchor_weight" in record
         for record in learned_collections
     )
     assert (

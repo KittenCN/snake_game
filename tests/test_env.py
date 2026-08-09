@@ -180,6 +180,82 @@ def test_zero_idle_base_disables_timeout_even_with_growth() -> None:
     assert env.observation()["idle_limit"] == 0
 
 
+def test_idle_limit_floor_protects_large_board_without_blocking_growth() -> None:
+    env = SnakeGameEnv(
+        GameConfig(
+            width=12,
+            height=12,
+            max_idle_steps=90,
+            idle_growth_per_food=2,
+            idle_limit_floor_steps=144,
+        )
+    )
+
+    env._score = 9
+    assert env.idle_limit == 144
+    env._score = 30
+    assert env.idle_limit == 150
+
+
+def test_idle_limit_floor_requires_idle_timeout_to_be_enabled() -> None:
+    with pytest.raises(ValueError, match="requires max_idle_steps"):
+        GameConfig(max_idle_steps=0, idle_limit_floor_steps=1).validate()
+
+
+def test_relative_survival_mask_rejects_wall_but_keeps_safe_turns() -> None:
+    env = SnakeGameEnv(GameConfig(width=5, height=5))
+    _install_state(
+        env,
+        [(2, 0), (2, 1), (2, 2)],
+        direction=Action.UP,
+        food=(4, 4),
+    )
+
+    assert env.relative_survival_mask() == (False, True, True)
+
+
+def test_relative_survival_mask_allows_vacating_tail_and_wrap() -> None:
+    env = SnakeGameEnv(GameConfig(width=4, height=4))
+    _install_state(
+        env,
+        [(2, 1), (2, 2), (1, 2), (1, 1)],
+        direction=Action.UP,
+        food=(0, 0),
+    )
+    assert env.relative_survival_mask() == (True, True, True)
+
+    wrapped = SnakeGameEnv(GameConfig(width=5, height=5, allow_wrap=True))
+    _install_state(
+        wrapped,
+        [(2, 0), (2, 1), (2, 2)],
+        direction=Action.UP,
+        food=(4, 4),
+    )
+    assert wrapped.relative_survival_mask()[RelativeAction.STRAIGHT] is True
+
+
+def test_relative_survival_mask_falls_back_when_every_action_is_terminal() -> None:
+    env = SnakeGameEnv(GameConfig(width=5, height=5))
+    _install_state(
+        env,
+        [
+            (2, 2),
+            (2, 1),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+            (3, 2),
+            (3, 1),
+        ],
+        direction=Action.UP,
+        food=(0, 0),
+    )
+
+    assert env.relative_survival_mask() == (True, True, True)
+
+
 def test_config_seed_produces_reproducible_but_distinct_episode_sequence() -> None:
     first = SnakeGameEnv(GameConfig(width=9, height=9, seed=12345))
     second = SnakeGameEnv(GameConfig(width=9, height=9, seed=12345))

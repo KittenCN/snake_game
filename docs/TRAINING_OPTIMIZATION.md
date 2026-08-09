@@ -214,8 +214,34 @@ success 门槛的轨迹晋升为 tier 1，同时超过更高 score/return 门槛
 负终局 TD 与成功动作 margin 发生梯度冲突。demo 采用无放回采样；unique transition 不足时只使用当前
 可用数量，其余 batch 回填普通 PER，随 demo 积累逐步达到目标配额。demo 不套用普通 PER importance
 公式，避免在优先级无放回抽样中使用错误的 inclusion probability；每个入选 demo 的 TD 权重均为 1。
-checkpoint 不保存两个大 replay；完整 resume 会从冻结 teacher 重新采集并重建 demo，所有门槛、batch
+demo replay 到达容量后会先对完整轨迹做准入预检：只有质量元组 `(tier, score, return)` 严格高于足够
+数量的现有样本时才整条替换，因此 success 不能覆盖 elite，失败准入也不会造成部分写入。
+`--demonstration-terminal-exclusion-steps` 可把终点前多个高风险动作排除在 imitation 外，而不是只排除
+最后一步。checkpoint 不保存两个大 replay；完整 resume 会从冻结 teacher 重新采集并重建 demo，所有门槛、batch
 占比、imitation 参数及累计晋升计数仍进入 checkpoint/sidecar 供身份校验与审计。
+
+### 固定 12x12 的收敛后提分
+
+服务器 `stable_v7_transfer_12x12` 在 episode 11200 得到 fixed-suite best `9.432`，随后在 episode
+25200 以 `min_lr_early_stop_patience` 停止。独立 1000-seed 留出评估中，v7 best 平均分为 `9.191`
+（95% CI `[8.899, 9.483]`），明显优于 v6 source 的 `5.336`，也优于 v7 latest 的 `8.523`；因此
+下阶段必须从 immutable v7 best warm start，而不是恢复退化的 latest。
+
+后期继续提高分数的四个约束修复为：
+
+- `idle_limit_floor_steps=144`：12x12 至少允许一个棋盘面积量级的无食物移动窗口；旧 checkpoint 缺省
+  为 0，且禁用 idle 时不能单独设置 floor。
+- `one_step_survival_v1`：在合法相对动作中优先保留不会下一步立即撞墙/撞身的动作；若所有动作都会
+  立即死亡则回退完整合法集合，避免全 false mask 产生无效 TD target。行为采集、teacher、固定评估、
+  推理和非终止 next-state target 共用同一 helper，终止 transition 的 next mask 规范化为全 true。
+- anchor 从 `0.20` 在 teacher replay 完成后按 behavior steps 线性退火到 `0.03`，避免固定 anchor 在
+  后期永久把策略束缚在 source Q 值附近。有效权重及 schedule 状态进入 checkpoint/sidecar 和日志。
+- demo 保留高质量整轨迹、排除终点前 3 个动作的 imitation，降低自撞/撞墙前连续危险动作与负 TD
+  target 的梯度冲突。
+
+这些参数改变了动作约束与 idle MDP 身份，因此应新建 `stable_v8_score_12x12`，不得 full resume v7。
+README 中的完整命令使用新 seed base 1700000 和全新输出。episode-0 baseline 是 v7 权重在 v8 身份下
+的重新评估；v8 只在自身相同评估身份内做 paired promotion、降学习率和停止决策。
 
 从 immutable `stable_v5_best` 迁移到 10x10 的新推荐命令：
 
@@ -319,4 +345,6 @@ best checkpoint 作为下一阶段 source；不要从未经独立配对证据验
 - 单元测试覆盖 replay、n-step target、动作掩码、target 同步、截断和固定 seed 评估。
 - 保守 warm start 覆盖冻结 teacher、零更新 replay 预热、anchor checkpoint 恢复、配对晋升与退化停止。
 - demonstration 回归覆盖完整轨迹原子晋升、覆盖版本保护、success/elite 分层采样、large-margin imitation 和 resume 参数身份。
+- 12x12 提分回归覆盖 idle floor、一步生存动作掩码/all-fatal 回退、terminal next mask、anchor 退火恢复、
+  demo 严格质量替换与多步 terminal imitation 排除。
 - 确定性短训练 smoke test 无 NaN/Inf，能生成可恢复 latest checkpoint 与独立选出的 best checkpoint。

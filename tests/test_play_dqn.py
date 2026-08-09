@@ -10,6 +10,7 @@ import torch
 from dqn_agent import DQNAgent, flatten_observation
 from env import GameConfig
 from play_dqn import (
+    action_mask,
     build_env_from_metadata,
     load_inference_agent,
     parse_args,
@@ -28,6 +29,7 @@ def _save_source(path: Path) -> tuple[DQNAgent, str]:
         replay_capacity=16,
         obs_shape=(20, 8, 8),
         network_version=3,
+        action_mask_mode="one_step_survival_v1",
         game_config=GameConfig(width=8, height=8, max_episode_steps=1280),
         device="cpu",
         amp_enabled=False,
@@ -42,6 +44,10 @@ def _save_source(path: Path) -> tuple[DQNAgent, str]:
                 "checkpoint_role": "best_eval",
                 "checkpoint_sha256": digest,
                 "episodes_completed": 500,
+                "network_version": source.network_version,
+                "action_dim": source.action_dim,
+                "action_mask_mode": source.action_mask_mode,
+                "obs_shape": list(source.obs_shape),
             }
         ),
         encoding="utf-8",
@@ -74,6 +80,7 @@ def test_play_policy_only_transfer_8x8_to_10x10_and_infers(tmp_path: Path) -> No
     observation, _, _, _ = step_agent_action(agent, env, action)
 
     assert agent.obs_shape == (20, 10, 10)
+    assert agent.action_mask_mode == "one_step_survival_v1"
     assert env.config.width == 10
     assert env.config.height == 10
     assert env.config.max_episode_steps == 2000
@@ -104,6 +111,20 @@ def test_play_same_map_still_uses_fresh_policy_only_agent(tmp_path: Path) -> Non
     assert agent.learn_step_counter == 0
     assert agent.optimizer.state_dict()["state"] == {}
     assert provenance["cross_map"] is False
+
+
+def test_play_uses_checkpointed_survival_mask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "best.pt"
+    _save_source(model)
+    agent, _ = load_inference_agent(
+        model, parse_args(["--model", str(model), "--device", "cpu"])
+    )
+    env = build_env_from_metadata(agent, seed=123)
+    monkeypatch.setattr(env, "relative_survival_mask", lambda: (True, False, False))
+
+    assert action_mask(agent, env) == [True, False, False]
 
 
 def test_play_cli_rejects_partial_map_override_and_sidecar_hash_conflict(

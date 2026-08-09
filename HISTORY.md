@@ -1,5 +1,14 @@
 # History
 
+## 0.6.0 - 2026-08-09
+
+- Added a configurable idle-limit floor so large boards do not terminate otherwise safe long-path play before one board-area traversal.
+- Added a versioned one-step-survival action mask shared by collection, teacher, evaluation, inference and Double-DQN bootstrap, with a safe all-fatal fallback and canonical terminal masks.
+- Added behavior-step policy-anchor annealing from an initial to a final weight after teacher replay warmup, with checkpoint, sidecar, resume and logging identity.
+- Made demonstration admission atomic and quality-monotonic at capacity, preventing success trajectories from overwriting elite samples.
+- Added configurable multi-step terminal imitation exclusion to keep pre-crash actions out of the successful-action margin objective.
+- Added the evidence-backed fixed-12x12 v8 score-improvement profile and regressions for all new MDP, replay and loss contracts.
+
 ## 0.5.2 - 2026-08-08
 
 - Added a single-read, optionally SHA-256-authenticated policy checkpoint factory that constructs a fresh target-map agent without restoring optimizer, replay, counters, scaler or RNG state.

@@ -90,6 +90,8 @@ _NETWORK_SCHEMAS: dict[int, dict[str, Any]] = {
     },
 }
 
+_ACTION_MASK_MODES = {"legal_v1", "one_step_survival_v1"}
+
 
 class ReplayBuffer:
     """Lazy CPU ring buffer with proportional prioritized replay.
@@ -304,6 +306,7 @@ class ReplayBuffer:
         trajectory_score: float = 0.0,
         trajectory_return: float = 0.0,
         imitation_eligible: bool = False,
+        _storage_index: int | None = None,
     ) -> tuple[int, int]:
         if quality_tier not in (0, 1, 2):
             raise ValueError(
@@ -331,7 +334,12 @@ class ReplayBuffer:
         if tuple(next_state_cpu.shape) != tuple(self._next_states.shape[1:]):
             raise ValueError("next_state shape does not match replay observation shape")
 
-        idx = self._position
+        if _storage_index is None:
+            idx = self._position
+        else:
+            idx = int(_storage_index)
+            if not 0 <= idx < self._size:
+                raise IndexError("replacement replay index out of range")
         self._states[idx].copy_(state_cpu)
         self._next_states[idx].copy_(next_state_cpu)
         self._actions[idx] = self._cpu_scalar(action, torch.long)
@@ -363,8 +371,9 @@ class ReplayBuffer:
         else:
             priority_value = abs(float(priority)) + self.priority_epsilon
         self._set_priority(idx, priority_value)
-        self._position = (self._position + 1) % self.capacity
-        self._size = min(self._size + 1, self.capacity)
+        if _storage_index is None:
+            self._position = (self._position + 1) % self.capacity
+            self._size = min(self._size + 1, self.capacity)
         return idx, slot_version
 
     @property
@@ -387,6 +396,7 @@ class ReplayBuffer:
         quality_tier: int,
         trajectory_score: float,
         trajectory_return: float,
+        imitation_exclusion_steps: int = 0,
     ) -> int:
         """Copy a completed trajectory if none of its ring slots were overwritten."""
         if quality_tier not in (1, 2):
@@ -395,6 +405,8 @@ class ReplayBuffer:
             return 0
         if len(tokens) > target.capacity:
             return 0
+        if imitation_exclusion_steps < 0:
+            raise ValueError("imitation_exclusion_steps must be non-negative")
         assert self._states is not None and self._next_states is not None
         assert self._actions is not None and self._rewards is not None
         assert self._dones is not None and self._discounts is not None
@@ -406,7 +418,38 @@ class ReplayBuffer:
                 return 0
             valid_indices.append(index)
 
-        for index in valid_indices:
+        free_count = target.capacity - len(target)
+        replacement_count = max(0, len(valid_indices) - free_count)
+        replacement_indices: list[int] = []
+        if replacement_count > 0:
+            incoming_quality = (
+                int(quality_tier),
+                float(trajectory_score),
+                float(trajectory_return),
+            )
+            weaker = [
+                index
+                for index in range(len(target))
+                if (
+                    int(target._quality_tiers[index].item()),
+                    float(target._trajectory_scores[index].item()),
+                    float(target._trajectory_returns[index].item()),
+                )
+                < incoming_quality
+            ]
+            weaker.sort(
+                key=lambda index: (
+                    int(target._quality_tiers[index].item()),
+                    float(target._trajectory_scores[index].item()),
+                    float(target._trajectory_returns[index].item()),
+                )
+            )
+            if len(weaker) < replacement_count:
+                return 0
+            replacement_indices = weaker[:replacement_count]
+
+        exclusion_start = max(0, len(valid_indices) - imitation_exclusion_steps)
+        for trajectory_index, index in enumerate(valid_indices):
             next_mask = (
                 self._next_action_masks[index]
                 if self._next_action_masks is not None
@@ -424,7 +467,15 @@ class ReplayBuffer:
                 quality_tier=quality_tier,
                 trajectory_score=trajectory_score,
                 trajectory_return=trajectory_return,
-                imitation_eligible=bool(self._imitation_eligible[index].item()),
+                imitation_eligible=(
+                    bool(self._imitation_eligible[index].item())
+                    and trajectory_index < exclusion_start
+                ),
+                _storage_index=(
+                    None
+                    if trajectory_index < free_count
+                    else replacement_indices[trajectory_index - free_count]
+                ),
             )
         return len(valid_indices)
 
@@ -931,9 +982,12 @@ class DQNAgent:
         game_config: GameConfig | None = None,
         obs_shape: Tuple[int, int, int] | None = None,
         network_version: int = 3,
+        action_mask_mode: str = "legal_v1",
         amp_enabled: bool | None = None,
         pin_memory: bool | None = None,
         policy_anchor_weight: float = 0.0,
+        policy_anchor_final_weight: float | None = None,
+        policy_anchor_decay_steps: int = 0,
         teacher_replay_steps: int = 0,
         demonstration_capacity: int = 0,
         demonstration_batch_fraction: float = 0.0,
@@ -944,6 +998,7 @@ class DQNAgent:
         demonstration_elite_return: float = 20.0,
         imitation_loss_weight: float = 0.0,
         imitation_margin: float = 0.8,
+        demonstration_terminal_exclusion_steps: int = 1,
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -985,14 +1040,40 @@ class DQNAgent:
                 f"{sorted(_NETWORK_SCHEMAS)}; got {network_version!r}"
             )
         self.network_version = network_version
+        if action_mask_mode not in _ACTION_MASK_MODES:
+            raise ValueError(
+                f"action_mask_mode must be one of {sorted(_ACTION_MASK_MODES)}"
+            )
+        if action_mask_mode == "one_step_survival_v1" and action_dim != 3:
+            raise ValueError(
+                "one_step_survival_v1 requires the three-action relative policy"
+            )
+        self.action_mask_mode = action_mask_mode
         if not math.isfinite(policy_anchor_weight) or policy_anchor_weight < 0:
             raise ValueError("policy_anchor_weight must be finite and non-negative")
+        if policy_anchor_final_weight is None:
+            policy_anchor_final_weight = policy_anchor_weight
+        if (
+            not math.isfinite(policy_anchor_final_weight)
+            or policy_anchor_final_weight < 0
+            or policy_anchor_final_weight > policy_anchor_weight
+        ):
+            raise ValueError(
+                "policy_anchor_final_weight must be finite and between zero and "
+                "policy_anchor_weight"
+            )
+        if policy_anchor_decay_steps < 0:
+            raise ValueError("policy_anchor_decay_steps must be non-negative")
         if teacher_replay_steps < 0:
             raise ValueError("teacher_replay_steps must be non-negative")
         if teacher_replay_steps > replay_capacity:
             raise ValueError("teacher_replay_steps must not exceed replay_capacity")
         if demonstration_capacity < 0:
             raise ValueError("demonstration_capacity must be non-negative")
+        if demonstration_terminal_exclusion_steps < 0:
+            raise ValueError(
+                "demonstration_terminal_exclusion_steps must be non-negative"
+            )
         if not 0.0 <= demonstration_batch_fraction < 1.0:
             raise ValueError("demonstration_batch_fraction must be in [0, 1)")
         if (
@@ -1045,6 +1126,8 @@ class DQNAgent:
                 "demonstration_batch_fraction must be positive when imitation loss is enabled"
             )
         self.policy_anchor_weight = float(policy_anchor_weight)
+        self.policy_anchor_final_weight = float(policy_anchor_final_weight)
+        self.policy_anchor_decay_steps = int(policy_anchor_decay_steps)
         self.teacher_replay_steps = int(teacher_replay_steps)
         self.demonstration_capacity = int(demonstration_capacity)
         self.demonstration_batch_fraction = float(demonstration_batch_fraction)
@@ -1057,6 +1140,9 @@ class DQNAgent:
         self.demonstration_elite_return = float(demonstration_elite_return)
         self.imitation_loss_weight = float(imitation_loss_weight)
         self.imitation_margin = float(imitation_margin)
+        self.demonstration_terminal_exclusion_steps = int(
+            demonstration_terminal_exclusion_steps
+        )
         self._configure_amp(amp_enabled)
 
         if obs_shape is None:
@@ -1134,6 +1220,16 @@ class DQNAgent:
     @property
     def policy_anchor_enabled(self) -> bool:
         return self.policy_anchor_net is not None
+
+    @property
+    def effective_policy_anchor_weight(self) -> float:
+        if self.policy_anchor_decay_steps <= 0:
+            return self.policy_anchor_weight
+        decay_behavior_steps = max(0, self.behavior_steps - self.teacher_replay_steps)
+        progress = min(1.0, decay_behavior_steps / self.policy_anchor_decay_steps)
+        return self.policy_anchor_weight + progress * (
+            self.policy_anchor_final_weight - self.policy_anchor_weight
+        )
 
     def configure_amp(self, enabled: bool | None = None) -> None:
         self._configure_amp(enabled)
@@ -1321,6 +1417,7 @@ class DQNAgent:
                 quality_tier=quality_tier,
                 trajectory_score=float(score),
                 trajectory_return=float(episode_return),
+                imitation_exclusion_steps=self.demonstration_terminal_exclusion_steps,
             )
             if promoted > 0:
                 self.demonstration_trajectories_seen += 1
@@ -1371,7 +1468,8 @@ class DQNAgent:
     def learn(self) -> dict[str, float] | None:
         if len(self.replay_buffer) < max(self.batch_size, self.min_replay_size):
             return None
-        if self.policy_anchor_weight > 0 and self.policy_anchor_net is None:
+        effective_anchor_weight = self.effective_policy_anchor_weight
+        if effective_anchor_weight > 0 and self.policy_anchor_net is None:
             raise RuntimeError(
                 "policy anchor weight is enabled but no frozen anchor is configured"
             )
@@ -1456,7 +1554,7 @@ class DQNAgent:
             td_errors = targets - q_values
             element_losses = F.smooth_l1_loss(q_values, targets, reduction="none")
             td_loss = (batch.weights * element_losses).mean()
-            if self.policy_anchor_net is not None and self.policy_anchor_weight > 0:
+            if self.policy_anchor_net is not None and effective_anchor_weight > 0:
                 with torch.no_grad():
                     anchor_q_values = self.policy_anchor_net(batch.states)
                 anchor_loss = F.smooth_l1_loss(
@@ -1490,7 +1588,7 @@ class DQNAgent:
                 )
             loss = (
                 td_loss
-                + self.policy_anchor_weight * anchor_loss
+                + effective_anchor_weight * anchor_loss
                 + self.imitation_loss_weight * imitation_loss
             )
 
@@ -1537,7 +1635,7 @@ class DQNAgent:
             "loss": loss_value,
             "td_loss": td_loss_value,
             "anchor_loss": anchor_loss_value,
-            "anchor_weight": self.policy_anchor_weight,
+            "anchor_weight": effective_anchor_weight,
             "imitation_loss": imitation_loss_value,
             "imitation_weight": self.imitation_loss_weight,
             "demonstration_batch_fraction": demo_count / self.batch_size,
@@ -1620,6 +1718,7 @@ class DQNAgent:
                 "learn_step_counter": self.learn_step_counter,
                 "obs_shape": self.obs_shape,
                 "network_version": self.network_version,
+                "action_mask_mode": self.action_mask_mode,
                 "observation_schema": _NETWORK_SCHEMAS[self.network_version][
                     "observation_schema"
                 ],
@@ -1630,6 +1729,9 @@ class DQNAgent:
                     "spatial_transfer_capable"
                 ],
                 "policy_anchor_weight": self.policy_anchor_weight,
+                "policy_anchor_final_weight": self.policy_anchor_final_weight,
+                "policy_anchor_decay_steps": self.policy_anchor_decay_steps,
+                "effective_policy_anchor_weight": self.effective_policy_anchor_weight,
                 "teacher_replay_steps": self.teacher_replay_steps,
                 "demonstration_capacity": self.demonstration_capacity,
                 "demonstration_batch_fraction": self.demonstration_batch_fraction,
@@ -1640,6 +1742,9 @@ class DQNAgent:
                 "demonstration_elite_return": self.demonstration_elite_return,
                 "imitation_loss_weight": self.imitation_loss_weight,
                 "imitation_margin": self.imitation_margin,
+                "demonstration_terminal_exclusion_steps": (
+                    self.demonstration_terminal_exclusion_steps
+                ),
                 "demonstration_replay_size": (
                     len(self.demonstration_replay)
                     if self.demonstration_replay is not None
@@ -1878,6 +1983,7 @@ class DQNAgent:
             return None
         config_data = dict(raw_config)
         config_data.setdefault("idle_growth_per_food", 0)
+        config_data.setdefault("idle_limit_floor_steps", 0)
         config_data.setdefault("max_episode_steps", 0)
         return GameConfig(**config_data)
 
@@ -1971,6 +2077,9 @@ class DQNAgent:
                 "Policy transfer inherits checkpoint network structure; remove agent_options: "
                 + ", ".join(forbidden)
             )
+        action_mask_mode = str(
+            options.pop("action_mask_mode", metadata.get("action_mask_mode", "legal_v1"))
+        )
         target_obs_shape = (
             int(source_obs_shape[0]),
             int(target_game_config.height),
@@ -2028,6 +2137,7 @@ class DQNAgent:
             game_config=target_game_config,
             obs_shape=target_obs_shape,
             network_version=network_version,
+            action_mask_mode=action_mask_mode,
             **options,
         )
         embedded_metadata = agent._apply_policy_checkpoint_snapshot(snapshot)
@@ -2053,6 +2163,8 @@ class DQNAgent:
             ),
             "source_network_version": network_version,
             "source_action_dim": action_dim,
+            "source_action_mask_mode": metadata.get("action_mask_mode", "legal_v1"),
+            "target_action_mask_mode": agent.action_mask_mode,
             "source_hidden_sizes": list(hidden_sizes),
             "source_obs_shape": list(source_obs_shape),
             "target_obs_shape": list(target_obs_shape),
@@ -2080,6 +2192,7 @@ class DQNAgent:
             "network_version": transfer_provenance.get("source_network_version"),
             "action_dim": transfer_provenance.get("source_action_dim"),
             "obs_shape": transfer_provenance.get("source_obs_shape"),
+            "action_mask_mode": transfer_provenance.get("source_action_mask_mode"),
         }
         conflicts = {
             key: (sidecar_metadata[key], value)
@@ -2121,6 +2234,7 @@ class DQNAgent:
             # Missing fields retain historical fixed-idle/no-time-horizon
             # semantics instead of inheriting current dataclass defaults.
             game_config_data.setdefault("idle_growth_per_food", 0)
+            game_config_data.setdefault("idle_limit_floor_steps", 0)
             game_config_data.setdefault("max_episode_steps", 0)
         # Checkpoint device strings describe the machine that created the artifact,
         # not a portable runtime requirement. An omitted override follows the current
@@ -2154,11 +2268,16 @@ class DQNAgent:
             game_config=GameConfig(**game_config_data) if game_config_data else None,
             obs_shape=obs_shape,
             network_version=metadata.get("network_version", 1),
+            action_mask_mode=metadata.get("action_mask_mode", "legal_v1"),
             amp_enabled=metadata.get("amp_enabled"),
             # Pinned memory is a runtime/device property and replay is not
             # restored, so configure it from the selected device every time.
             pin_memory=None,
             policy_anchor_weight=metadata.get("policy_anchor_weight", 0.0),
+            policy_anchor_final_weight=metadata.get(
+                "policy_anchor_final_weight", metadata.get("policy_anchor_weight", 0.0)
+            ),
+            policy_anchor_decay_steps=metadata.get("policy_anchor_decay_steps", 0),
             teacher_replay_steps=metadata.get("teacher_replay_steps", 0),
             demonstration_capacity=metadata.get("demonstration_capacity", 0),
             demonstration_batch_fraction=metadata.get(
@@ -2173,6 +2292,9 @@ class DQNAgent:
             demonstration_elite_return=metadata.get("demonstration_elite_return", 20.0),
             imitation_loss_weight=metadata.get("imitation_loss_weight", 0.0),
             imitation_margin=metadata.get("imitation_margin", 0.8),
+            demonstration_terminal_exclusion_steps=metadata.get(
+                "demonstration_terminal_exclusion_steps", 1
+            ),
         )
         agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
         agent.target_net.load_state_dict(
@@ -2215,6 +2337,16 @@ class DQNAgent:
             )
             agent.behavior_steps = int(
                 max(0.0, min(1.0, progress)) * agent.epsilon_decay_steps
+            )
+        stored_effective_anchor = metadata.get("effective_policy_anchor_weight")
+        if stored_effective_anchor is not None and not math.isclose(
+            float(stored_effective_anchor),
+            agent.effective_policy_anchor_weight,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                "checkpoint policy-anchor decay progress conflicts with behavior_steps"
             )
         agent.replay_restored = False
         agent._restore_rng_state(checkpoint.get("rng_state"))
