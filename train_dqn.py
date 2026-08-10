@@ -39,7 +39,8 @@ except ImportError:
 
 CHECKPOINT_FORMAT = 4
 V3_OBSERVATION_CHANNELS = 20
-CONVERGENCE_CONTROLLER_VERSION = 3
+CONVERGENCE_CONTROLLER_VERSION = 4
+INCONCLUSIVE_SCHEDULER_MODES = {"defer_v1", "bounded_probe_v1"}
 
 
 @dataclass
@@ -61,6 +62,11 @@ class EvaluationConvergenceController:
     regression_stop_delta: float = 0.0
     adaptive_eval_max_episodes: int = 0
     adaptive_eval_growth_factor: float = 2.0
+    inconclusive_scheduler_mode: str = "defer_v1"
+    bounded_inconclusive_patience: int = 0
+    full_eval_confirmation_interval: int = 0
+    full_eval_seed_base: int = 1_000_000
+    full_eval_max_attempts: int = 0
     reference_score: float | None = None
     reference_scores: list[float] | None = None
     plateau_evaluations: int = 0
@@ -68,6 +74,11 @@ class EvaluationConvergenceController:
     regression_evaluations: int = 0
     reductions: int = 0
     evaluations: int = 0
+    probe_inconclusive_evaluations: int = 0
+    evaluation_episodes: int = 0
+    evaluation_seconds: float = 0.0
+    full_eval_attempts: int = 0
+    scheduler_probes: int = 0
     migration_note: str | None = None
 
     @property
@@ -82,6 +93,7 @@ class EvaluationConvergenceController:
         self.regression_evaluations = 0
         self.reductions = 0
         self.evaluations = 0
+        self.probe_inconclusive_evaluations = 0
 
     def set_paired_reference(self, scores: Sequence[float | int]) -> None:
         parsed = [float(value) for value in scores]
@@ -89,26 +101,42 @@ class EvaluationConvergenceController:
             raise ValueError("Paired reference scores must be non-empty and finite")
         self.reference_scores = parsed
         self.regression_evaluations = 0
+        self.probe_inconclusive_evaluations = 0
+
+    def record_evaluation_cost(self, episodes: int, seconds: float) -> None:
+        if episodes <= 0:
+            raise ValueError("Evaluation episode cost must be positive")
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("Evaluation duration must be finite and non-negative")
+        self.evaluation_episodes += int(episodes)
+        self.evaluation_seconds += float(seconds)
 
     def paired_comparison(
         self,
         scores: Sequence[float | int] | None,
         *,
         planned_looks: int = 1,
+        reference_scores: Sequence[float | int] | None = None,
     ) -> dict[str, Any] | None:
-        if scores is None or self.reference_scores is None:
+        resolved_reference = (
+            self.reference_scores if reference_scores is None else reference_scores
+        )
+        if scores is None or resolved_reference is None:
             return None
         candidate = [float(value) for value in scores]
-        if len(candidate) > len(self.reference_scores):
+        parsed_reference = [float(value) for value in resolved_reference]
+        if len(candidate) > len(parsed_reference):
             raise ValueError(
                 "Paired candidate exceeds the complete reference sample count: "
-                f"reference={len(self.reference_scores)}, candidate={len(candidate)}"
+                f"reference={len(parsed_reference)}, candidate={len(candidate)}"
             )
         if not candidate or not all(math.isfinite(value) for value in candidate):
             raise ValueError("Paired candidate scores must be non-empty and finite")
         if planned_looks <= 0:
             raise ValueError("Paired comparison planned looks must be positive")
-        reference_prefix = self.reference_scores[: len(candidate)]
+        if not all(math.isfinite(value) for value in parsed_reference):
+            raise ValueError("Paired reference scores must be finite")
+        reference_prefix = parsed_reference[: len(candidate)]
         differences = [
             current - reference
             for current, reference in zip(candidate, reference_prefix, strict=True)
@@ -176,44 +204,96 @@ class EvaluationConvergenceController:
         sample_scores: Sequence[float | int] | None = None,
         defer_reason: str | None = None,
         planned_looks: int = 1,
+        evaluation_scope: str = "full_evaluation",
+        is_max_sample: bool = False,
+        comparison_reference_scores: Sequence[float | int] | None = None,
     ) -> dict[str, Any]:
         if not math.isfinite(score):
             raise ValueError("Evaluation score must be finite")
+        if evaluation_scope not in {
+            "full_evaluation",
+            "full_confirmation",
+            "scheduler_probe",
+        }:
+            raise ValueError("Unknown evaluation scope")
         before_reference = self.reference_score
         before_lrs = self.learning_rates(optimizer)
-        paired = self.paired_comparison(sample_scores, planned_looks=planned_looks)
+        paired = self.paired_comparison(
+            sample_scores,
+            planned_looks=planned_looks,
+            reference_scores=comparison_reference_scores,
+        )
         aggregate_significant = (
             before_reference is None
             or score >= before_reference + self.early_stop_delta
         )
-        if defer_reason is not None:
+
+        def payload(
+            *,
+            decision: str,
+            significant: bool = False,
+            clear_regression: bool = False,
+            reduced: bool = False,
+            stop: bool = False,
+            observation_deferred: bool = False,
+            patience_deferred: bool = False,
+            bounded_triggered: bool = False,
+        ) -> dict[str, Any]:
+            statistical_state = (
+                str(paired["statistical_state"])
+                if paired is not None
+                else (
+                    "confirmed_improvement"
+                    if aggregate_significant
+                    else "confirmed_plateau"
+                )
+            )
             return {
                 "score": score,
-                "decision": defer_reason,
-                "observation_deferred": True,
-                "significant_improvement": False,
+                "decision": decision,
+                "evaluation_scope": evaluation_scope,
+                "is_max_sample": bool(is_max_sample),
+                "observation_deferred": observation_deferred,
+                "significant_improvement": significant,
                 "aggregate_significant_improvement": aggregate_significant,
                 "paired_comparison": paired,
-                "paired_promotion_eligible": False,
-                "clear_regression": False,
-                "statistical_state": (
-                    paired["statistical_state"] if paired else "deferred"
+                "paired_promotion_eligible": bool(
+                    evaluation_scope in {"full_evaluation", "full_confirmation"}
+                    and paired
+                    and paired["promotion_eligible"]
                 ),
-                "patience_deferred": True,
+                "clear_regression": clear_regression,
+                "statistical_state": statistical_state,
+                "patience_deferred": patience_deferred,
                 "regression_evaluations": self.regression_evaluations,
-                "lr_reduced": False,
-                "should_stop": False,
+                "lr_reduced": reduced,
+                "should_stop": stop,
                 "reference_score_before": before_reference,
                 "reference_score": self.reference_score,
                 "learning_rates_before": before_lrs,
-                "learning_rates": before_lrs,
+                "learning_rates": self.learning_rates(optimizer),
                 "at_min_lr": self.at_min_lr(optimizer),
                 "plateau_evaluations": self.plateau_evaluations,
                 "min_lr_evaluations": self.min_lr_evaluations,
+                "probe_inconclusive_evaluations": self.probe_inconclusive_evaluations,
+                "bounded_inconclusive_triggered": bounded_triggered,
+                "inconclusive_scheduler_mode": self.inconclusive_scheduler_mode,
                 "reductions": self.reductions,
                 "evaluations": self.evaluations,
+                "evaluation_episodes": self.evaluation_episodes,
+                "evaluation_seconds": self.evaluation_seconds,
+                "full_eval_attempts": self.full_eval_attempts,
+                "full_eval_max_attempts": self.full_eval_max_attempts,
+                "scheduler_probes": self.scheduler_probes,
                 "migration_note": self.migration_note,
             }
+
+        if defer_reason is not None:
+            return payload(
+                decision=defer_reason,
+                observation_deferred=True,
+                patience_deferred=True,
+            )
         self.evaluations += 1
         statistical_state = (
             str(paired["statistical_state"])
@@ -224,11 +304,71 @@ class EvaluationConvergenceController:
                 else "confirmed_plateau"
             )
         )
-        significant = aggregate_significant and (
+
+        if evaluation_scope == "scheduler_probe":
+            if paired is None:
+                raise ValueError("Scheduler probes require a paired reference")
+            self.scheduler_probes += 1
+            reduced = False
+            patience_deferred = True
+            bounded_triggered = False
+            decision = f"scheduler_probe_{statistical_state}"
+            if (
+                statistical_state == "inconclusive"
+                and self.inconclusive_scheduler_mode == "bounded_probe_v1"
+                and self.bounded_inconclusive_patience > 0
+            ):
+                self.probe_inconclusive_evaluations += 1
+                if (
+                    self.probe_inconclusive_evaluations
+                    >= self.bounded_inconclusive_patience
+                ):
+                    bounded_triggered = True
+                    self.probe_inconclusive_evaluations = 0
+            else:
+                self.probe_inconclusive_evaluations = 0
+            spends_plateau_tick = (
+                statistical_state == "confirmed_plateau" or bounded_triggered
+            )
+            if spends_plateau_tick:
+                prefix = (
+                    "bounded_probe_inconclusive"
+                    if bounded_triggered
+                    else "scheduler_probe"
+                )
+                if not self.scheduler_enabled:
+                    decision = f"{prefix}_no_scheduler"
+                elif self.at_min_lr(optimizer):
+                    decision = f"{prefix}_at_min_lr_deferred"
+                else:
+                    patience_deferred = False
+                    self.plateau_evaluations += 1
+                    decision = f"{prefix}_plateau_patience"
+                    if self.plateau_evaluations >= self.lr_plateau_patience:
+                        for group in optimizer.param_groups:
+                            group["lr"] = max(
+                                self.lr_plateau_min,
+                                float(group["lr"]) * self.lr_plateau_factor,
+                            )
+                        self.reductions += 1
+                        self.plateau_evaluations = 0
+                        self.min_lr_evaluations = 0
+                        reduced = True
+                        decision = f"{prefix}_lr_reduced"
+            return payload(
+                decision=decision,
+                reduced=reduced,
+                patience_deferred=patience_deferred,
+                bounded_triggered=bounded_triggered,
+            )
+
+        significant = (
             before_reference is None
-            or not self.require_paired_promotion
             or statistical_state == "confirmed_improvement"
+            if self.require_paired_promotion and paired is not None
+            else aggregate_significant
         )
+        bounded_triggered = False
         clear_regression = bool(
             self.require_paired_promotion
             and self.regression_stop_patience > 0
@@ -246,10 +386,13 @@ class EvaluationConvergenceController:
         reduced = False
         stop = False
         decision = "significant_improvement"
+        patience_deferred = False
 
         if significant:
             self.reference_score = (
-                score if before_reference is None else max(before_reference, score)
+                score
+                if before_reference is None or evaluation_scope == "full_confirmation"
+                else max(before_reference, score)
             )
             self.plateau_evaluations = 0
             self.min_lr_evaluations = 0
@@ -262,6 +405,7 @@ class EvaluationConvergenceController:
             # advance two independent stop mechanisms.
             decision = "paired_clear_regression"
         elif self.require_paired_promotion and statistical_state == "inconclusive":
+            patience_deferred = True
             decision = "paired_inconclusive"
         elif not self.scheduler_enabled:
             self.plateau_evaluations += 1
@@ -277,6 +421,10 @@ class EvaluationConvergenceController:
                 self.early_stop_patience > 0
                 and self.min_lr_evaluations >= self.early_stop_patience
             )
+        elif evaluation_scope == "full_confirmation":
+            # Probe decisions own pre-min-LR scheduling. Full confirmations are
+            # reserved for promotion, regression, and conservative min-LR stop.
+            decision = "full_confirmation_plateau_no_scheduler_tick"
         else:
             self.plateau_evaluations += 1
             decision = "lr_plateau_patience"
@@ -292,34 +440,15 @@ class EvaluationConvergenceController:
                 reduced = True
                 decision = "lr_reduced"
 
-        after_lrs = self.learning_rates(optimizer)
-        return {
-            "score": score,
-            "decision": decision,
-            "observation_deferred": False,
-            "significant_improvement": significant,
-            "aggregate_significant_improvement": aggregate_significant,
-            "paired_comparison": paired,
-            "paired_promotion_eligible": bool(paired and paired["promotion_eligible"]),
-            "clear_regression": clear_regression,
-            "statistical_state": statistical_state,
-            "patience_deferred": (
-                self.require_paired_promotion and statistical_state == "inconclusive"
-            ),
-            "regression_evaluations": self.regression_evaluations,
-            "lr_reduced": reduced,
-            "should_stop": stop,
-            "reference_score_before": before_reference,
-            "reference_score": self.reference_score,
-            "learning_rates_before": before_lrs,
-            "learning_rates": after_lrs,
-            "at_min_lr": self.at_min_lr(optimizer),
-            "plateau_evaluations": self.plateau_evaluations,
-            "min_lr_evaluations": self.min_lr_evaluations,
-            "reductions": self.reductions,
-            "evaluations": self.evaluations,
-            "migration_note": self.migration_note,
-        }
+        return payload(
+            decision=decision,
+            significant=significant,
+            clear_regression=clear_regression,
+            reduced=reduced,
+            stop=stop,
+            patience_deferred=patience_deferred,
+            bounded_triggered=bounded_triggered,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -336,6 +465,11 @@ class EvaluationConvergenceController:
                 "regression_stop_delta": self.regression_stop_delta,
                 "adaptive_eval_max_episodes": self.adaptive_eval_max_episodes,
                 "adaptive_eval_growth_factor": self.adaptive_eval_growth_factor,
+                "inconclusive_scheduler_mode": self.inconclusive_scheduler_mode,
+                "bounded_inconclusive_patience": self.bounded_inconclusive_patience,
+                "full_eval_confirmation_interval": self.full_eval_confirmation_interval,
+                "full_eval_seed_base": self.full_eval_seed_base,
+                "full_eval_max_attempts": self.full_eval_max_attempts,
             },
             "state": {
                 "reference_score": self.reference_score,
@@ -345,14 +479,31 @@ class EvaluationConvergenceController:
                 "regression_evaluations": self.regression_evaluations,
                 "reductions": self.reductions,
                 "evaluations": self.evaluations,
+                "probe_inconclusive_evaluations": (
+                    self.probe_inconclusive_evaluations
+                ),
+                "evaluation_episodes": self.evaluation_episodes,
+                "evaluation_seconds": self.evaluation_seconds,
+                "full_eval_attempts": self.full_eval_attempts,
+                "scheduler_probes": self.scheduler_probes,
                 "migration_note": self.migration_note,
             },
         }
 
+    def to_summary_dict(self) -> dict[str, Any]:
+        """Return controller state suitable for high-frequency JSONL records."""
+        summary = self.to_dict()
+        state = summary["state"]
+        reference_scores = state.pop("reference_scores")
+        state["reference_scores_count"] = (
+            0 if reference_scores is None else len(reference_scores)
+        )
+        return summary
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> EvaluationConvergenceController:
         version = payload.get("version")
-        if version not in {1, 2, CONVERGENCE_CONTROLLER_VERSION}:
+        if version not in {1, 2, 3, CONVERGENCE_CONTROLLER_VERSION}:
             raise RuntimeError(
                 "Unsupported convergence controller sidecar version: "
                 f"{payload.get('version')!r}"
@@ -379,6 +530,17 @@ class EvaluationConvergenceController:
             adaptive_eval_growth_factor=float(
                 config.get("adaptive_eval_growth_factor", 2.0)
             ),
+            inconclusive_scheduler_mode=str(
+                config.get("inconclusive_scheduler_mode", "defer_v1")
+            ),
+            bounded_inconclusive_patience=int(
+                config.get("bounded_inconclusive_patience", 0)
+            ),
+            full_eval_confirmation_interval=int(
+                config.get("full_eval_confirmation_interval", 0)
+            ),
+            full_eval_seed_base=int(config.get("full_eval_seed_base", 1_000_000)),
+            full_eval_max_attempts=int(config.get("full_eval_max_attempts", 0)),
             reference_score=(
                 None
                 if state.get("reference_score") is None
@@ -394,6 +556,13 @@ class EvaluationConvergenceController:
             regression_evaluations=int(state.get("regression_evaluations", 0)),
             reductions=int(state.get("reductions", 0)),
             evaluations=int(state.get("evaluations", 0)),
+            probe_inconclusive_evaluations=int(
+                state.get("probe_inconclusive_evaluations", 0)
+            ),
+            evaluation_episodes=int(state.get("evaluation_episodes", 0)),
+            evaluation_seconds=float(state.get("evaluation_seconds", 0.0)),
+            full_eval_attempts=int(state.get("full_eval_attempts", 0)),
+            scheduler_probes=int(state.get("scheduler_probes", 0)),
             migration_note=(
                 None
                 if state.get("migration_note") is None
@@ -448,6 +617,42 @@ class EvaluationConvergenceController:
             raise RuntimeError(
                 "Controller adaptive evaluation growth factor must be finite and greater than 1"
             )
+        if self.inconclusive_scheduler_mode not in INCONCLUSIVE_SCHEDULER_MODES:
+            raise RuntimeError("Controller inconclusive scheduler mode is unsupported")
+        if self.bounded_inconclusive_patience < 0:
+            raise RuntimeError(
+                "Controller bounded-inconclusive patience must be non-negative"
+            )
+        if (
+            self.inconclusive_scheduler_mode == "defer_v1"
+            and self.bounded_inconclusive_patience != 0
+        ):
+            raise RuntimeError(
+                "Controller defer_v1 mode requires zero bounded-inconclusive patience"
+            )
+        if (
+            self.inconclusive_scheduler_mode == "bounded_probe_v1"
+            and self.bounded_inconclusive_patience <= 0
+        ):
+            raise RuntimeError(
+                "Controller bounded_probe_v1 mode requires positive patience"
+            )
+        if self.full_eval_confirmation_interval < 0:
+            raise RuntimeError(
+                "Controller full evaluation confirmation interval must be non-negative"
+            )
+        if self.full_eval_seed_base < 0:
+            raise RuntimeError("Controller full evaluation seed base must be non-negative")
+        if self.full_eval_max_attempts < 0:
+            raise RuntimeError("Controller full evaluation max attempts must be non-negative")
+        if self.full_eval_confirmation_interval > 0 and (
+            not self.require_paired_promotion or self.full_eval_max_attempts <= 0
+        ):
+            raise RuntimeError(
+                "Controller gated full evaluation requires paired promotion and alpha budget"
+            )
+        if self.full_eval_attempts > self.full_eval_max_attempts:
+            raise RuntimeError("Controller full evaluation attempts exceed alpha budget")
         if self.reference_score is not None and not math.isfinite(self.reference_score):
             raise RuntimeError("Controller reference score must be finite or null")
         if self.reference_scores is not None and (
@@ -462,10 +667,18 @@ class EvaluationConvergenceController:
                 self.regression_evaluations,
                 self.reductions,
                 self.evaluations,
+                self.probe_inconclusive_evaluations,
+                self.evaluation_episodes,
+                self.full_eval_attempts,
+                self.scheduler_probes,
             )
             < 0
         ):
             raise RuntimeError("Controller counters must be non-negative")
+        if not math.isfinite(self.evaluation_seconds) or self.evaluation_seconds < 0:
+            raise RuntimeError(
+                "Controller cumulative evaluation duration must be finite and non-negative"
+            )
 
 
 def _same_artifact(first: Path, second: Path) -> bool:
@@ -643,8 +856,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--network-version", type=int, choices=[1, 2, 3], default=3)
     parser.add_argument(
         "--action-mask-mode",
-        choices=["legal_v1", "one_step_survival_v1"],
-        default="one_step_survival_v1",
+        choices=["legal_v1", "one_step_survival_v1", "topology_survival_v1"],
+        default="topology_survival_v1",
         help="Versioned behavior/target action-mask contract",
     )
     parser.add_argument("--output", default="models/dqn_snake_v3_best.pt")
@@ -693,6 +906,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Allow an intentional training episode-seed stream change on resume",
     )
     parser.add_argument("--log-dir", default="runs")
+    parser.add_argument(
+        "--collection-log-interval",
+        type=int,
+        default=10,
+        help="Write collection JSONL every N collections; evaluations/final state always log",
+    )
     parser.add_argument("--render-frequency", type=int, default=0)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--early-stop-patience", type=int, default=0)
@@ -723,6 +942,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--adaptive-eval-growth-factor", type=float, default=2.0)
+    parser.add_argument(
+        "--inconclusive-scheduler-mode",
+        choices=sorted(INCONCLUSIVE_SCHEDULER_MODES),
+        default="defer_v1",
+        help=(
+            "defer_v1 never spends patience for paired ambiguity; "
+            "bounded_probe_v1 may spend only pre-min-LR plateau patience"
+        ),
+    )
+    parser.add_argument(
+        "--bounded-inconclusive-patience",
+        type=int,
+        default=0,
+        help="Consecutive inconclusive scheduler probes per pre-min-LR plateau tick",
+    )
+    parser.add_argument(
+        "--full-eval-confirmation-interval",
+        type=int,
+        default=0,
+        help=(
+            "Run the maximum paired suite every N scheduler probes; 0 preserves "
+            "the adaptive evaluation pipeline"
+        ),
+    )
+    parser.add_argument(
+        "--full-eval-seed-base",
+        type=int,
+        default=1_000_000,
+        help="Disjoint seed namespace reserved for fresh full paired attempts",
+    )
+    parser.add_argument(
+        "--full-eval-max-attempts",
+        type=int,
+        default=0,
+        help="Pre-registered family-wise alpha budget for full paired attempts",
+    )
     # Accepted only to make old commands fail safe instead of re-enabling the rollback loop.
     parser.add_argument(
         "--resume-best-on-decline", action="store_true", help=argparse.SUPPRESS
@@ -742,12 +997,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "--action-mask-mode" in args._provided_options
             and args.action_mask_mode != "legal_v1"
         ):
-            parser.error("one_step_survival_v1 requires network-version 3")
+            parser.error("survival action masks require network-version 3")
         args.action_mask_mode = "legal_v1"
     if args.episodes <= 0 or args.eval_episodes <= 0:
         parser.error("episodes and eval-episodes must be positive")
     if args.eval_interval <= 0 or args.checkpoint_interval <= 0:
         parser.error("eval-interval and checkpoint-interval must be positive")
+    if args.collection_log_interval <= 0:
+        parser.error("collection-log-interval must be positive")
     if args.train_frequency <= 0 or args.gradient_steps <= 0:
         parser.error("train-frequency and gradient-steps must be positive")
     if args.num_envs <= 0 or args.rollout_steps <= 0:
@@ -869,6 +1126,59 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         and args.resume_from is None
     ):
         parser.error("adaptive evaluation requires --require-paired-promotion")
+    if args.bounded_inconclusive_patience < 0:
+        parser.error("bounded-inconclusive-patience must be non-negative")
+    if (
+        args.inconclusive_scheduler_mode == "defer_v1"
+        and args.bounded_inconclusive_patience != 0
+        and args.resume_from is None
+    ):
+        parser.error(
+            "bounded-inconclusive-patience requires "
+            "--inconclusive-scheduler-mode bounded_probe_v1"
+        )
+    if (
+        args.inconclusive_scheduler_mode == "bounded_probe_v1"
+        and args.bounded_inconclusive_patience <= 0
+        and args.resume_from is None
+    ):
+        parser.error(
+            "bounded_probe_v1 requires positive --bounded-inconclusive-patience"
+        )
+    if args.bounded_inconclusive_patience > 0 and (
+        not args.require_paired_promotion or args.lr_plateau_patience <= 0
+    ) and args.resume_from is None:
+        parser.error(
+            "bounded inconclusive scheduling requires paired promotion and LR scheduling"
+        )
+    if args.full_eval_confirmation_interval < 0:
+        parser.error("full-eval-confirmation-interval must be non-negative")
+    if args.full_eval_confirmation_interval > 0 and (
+        not args.require_paired_promotion
+        or args.adaptive_eval_max_episodes <= args.eval_episodes
+        or args.full_eval_max_attempts <= 0
+    ) and args.resume_from is None:
+        parser.error(
+            "gated full evaluation requires paired promotion, adaptive max > base, "
+            "and positive full-eval-max-attempts"
+        )
+    if args.full_eval_seed_base < 0:
+        parser.error("full-eval-seed-base must be non-negative")
+    if args.full_eval_max_attempts < 0:
+        parser.error("full-eval-max-attempts must be non-negative")
+    baseline_seed_stop = args.eval_seed_base + max(
+        args.eval_episodes, args.adaptive_eval_max_episodes
+    )
+    full_seed_stop = (
+        args.full_eval_seed_base
+        + args.full_eval_max_attempts
+        * max(args.eval_episodes, args.adaptive_eval_max_episodes)
+    )
+    if args.full_eval_confirmation_interval > 0 and not (
+        full_seed_stop <= args.eval_seed_base
+        or args.full_eval_seed_base >= baseline_seed_stop
+    ):
+        parser.error("baseline/probe and full evaluation seed namespaces must not overlap")
     if not 0.0 < args.lr_plateau_factor < 1.0:
         parser.error("lr-plateau-factor must be greater than 0 and less than 1")
     if not math.isfinite(args.lr_plateau_min) or args.lr_plateau_min <= 0:
@@ -1057,6 +1367,8 @@ def potential_shaping(
 
 def action_mask(agent: DQNAgent, env: SnakeGameEnv) -> list[bool]:
     if agent.action_dim == len(RelativeAction):
+        if agent.action_mask_mode == "topology_survival_v1":
+            return list(env.relative_topology_survival_mask())
         if agent.action_mask_mode == "one_step_survival_v1":
             return list(env.relative_survival_mask())
         return [True] * agent.action_dim
@@ -1304,6 +1616,141 @@ def evaluate_adaptive_paired(
     return evaluation, metadata
 
 
+def evaluate_scheduler_probe(
+    agent: DQNAgent,
+    game_config: GameConfig,
+    seeds: Sequence[int],
+    max_steps: int,
+    controller: EvaluationConvergenceController,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run a cheap paired probe that can screen scheduling but never promote."""
+    evaluation = evaluate_agent(agent, game_config, seeds, max_steps)
+    score_samples = evaluation_samples(evaluation, "score")
+    paired = controller.paired_comparison(score_samples, planned_looks=1)
+    if paired is None:
+        raise RuntimeError("Scheduler probe requires an immutable paired reference")
+    promotion_candidate = bool(
+        paired["mean_delta"] > paired["meaningful_delta"]
+        and paired["adjusted_ci_high"] > paired["meaningful_delta"]
+    )
+    return evaluation, {
+        "evaluation_scope": "scheduler_probe",
+        "actual_episodes": len(score_samples),
+        "planned_episodes": len(seeds),
+        "max_episodes": len(seeds),
+        "expansion_stage": 1,
+        "planned_looks": 1,
+        "stages": [
+            {
+                "stage": 1,
+                "actual_episodes": len(score_samples),
+                "planned_episodes": len(seeds),
+                "statistical_state": paired["statistical_state"],
+                "clear_regression": False,
+            }
+        ],
+        "statistical_method": paired["method"],
+        "family_confidence": paired["family_confidence"],
+        "look_confidence": paired["look_confidence"],
+        "statistical_state": paired["statistical_state"],
+        "promotion_candidate": promotion_candidate,
+        "probe_comparison": paired,
+    }
+
+
+def reserve_full_evaluation_attempt(
+    controller: EvaluationConvergenceController,
+    *,
+    episodes: int,
+) -> tuple[int, list[int]] | None:
+    """Reserve one pre-registered, non-overlapping full-suite seed block."""
+    if episodes <= 0:
+        raise ValueError("Full evaluation episodes must be positive")
+    if controller.full_eval_attempts >= controller.full_eval_max_attempts:
+        return None
+    attempt_index = controller.full_eval_attempts
+    start = controller.full_eval_seed_base + attempt_index * episodes
+    controller.full_eval_attempts += 1
+    return attempt_index, list(range(start, start + episodes))
+
+
+def evaluate_fresh_full_pair(
+    candidate: DQNAgent,
+    reference: DQNAgent,
+    game_config: GameConfig,
+    seeds: Sequence[int],
+    max_steps: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Evaluate candidate and immutable best on the exact same fresh full suite."""
+    reference_evaluation = evaluate_agent(reference, game_config, seeds, max_steps)
+    candidate_evaluation = evaluate_agent(candidate, game_config, seeds, max_steps)
+    if candidate_evaluation.get("seeds") != reference_evaluation.get("seeds"):
+        raise RuntimeError("Fresh full paired evaluations used different seed ordering")
+    return candidate_evaluation, reference_evaluation
+
+
+def load_policy_evaluation_reference(
+    checkpoint_path: Path,
+    candidate: DQNAgent,
+    game_config: GameConfig,
+) -> DQNAgent:
+    """Load an authenticated immutable-best policy without perturbing RNG streams."""
+    metadata_path = sidecar_path(checkpoint_path)
+    if not metadata_path.is_file():
+        raise RuntimeError(
+            f"Immutable best checkpoint metadata is missing: {metadata_path}"
+        )
+    try:
+        with metadata_path.open("r", encoding="utf-8-sig") as stream:
+            metadata = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Immutable best checkpoint metadata is unreadable: {metadata_path}: {exc}"
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Immutable best checkpoint metadata must be a JSON object.")
+    expected_sha256 = metadata.get("checkpoint_sha256")
+    referenced_path = metadata.get("best_checkpoint_path")
+    if (
+        metadata.get("checkpoint_role") != "best_eval"
+        or not isinstance(expected_sha256, str)
+        or metadata.get("best_checkpoint_sha256") != expected_sha256
+        or not referenced_path
+        or Path(referenced_path).resolve() != checkpoint_path.resolve()
+    ):
+        raise RuntimeError(
+            "Immutable evaluation reference must have an authenticated self-linked "
+            "best_eval sidecar."
+        )
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cuda_devices = (
+        []
+        if candidate.device.type != "cuda"
+        else [
+            candidate.device.index
+            if candidate.device.index is not None
+            else torch.cuda.current_device()
+        ]
+    )
+    try:
+        with torch.random.fork_rng(devices=cuda_devices):
+            reference = DQNAgent.from_policy_checkpoint(
+                str(checkpoint_path),
+                target_game_config=game_config,
+                device=str(candidate.device),
+                expected_sha256=expected_sha256,
+                agent_options={"action_mask_mode": candidate.action_mask_mode},
+            )
+            DQNAgent.validate_policy_sidecar_identity(
+                metadata, reference.policy_transfer_provenance or {}
+            )
+            return reference
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -1350,6 +1797,11 @@ def evaluation_identity(
         "eval_episodes": train_args.eval_episodes,
         "adaptive_eval_max_episodes": train_args.adaptive_eval_max_episodes,
         "adaptive_eval_growth_factor": train_args.adaptive_eval_growth_factor,
+        "full_eval_confirmation_interval": train_args.full_eval_confirmation_interval,
+        "inconclusive_scheduler_mode": train_args.inconclusive_scheduler_mode,
+        "bounded_inconclusive_patience": train_args.bounded_inconclusive_patience,
+        "full_eval_seed_base": train_args.full_eval_seed_base,
+        "full_eval_max_attempts": train_args.full_eval_max_attempts,
         "game_config": asdict(game_config),
         "action_mask_mode": train_args.action_mask_mode,
     }
@@ -1421,6 +1873,7 @@ def save_checkpoint(
     episodes_started: int | None = None,
     warm_start_provenance: dict[str, Any] | None = None,
     convergence_controller: EvaluationConvergenceController | None = None,
+    pending_best_promotion: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     agent.save(str(path))
@@ -1490,6 +1943,7 @@ def save_checkpoint(
         "train_args": vars(train_args),
         "warm_start_provenance": warm_start_provenance,
         "policy_transfer_provenance": agent.policy_transfer_provenance,
+        "pending_best_promotion": pending_best_promotion,
     }
     _atomic_json(sidecar_path(path), payload)
 
@@ -1754,6 +2208,11 @@ _CONTROLLER_OPTIONS = {
     "--regression-stop-delta": "regression_stop_delta",
     "--adaptive-eval-max-episodes": "adaptive_eval_max_episodes",
     "--adaptive-eval-growth-factor": "adaptive_eval_growth_factor",
+    "--inconclusive-scheduler-mode": "inconclusive_scheduler_mode",
+    "--bounded-inconclusive-patience": "bounded_inconclusive_patience",
+    "--full-eval-confirmation-interval": "full_eval_confirmation_interval",
+    "--full-eval-seed-base": "full_eval_seed_base",
+    "--full-eval-max-attempts": "full_eval_max_attempts",
 }
 
 
@@ -1772,6 +2231,11 @@ def _new_convergence_controller(
         regression_stop_delta=args.regression_stop_delta,
         adaptive_eval_max_episodes=args.adaptive_eval_max_episodes,
         adaptive_eval_growth_factor=args.adaptive_eval_growth_factor,
+        inconclusive_scheduler_mode=args.inconclusive_scheduler_mode,
+        bounded_inconclusive_patience=args.bounded_inconclusive_patience,
+        full_eval_confirmation_interval=args.full_eval_confirmation_interval,
+        full_eval_seed_base=args.full_eval_seed_base,
+        full_eval_max_attempts=args.full_eval_max_attempts,
         reference_score=reference_score,
     )
     controller.validate()
@@ -1838,7 +2302,9 @@ def restore_convergence_controller(
         and not args.reset_best_evaluation
     ):
         expected_reference_count = (
-            restored.adaptive_eval_max_episodes
+            args.eval_episodes
+            if restored.full_eval_confirmation_interval > 0
+            else restored.adaptive_eval_max_episodes
             if restored.adaptive_eval_max_episodes > 0
             else args.eval_episodes
         )
@@ -1860,17 +2326,18 @@ def restore_convergence_controller(
             raise RuntimeError(
                 "Resume paired reference score conflicts with the immutable best score."
             )
-        reference_mean = float(statistics.mean(restored.reference_scores or ()))
-        if not math.isclose(
-            reference_mean,
-            restored.reference_score,
-            rel_tol=1e-12,
-            abs_tol=1e-12,
-        ):
-            raise RuntimeError(
-                "Resume paired reference sample mean conflicts with the immutable "
-                "best score."
-            )
+        if restored.full_eval_confirmation_interval == 0:
+            reference_mean = float(statistics.mean(restored.reference_scores or ()))
+            if not math.isclose(
+                reference_mean,
+                restored.reference_score,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise RuntimeError(
+                    "Resume paired reference sample mean conflicts with the immutable "
+                    "best score."
+                )
     return restored
 
 
@@ -1915,6 +2382,129 @@ def validate_resume_environment(
     print("Warning: intentionally changing resume environment:", detail)
 
 
+def _best_promotion_marker(
+    output_path: Path, *, score: float, episode: int
+) -> dict[str, Any]:
+    """Describe a durable, already-approved best promotion transaction."""
+    previous_sha256 = _sha256(output_path) if output_path.is_file() else None
+    return {
+        "schema_version": 1,
+        "best_checkpoint_path": str(output_path.resolve()),
+        "best_eval_score": float(score),
+        "best_eval_episode": int(episode),
+        "previous_best_checkpoint_sha256": previous_sha256,
+    }
+
+
+def reconcile_pending_best_promotion(
+    metadata: dict[str, Any],
+    agent: DQNAgent,
+    controller: EvaluationConvergenceController,
+    args: argparse.Namespace,
+    *,
+    resume_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Finish an approved best promotion without rolling back latest training state."""
+    pending = metadata.get("pending_best_promotion")
+    if pending is None:
+        return metadata
+    if not isinstance(pending, dict) or pending.get("schema_version") != 1:
+        raise RuntimeError("Resume metadata contains an unsupported best promotion marker.")
+    try:
+        score = float(pending["best_eval_score"])
+        episode = int(pending["best_eval_episode"])
+        pending_path = Path(pending["best_checkpoint_path"]).resolve()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Resume metadata contains an invalid best promotion marker.") from exc
+    previous_sha256 = pending.get("previous_best_checkpoint_sha256")
+    if (
+        not math.isfinite(score)
+        or episode < 0
+        or pending_path != output_path.resolve()
+        or metadata.get("best_eval_score") != score
+        or metadata.get("best_eval_episode") != episode
+        or metadata.get("best_checkpoint_sha256") != previous_sha256
+        or (
+            previous_sha256 is not None
+            and (
+                not isinstance(previous_sha256, str)
+                or len(previous_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in previous_sha256)
+            )
+        )
+    ):
+        raise RuntimeError("Resume best promotion marker conflicts with latest state.")
+
+    best_metadata: dict[str, Any] | None = None
+    best_meta_path = sidecar_path(output_path)
+    if best_meta_path.is_file():
+        try:
+            with best_meta_path.open("r", encoding="utf-8-sig") as stream:
+                value = json.load(stream)
+            if isinstance(value, dict):
+                best_metadata = value
+        except (OSError, json.JSONDecodeError):
+            best_metadata = None
+    current_sha256 = _sha256(output_path) if output_path.is_file() else None
+    promotion_complete = bool(
+        current_sha256
+        and best_metadata
+        and best_metadata.get("checkpoint_role") == "best_eval"
+        and best_metadata.get("checkpoint_sha256") == current_sha256
+        and best_metadata.get("best_checkpoint_sha256") == current_sha256
+        and best_metadata.get("best_eval_score") == score
+        and best_metadata.get("best_eval_episode") == episode
+    )
+    if not promotion_complete:
+        sidecar_sha256 = (
+            best_metadata.get("checkpoint_sha256") if best_metadata else None
+        )
+        known_interrupted_state = (
+            previous_sha256 is None
+            or current_sha256 == previous_sha256
+            or sidecar_sha256 == previous_sha256
+        )
+        if not known_interrupted_state:
+            raise RuntimeError(
+                "Pending best promotion found an unknown best artifact; refusing to overwrite it."
+            )
+        save_checkpoint(
+            agent,
+            output_path,
+            episode=episode,
+            run_seed=int(metadata.get("run_seed", args.seed)),
+            best_eval_score=score,
+            best_eval_episode=episode,
+            train_args=args,
+            checkpoint_role="best_eval",
+            best_checkpoint_path=output_path,
+            episodes_started=int(metadata.get("episodes_started", episode)),
+            warm_start_provenance=metadata.get("warm_start_provenance"),
+            convergence_controller=controller,
+        )
+
+    save_checkpoint(
+        agent,
+        resume_path,
+        episode=int(metadata.get("episodes_completed", episode)),
+        run_seed=int(metadata.get("run_seed", args.seed)),
+        best_eval_score=score,
+        best_eval_episode=episode,
+        train_args=args,
+        checkpoint_role="latest",
+        best_checkpoint_path=output_path,
+        episodes_started=int(metadata.get("episodes_started", episode)),
+        warm_start_provenance=metadata.get("warm_start_provenance"),
+        convergence_controller=controller,
+    )
+    print(
+        f"Reconciled interrupted best promotion at episode {episode}; latest training "
+        "state was preserved."
+    )
+    return load_resume_metadata(resume_path, ignore_mismatch=False)
+
+
 def validate_resume_best(
     metadata: dict[str, Any],
     args: argparse.Namespace,
@@ -1938,6 +2528,11 @@ def validate_resume_best(
         # unchanged single-look defaults, not an unknown evaluation identity.
         normalized.setdefault("adaptive_eval_max_episodes", 0)
         normalized.setdefault("adaptive_eval_growth_factor", 2.0)
+        normalized.setdefault("full_eval_confirmation_interval", 0)
+        normalized.setdefault("inconclusive_scheduler_mode", "defer_v1")
+        normalized.setdefault("bounded_inconclusive_patience", 0)
+        normalized.setdefault("full_eval_seed_base", 1_000_000)
+        normalized.setdefault("full_eval_max_attempts", 0)
         normalized.setdefault("action_mask_mode", "legal_v1")
         game_identity = normalized.get("game_config")
         if isinstance(game_identity, dict):
@@ -2198,25 +2793,32 @@ def _train(args: argparse.Namespace) -> None:
         _validate_output_network_identity(
             args.network_version, output_path, latest_path
         )
-    conservative_options_enabled = any(
+    warm_start_policy_options_enabled = any(
         (
             args.policy_anchor_weight > 0,
             args.teacher_replay_steps > 0,
             args.demonstration_batch_fraction > 0,
             args.imitation_loss_weight > 0,
-            args.require_paired_promotion,
-            args.regression_stop_patience > 0,
         )
     )
+    gated_episode_zero_baseline = (
+        args.require_paired_promotion and args.full_eval_confirmation_interval > 0
+    )
+    reference_options_require_warm_start = (
+        args.require_paired_promotion or args.regression_stop_patience > 0
+    ) and not gated_episode_zero_baseline
     if (
         resume_path is None
         and not args.warm_start_from
-        and conservative_options_enabled
+        and (
+            warm_start_policy_options_enabled
+            or reference_options_require_warm_start
+        )
     ):
         raise RuntimeError(
             "Policy anchoring, teacher/demonstration replay, imitation learning, and "
-            "paired evaluation guards require "
-            "--warm-start-from (or a latest checkpoint that already contains them)."
+            "non-gated paired evaluation guards require --warm-start-from (or a latest "
+            "checkpoint that already contains them)."
         )
     if not args.warm_start_from:
         _prepare_fresh_outputs(args, resume_path)
@@ -2275,6 +2877,14 @@ def _train(args: argparse.Namespace) -> None:
             ),
         )
         if metadata:
+            metadata = reconcile_pending_best_promotion(
+                metadata,
+                agent,
+                controller,
+                args,
+                resume_path=resume_path,
+                output_path=output_path,
+            )
             best_eval_score, best_eval_episode = validate_resume_best(
                 metadata,
                 args,
@@ -2436,6 +3046,7 @@ def _train(args: argparse.Namespace) -> None:
                     "observation_pinned": current_encoder.is_pinned,
                     "runtime": runtime_info,
                     "eval_seeds": eval_seeds,
+                    "collection_log_interval": args.collection_log_interval,
                     "eval_episodes_planned": args.eval_episodes,
                     "eval_episodes_max": eval_max_episodes,
                     "eval_planned_looks": len(eval_plan),
@@ -2455,26 +3066,38 @@ def _train(args: argparse.Namespace) -> None:
                     "current_learning_rates": controller.learning_rates(
                         agent.optimizer
                     ),
-                    "convergence_controller": controller.to_dict(),
+                    "convergence_controller": controller.to_summary_dict(),
                     "args": vars(args),
                 }
             )
             + "\n"
         )
 
-    if args.warm_start_from:
-        # The immutable warm-start reference is evaluated once at the complete
-        # maximum suite size; candidate prefixes compare against its prefix.
+    establish_episode_zero_baseline = bool(
+        args.warm_start_from
+        or (resume_path is None and gated_episode_zero_baseline)
+    )
+    if establish_episode_zero_baseline:
+        # The immutable new-run reference is evaluated once at the complete maximum
+        # suite size before any training transition; probes compare against its prefix.
+        baseline_started = time.perf_counter()
         baseline = evaluate_agent(agent, game_config, eval_seeds, step_limit)
+        baseline_seconds = time.perf_counter() - baseline_started
         baseline_score = float(baseline["score"]["mean"])
         baseline_score_samples = evaluation_samples(baseline, "score")
+        controller.record_evaluation_cost(len(baseline_score_samples), baseline_seconds)
         controller_decision = controller.observe(
             baseline_score,
             agent.optimizer,
             sample_scores=baseline_score_samples,
             planned_looks=len(eval_plan),
+            is_max_sample=True,
         )
-        controller.set_paired_reference(baseline_score_samples)
+        controller.set_paired_reference(
+            baseline_score_samples[: args.eval_episodes]
+            if args.full_eval_confirmation_interval > 0
+            else baseline_score_samples
+        )
         best_eval_score = baseline_score
         best_eval_episode = 0
         save_checkpoint(
@@ -2507,7 +3130,10 @@ def _train(args: argparse.Namespace) -> None:
         )
         baseline_record: dict[str, Any] = {
             "record_type": "evaluation",
+            # Keep the established baseline kind for analyzer compatibility; the
+            # source field distinguishes transferred and freshly initialized policies.
             "evaluation_kind": "warm_start_baseline",
+            "baseline_source": "warm_start" if args.warm_start_from else "fresh",
             "episode": 0,
             "best_eval_score": best_eval_score,
             "best_eval_episode": best_eval_episode,
@@ -2529,6 +3155,9 @@ def _train(args: argparse.Namespace) -> None:
             ),
             "eval_statistical_state": controller_decision["statistical_state"],
             "eval_patience_deferred": controller_decision["patience_deferred"],
+            "eval_seconds": baseline_seconds,
+            "eval_total_episodes": controller.evaluation_episodes,
+            "eval_total_seconds": controller.evaluation_seconds,
         }
         for group in ("reward", "score", "steps"):
             for name, value in baseline[group].items():
@@ -2542,12 +3171,12 @@ def _train(args: argparse.Namespace) -> None:
         with log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(baseline_record, ensure_ascii=False) + "\n")
         print(
-            f"Warm-start baseline fixed-suite score {baseline_score:.3f}; "
+            f"Episode-0 immutable baseline fixed-suite score {baseline_score:.3f}; "
             f"saved episode-0 best {output_path} and latest {latest_path}."
         )
 
-    # Training environments are not launched until an authenticated warm-start
-    # baseline and its two new-run checkpoints have been durably recorded.
+    # Training environments are not launched until any required episode-0 baseline
+    # and its two new-run checkpoints have been durably recorded.
     for slot in slots:
         slot.reset(run_seed=args.seed, seed_index=next_seed_index)
         next_seed_index += 1
@@ -2742,7 +3371,7 @@ def _train(args: argparse.Namespace) -> None:
             "update_seconds": update_seconds,
             "epsilon": agent.epsilon,
             "current_learning_rates": controller.learning_rates(agent.optimizer),
-            "convergence_controller": controller.to_dict(),
+            "convergence_controller": controller.to_summary_dict(),
             "behavior_steps": agent.behavior_steps,
             "learn_step_counter": agent.learn_step_counter,
             "replay_size": len(agent.replay_buffer),
@@ -2799,8 +3428,129 @@ def _train(args: argparse.Namespace) -> None:
 
         should_evaluate = episodes_completed >= next_eval_episode
         controller_decision: dict[str, Any] | None = None
+        evaluation_record: dict[str, Any] | None = None
         if should_evaluate:
-            if args.require_paired_promotion:
+            evaluation_started = time.perf_counter()
+            reference_evaluation: dict[str, Any] | None = None
+            probe_evaluation: dict[str, Any] | None = None
+            probe_decision: dict[str, Any] | None = None
+            full_reason: str | None = None
+            full_attempt_index: int | None = None
+            alpha_budget_exhausted = False
+            if (
+                args.require_paired_promotion
+                and args.full_eval_confirmation_interval > 0
+                and teacher_replay_complete
+            ):
+                probe_evaluation, probe_metadata = evaluate_scheduler_probe(
+                    agent,
+                    game_config,
+                    eval_seeds[: args.eval_episodes],
+                    step_limit,
+                    controller,
+                )
+                probe_seconds = time.perf_counter() - evaluation_started
+                controller.record_evaluation_cost(args.eval_episodes, probe_seconds)
+                probe_scores = evaluation_samples(probe_evaluation, "score")
+                probe_decision = controller.observe(
+                    float(probe_evaluation["score"]["mean"]),
+                    agent.optimizer,
+                    sample_scores=probe_scores,
+                    planned_looks=1,
+                    evaluation_scope="scheduler_probe",
+                )
+                periodic_confirmation = (
+                    controller.scheduler_probes
+                    % args.full_eval_confirmation_interval
+                    == 0
+                )
+                if probe_metadata["promotion_candidate"]:
+                    full_reason = "promotion_candidate"
+                elif periodic_confirmation:
+                    full_reason = "periodic_confirmation"
+
+                reserved = (
+                    reserve_full_evaluation_attempt(
+                        controller, episodes=eval_max_episodes
+                    )
+                    if full_reason is not None
+                    else None
+                )
+                if full_reason is not None and reserved is None:
+                    alpha_budget_exhausted = True
+                    full_reason = None
+                if reserved is not None:
+                    full_attempt_index, full_seeds = reserved
+                    # Persist alpha/seed reservation before looking at either policy.
+                    save_checkpoint(
+                        agent,
+                        latest_path,
+                        episode=episodes_completed,
+                        run_seed=args.seed,
+                        best_eval_score=best_eval_score,
+                        best_eval_episode=best_eval_episode,
+                        train_args=args,
+                        checkpoint_role="latest",
+                        best_checkpoint_path=output_path,
+                        episodes_started=episodes_started,
+                        warm_start_provenance=warm_start_provenance,
+                        convergence_controller=controller,
+                    )
+                    full_started = time.perf_counter()
+                    reference_agent = load_policy_evaluation_reference(
+                        output_path, agent, game_config
+                    )
+                    evaluation, reference_evaluation = evaluate_fresh_full_pair(
+                        agent,
+                        reference_agent,
+                        game_config,
+                        full_seeds,
+                        step_limit,
+                    )
+                    full_seconds = time.perf_counter() - full_started
+                    controller.record_evaluation_cost(
+                        2 * eval_max_episodes, full_seconds
+                    )
+                    score_samples = evaluation_samples(evaluation, "score")
+                    reference_scores = evaluation_samples(reference_evaluation, "score")
+                    controller_decision = controller.observe(
+                        float(evaluation["score"]["mean"]),
+                        agent.optimizer,
+                        sample_scores=score_samples,
+                        comparison_reference_scores=reference_scores,
+                        planned_looks=args.full_eval_max_attempts,
+                        evaluation_scope="full_confirmation",
+                        is_max_sample=True,
+                    )
+                    paired = controller_decision["paired_comparison"]
+                    adaptive_metadata = {
+                        "evaluation_scope": "full_confirmation",
+                        "actual_episodes": eval_max_episodes,
+                        "planned_episodes": eval_max_episodes,
+                        "max_episodes": eval_max_episodes,
+                        "execution_episodes": (
+                            args.eval_episodes + 2 * eval_max_episodes
+                        ),
+                        "expansion_stage": 1,
+                        "planned_looks": args.full_eval_max_attempts,
+                        "stages": [],
+                        "statistical_method": paired["method"],
+                        "family_confidence": paired["family_confidence"],
+                        "look_confidence": paired["look_confidence"],
+                        "statistical_state": paired["statistical_state"],
+                        "full_reason": full_reason,
+                        "full_attempt_index": full_attempt_index,
+                    }
+                else:
+                    evaluation = probe_evaluation
+                    adaptive_metadata = {
+                        **probe_metadata,
+                        "execution_episodes": args.eval_episodes,
+                        "full_reason": None,
+                        "full_attempt_index": None,
+                    }
+                    controller_decision = probe_decision
+            elif args.require_paired_promotion:
                 evaluation, adaptive_metadata = evaluate_adaptive_paired(
                     agent,
                     game_config,
@@ -2814,6 +3564,10 @@ def _train(args: argparse.Namespace) -> None:
                         teacher_replay_complete
                         and eval_max_episodes > args.eval_episodes
                     ),
+                )
+                evaluation_seconds = time.perf_counter() - evaluation_started
+                controller.record_evaluation_cost(
+                    int(adaptive_metadata["actual_episodes"]), evaluation_seconds
                 )
             else:
                 evaluation = evaluate_agent(
@@ -2830,7 +3584,13 @@ def _train(args: argparse.Namespace) -> None:
                     "family_confidence": None,
                     "look_confidence": None,
                     "statistical_state": None,
+                    "evaluation_scope": "full_evaluation",
+                    "execution_episodes": args.eval_episodes,
+                    "full_reason": None,
+                    "full_attempt_index": None,
                 }
+                evaluation_seconds = time.perf_counter() - evaluation_started
+                controller.record_evaluation_cost(args.eval_episodes, evaluation_seconds)
             metrics = completed_summaries[-1]
             for group in ("reward", "score", "steps"):
                 for name, value in evaluation[group].items():
@@ -2845,26 +3605,51 @@ def _train(args: argparse.Namespace) -> None:
             metrics["eval_episodes_actual"] = adaptive_metadata["actual_episodes"]
             metrics["eval_episodes_planned"] = adaptive_metadata["planned_episodes"]
             metrics["eval_episodes_max"] = adaptive_metadata["max_episodes"]
+            metrics["eval_execution_episodes"] = adaptive_metadata.get(
+                "execution_episodes", adaptive_metadata["actual_episodes"]
+            )
             metrics["eval_expansion_stage"] = adaptive_metadata["expansion_stage"]
             metrics["eval_planned_looks"] = adaptive_metadata["planned_looks"]
             metrics["eval_adaptive_stages"] = adaptive_metadata["stages"]
             metrics["eval_statistical_method"] = adaptive_metadata["statistical_method"]
             metrics["eval_family_confidence"] = adaptive_metadata["family_confidence"]
             metrics["eval_look_confidence"] = adaptive_metadata["look_confidence"]
+            metrics["eval_scope"] = adaptive_metadata.get(
+                "evaluation_scope", "full_evaluation"
+            )
+            metrics["eval_full_reason"] = adaptive_metadata.get("full_reason")
+            metrics["eval_full_attempt_index"] = adaptive_metadata.get(
+                "full_attempt_index"
+            )
+            metrics["eval_alpha_budget_exhausted"] = alpha_budget_exhausted
             average_score = float(evaluation["score"]["mean"])
             previous_best = best_eval_score
             had_paired_reference = controller.reference_scores is not None
-            controller_decision = controller.observe(
-                average_score,
-                agent.optimizer,
-                sample_scores=score_samples,
-                defer_reason=(
-                    None if teacher_replay_complete else "teacher_replay_warmup"
-                ),
-                planned_looks=int(adaptive_metadata["planned_looks"]),
-            )
+            if controller_decision is None:
+                controller_decision = controller.observe(
+                    average_score,
+                    agent.optimizer,
+                    sample_scores=score_samples,
+                    defer_reason=(
+                        None if teacher_replay_complete else "teacher_replay_warmup"
+                    ),
+                    planned_looks=int(adaptive_metadata["planned_looks"]),
+                    is_max_sample=(len(score_samples) == eval_max_episodes),
+                )
+            evaluation_seconds = time.perf_counter() - evaluation_started
             metrics["eval_statistical_state"] = controller_decision["statistical_state"]
             metrics["eval_patience_deferred"] = controller_decision["patience_deferred"]
+            metrics["eval_seconds"] = evaluation_seconds
+            metrics["eval_total_episodes"] = controller.evaluation_episodes
+            metrics["eval_total_seconds"] = controller.evaluation_seconds
+            metrics["eval_probe_decision"] = probe_decision
+            if reference_evaluation is not None:
+                metrics["eval_reference_score_mean"] = reference_evaluation["score"][
+                    "mean"
+                ]
+                metrics["eval_reference_score_samples"] = evaluation_samples(
+                    reference_evaluation, "score"
+                )
             improved = teacher_replay_complete and (
                 (
                     not had_paired_reference
@@ -2877,12 +3662,14 @@ def _train(args: argparse.Namespace) -> None:
                 agent.optimizer
             )
             metrics["convergence_decision"] = controller_decision
-            metrics["convergence_controller"] = controller.to_dict()
+            metrics["convergence_controller"] = controller.to_summary_dict()
             collection_metrics["current_learning_rates"] = controller.learning_rates(
                 agent.optimizer
             )
             collection_metrics["convergence_decision"] = controller_decision
-            collection_metrics["convergence_controller"] = controller.to_dict()
+            collection_metrics["convergence_controller"] = (
+                controller.to_summary_dict()
+            )
             for key in (
                 "eval_episodes_actual",
                 "eval_episodes_planned",
@@ -2895,6 +3682,14 @@ def _train(args: argparse.Namespace) -> None:
                 "eval_look_confidence",
                 "eval_statistical_state",
                 "eval_patience_deferred",
+                "eval_seconds",
+                "eval_total_episodes",
+                "eval_total_seconds",
+                "eval_scope",
+                "eval_execution_episodes",
+                "eval_full_reason",
+                "eval_full_attempt_index",
+                "eval_alpha_budget_exhausted",
             ):
                 collection_metrics[key] = metrics[key]
             if improved:
@@ -2907,9 +3702,40 @@ def _train(args: argparse.Namespace) -> None:
                     raise RuntimeError(
                         "Paired promotion requires a complete maximum-sized reference"
                     )
-                controller.set_paired_reference(score_samples)
-                metrics["convergence_controller"] = controller.to_dict()
-                collection_metrics["convergence_controller"] = controller.to_dict()
+                controller.set_paired_reference(
+                    evaluation_samples(probe_evaluation, "score")
+                    if args.full_eval_confirmation_interval > 0
+                    and probe_evaluation is not None
+                    else score_samples
+                )
+                metrics["convergence_controller"] = controller.to_summary_dict()
+                collection_metrics["convergence_controller"] = (
+                    controller.to_summary_dict()
+                )
+                pending_best_promotion = _best_promotion_marker(
+                    output_path,
+                    score=best_eval_score,
+                    episode=best_eval_episode,
+                )
+                # The authenticated latest checkpoint is the write-ahead record. A
+                # resume can complete the approved promotion from this exact training
+                # state if the process stops before the canonical best/latest pair is
+                # fully linked.
+                save_checkpoint(
+                    agent,
+                    latest_path,
+                    episode=episodes_completed,
+                    run_seed=args.seed,
+                    best_eval_score=best_eval_score,
+                    best_eval_episode=best_eval_episode,
+                    train_args=args,
+                    checkpoint_role="latest",
+                    best_checkpoint_path=output_path,
+                    episodes_started=episodes_started,
+                    warm_start_provenance=warm_start_provenance,
+                    convergence_controller=controller,
+                    pending_best_promotion=pending_best_promotion,
+                )
                 save_checkpoint(
                     agent,
                     output_path,
@@ -2924,11 +3750,41 @@ def _train(args: argparse.Namespace) -> None:
                     warm_start_provenance=warm_start_provenance,
                     convergence_controller=controller,
                 )
+                save_checkpoint(
+                    agent,
+                    latest_path,
+                    episode=episodes_completed,
+                    run_seed=args.seed,
+                    best_eval_score=best_eval_score,
+                    best_eval_episode=best_eval_episode,
+                    train_args=args,
+                    checkpoint_role="latest",
+                    best_checkpoint_path=output_path,
+                    episodes_started=episodes_started,
+                    warm_start_provenance=warm_start_provenance,
+                    convergence_controller=controller,
+                )
                 print(
                     f"New best fixed-suite score {best_eval_score:.3f} at episode "
                     f"{episodes_completed}; "
                     f"saved {output_path}."
                 )
+            evaluation_record = {
+                "record_type": "evaluation",
+                "evaluation_kind": metrics["eval_scope"],
+                "episode": episodes_completed,
+                "best_eval_score": best_eval_score,
+                "best_eval_episode": best_eval_episode,
+                "convergence_decision": controller_decision,
+                "convergence_controller": controller.to_dict(),
+                **{
+                    key: value
+                    for key, value in metrics.items()
+                    if key.startswith("eval_")
+                },
+            }
+            for key in [key for key in metrics if key.startswith("eval_")]:
+                del metrics[key]
             if controller_decision["lr_reduced"]:
                 print(
                     "Reduced optimizer learning rates after fixed-suite plateau: "
@@ -2959,8 +3815,22 @@ def _train(args: argparse.Namespace) -> None:
             while next_checkpoint_episode <= episodes_completed:
                 next_checkpoint_episode += args.checkpoint_interval
 
+        controller_stop = bool(
+            controller_decision is not None and controller_decision["should_stop"]
+        )
+        final_collection = (
+            episodes_completed >= initial_completed + args.episodes or controller_stop
+        )
+        log_collection = (
+            should_evaluate
+            or final_collection
+            or collection_index % args.collection_log_interval == 0
+        )
         with log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(collection_metrics, ensure_ascii=False) + "\n")
+            if log_collection:
+                stream.write(json.dumps(collection_metrics, ensure_ascii=False) + "\n")
+            if evaluation_record is not None:
+                stream.write(json.dumps(evaluation_record, ensure_ascii=False) + "\n")
             for metrics in completed_summaries:
                 rendered = metrics.pop("render")
                 stream.write(json.dumps(metrics, ensure_ascii=False) + "\n")
@@ -2977,7 +3847,7 @@ def _train(args: argparse.Namespace) -> None:
                         f"updates={collection_metrics['updates_per_second']:.1f}/s | "
                         f"sample={sampling_seconds:.3f}s | gpu_wait={gpu_wait_seconds:.3f}s"
                     )
-        if controller_decision is not None and controller_decision["should_stop"]:
+        if controller_stop:
             print(
                 f"Early stopping at episode {episodes_completed}; best fixed-suite score "
                 f"{best_eval_score:.3f} at {best_eval_episode}; controller decision "

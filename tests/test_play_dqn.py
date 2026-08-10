@@ -127,6 +127,23 @@ def test_play_uses_checkpointed_survival_mask(
     assert action_mask(agent, env) == [True, False, False]
 
 
+def test_play_dispatches_checkpointed_topology_mask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "best.pt"
+    _save_source(model)
+    agent, _ = load_inference_agent(
+        model, parse_args(["--model", str(model), "--device", "cpu"])
+    )
+    agent.action_mask_mode = "topology_survival_v1"
+    env = build_env_from_metadata(agent, seed=123)
+    monkeypatch.setattr(
+        env, "relative_topology_survival_mask", lambda: (False, True, False)
+    )
+
+    assert action_mask(agent, env) == [False, True, False]
+
+
 def test_play_cli_rejects_partial_map_override_and_sidecar_hash_conflict(
     tmp_path: Path,
 ) -> None:

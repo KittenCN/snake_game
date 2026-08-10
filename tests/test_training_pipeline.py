@@ -22,10 +22,13 @@ from train_dqn import (
     deterministic_episode_seed,
     evaluate_agent,
     evaluate_adaptive_paired,
+    evaluate_fresh_full_pair,
+    evaluate_scheduler_probe,
     load_resume_metadata,
     load_warm_start_metadata,
     parse_args,
     potential_shaping,
+    reserve_full_evaluation_attempt,
     restore_convergence_controller,
     save_checkpoint,
     state_potential,
@@ -53,6 +56,7 @@ from train_dqn import (
         ["--policy-anchor-weight", "nan"],
         ["--teacher-replay-steps", "-1"],
         ["--teacher-replay-steps", "101", "--replay-capacity", "100"],
+        ["--collection-log-interval", "0"],
         ["--idle-limit-floor-steps", "-1"],
         ["--max-idle-steps", "0", "--idle-limit-floor-steps", "1"],
         ["--policy-anchor-weight", "0.1", "--policy-anchor-final-weight", "0.2"],
@@ -99,6 +103,49 @@ from train_dqn import (
         ["--adaptive-eval-max-episodes", "8"],
         ["--adaptive-eval-growth-factor", "1"],
         ["--adaptive-eval-growth-factor", "nan"],
+        ["--bounded-inconclusive-patience", "-1"],
+        ["--bounded-inconclusive-patience", "3"],
+        ["--inconclusive-scheduler-mode", "bounded_probe_v1"],
+        [
+            "--require-paired-promotion",
+            "--adaptive-eval-max-episodes",
+            "8",
+            "--eval-episodes",
+            "2",
+            "--full-eval-confirmation-interval",
+            "2",
+        ],
+        ["--full-eval-max-attempts", "-1"],
+        [
+            "--require-paired-promotion",
+            "--adaptive-eval-max-episodes",
+            "8",
+            "--eval-episodes",
+            "2",
+            "--full-eval-confirmation-interval",
+            "2",
+            "--full-eval-max-attempts",
+            "2",
+            "--eval-seed-base",
+            "100",
+            "--full-eval-seed-base",
+            "101",
+        ],
+        [
+            "--require-paired-promotion",
+            "--adaptive-eval-max-episodes",
+            "8",
+            "--eval-episodes",
+            "2",
+            "--full-eval-confirmation-interval",
+            "2",
+            "--full-eval-max-attempts",
+            "2",
+            "--eval-seed-base",
+            "100",
+            "--full-eval-seed-base",
+            "104",
+        ],
     ],
 )
 def test_convergence_cli_rejects_invalid_ranges(options: list[str]) -> None:
@@ -279,6 +326,97 @@ def test_only_confirmed_paired_plateau_reduces_lr() -> None:
     assert decision["learning_rates"] == [0.005]
 
 
+def test_bounded_probe_inconclusive_spends_one_pre_min_plateau_tick() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.01)
+    controller = EvaluationConvergenceController(
+        lr_plateau_patience=2,
+        lr_plateau_factor=0.5,
+        lr_plateau_min=0.001,
+        early_stop_patience=2,
+        early_stop_delta=0.25,
+        require_paired_promotion=True,
+        paired_promotion_min_delta=0.1,
+        inconclusive_scheduler_mode="bounded_probe_v1",
+        bounded_inconclusive_patience=3,
+        reference_score=0.0,
+    )
+    controller.set_paired_reference([0.0] * 4)
+    samples = [-0.1, 0.1, 0.5, 0.7]
+
+    first = controller.observe(
+        0.3,
+        optimizer,
+        sample_scores=samples,
+        evaluation_scope="scheduler_probe",
+    )
+    second = controller.observe(
+        0.3,
+        optimizer,
+        sample_scores=samples,
+        evaluation_scope="scheduler_probe",
+    )
+    third = controller.observe(
+        0.3,
+        optimizer,
+        sample_scores=samples,
+        evaluation_scope="scheduler_probe",
+    )
+
+    assert first["patience_deferred"] is True
+    assert second["probe_inconclusive_evaluations"] == 2
+    assert third["bounded_inconclusive_triggered"] is True
+    assert third["decision"] == "bounded_probe_inconclusive_plateau_patience"
+    assert third["plateau_evaluations"] == 1
+    assert third["learning_rates"] == [0.01]
+
+    for _ in range(2):
+        controller.observe(
+            0.3,
+            optimizer,
+            sample_scores=samples,
+            evaluation_scope="scheduler_probe",
+        )
+    reduced = controller.observe(
+        0.3,
+        optimizer,
+        sample_scores=samples,
+        evaluation_scope="scheduler_probe",
+    )
+    assert reduced["decision"] == "bounded_probe_inconclusive_lr_reduced"
+    assert reduced["learning_rates"] == [0.005]
+
+
+def test_probe_ambiguity_never_spends_min_lr_early_stop_patience() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.001)
+    controller = EvaluationConvergenceController(
+        1,
+        0.5,
+        0.001,
+        1,
+        0.25,
+        require_paired_promotion=True,
+        inconclusive_scheduler_mode="bounded_probe_v1",
+        bounded_inconclusive_patience=3,
+        reference_score=0.0,
+    )
+    controller.set_paired_reference([0.0] * 4)
+
+    for _ in range(6):
+        decision = controller.observe(
+            0.3,
+            optimizer,
+            sample_scores=[-0.1, 0.1, 0.5, 0.7],
+            evaluation_scope="scheduler_probe",
+        )
+
+    assert decision["decision"] == "bounded_probe_inconclusive_at_min_lr_deferred"
+    assert decision["should_stop"] is False
+    assert decision["min_lr_evaluations"] == 0
+    assert decision["learning_rates"] == [0.001]
+
+
 def _evaluation_payload(seeds: list[int], score: float) -> dict[str, object]:
     count = len(seeds)
     samples = [score] * count
@@ -361,6 +499,132 @@ def test_adaptive_paired_evaluation_uses_disjoint_chunks_and_full_promotion(
     assert metadata["statistical_state"] == expected_state
 
 
+def test_probe_and_fresh_full_attempts_use_disjoint_seed_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GameConfig(width=5, height=5)
+    candidate = make_agent(config)
+    reference = make_agent(config)
+    controller = EvaluationConvergenceController(
+        2,
+        0.5,
+        0.001,
+        2,
+        0.25,
+        require_paired_promotion=True,
+        reference_score=0.0,
+        full_eval_seed_base=1_000,
+        full_eval_max_attempts=2,
+    )
+    controller.set_paired_reference([0.0, 0.0])
+    calls: list[tuple[DQNAgent, list[int]]] = []
+
+    def fake_evaluate(
+        agent: DQNAgent,
+        _config: GameConfig,
+        seeds: list[int],
+        _max_steps: int,
+    ) -> dict[str, object]:
+        calls.append((agent, list(seeds)))
+        score = 1.0 if agent is candidate else 0.0
+        return _evaluation_payload(list(seeds), score)
+
+    monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
+    probe, probe_metadata = evaluate_scheduler_probe(
+        candidate, config, [100, 101], 2, controller
+    )
+    first = reserve_full_evaluation_attempt(controller, episodes=6)
+    second = reserve_full_evaluation_attempt(controller, episodes=6)
+
+    assert probe["seeds"] == [100, 101]
+    assert probe_metadata["promotion_candidate"] is True
+    assert first == (0, list(range(1_000, 1_006)))
+    assert second == (1, list(range(1_006, 1_012)))
+    assert reserve_full_evaluation_attempt(controller, episodes=6) is None
+    assert set(probe["seeds"]).isdisjoint(first[1])
+    candidate_full, reference_full = evaluate_fresh_full_pair(
+        candidate, reference, config, first[1], 2
+    )
+    assert candidate_full["seeds"] == reference_full["seeds"] == first[1]
+    assert calls[-2:] == [(reference, first[1]), (candidate, first[1])]
+
+
+def test_full_confirmation_uses_pre_registered_attempt_alpha_not_probe_selection() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.Adam([parameter], lr=0.01)
+    controller = EvaluationConvergenceController(
+        2,
+        0.5,
+        0.001,
+        2,
+        0.25,
+        require_paired_promotion=True,
+        paired_promotion_min_delta=0.1,
+        reference_score=5.0,
+        full_eval_max_attempts=8,
+    )
+    controller.set_paired_reference([5.0, 5.0])
+
+    probe = controller.observe(
+        6.0,
+        optimizer,
+        sample_scores=[6.0, 6.0],
+        evaluation_scope="scheduler_probe",
+    )
+    full = controller.observe(
+        6.0,
+        optimizer,
+        sample_scores=[6.0] * 6,
+        comparison_reference_scores=[5.0] * 6,
+        planned_looks=8,
+        evaluation_scope="full_confirmation",
+        is_max_sample=True,
+    )
+
+    assert probe["paired_promotion_eligible"] is False
+    assert full["paired_promotion_eligible"] is True
+    assert full["paired_comparison"]["planned_looks"] == 8
+    assert full["paired_comparison"]["look_confidence"] == pytest.approx(
+        1.0 - 0.05 / 8
+    )
+
+
+def test_controller_summary_omits_large_reference_cache_and_v3_migrates() -> None:
+    controller = EvaluationConvergenceController(2, 0.5, 0.001, 2, 0.25)
+    controller.set_paired_reference([float(index) for index in range(600)])
+    controller.record_evaluation_cost(600, 12.5)
+    summary = controller.to_summary_dict()
+
+    assert "reference_scores" not in summary["state"]
+    assert summary["state"]["reference_scores_count"] == 600
+    assert len(json.dumps(summary)) < len(json.dumps(controller.to_dict())) / 5
+
+    legacy = controller.to_dict()
+    legacy["version"] = 3
+    for key in (
+        "inconclusive_scheduler_mode",
+        "bounded_inconclusive_patience",
+        "full_eval_confirmation_interval",
+        "full_eval_seed_base",
+        "full_eval_max_attempts",
+    ):
+        legacy["config"].pop(key)
+    for key in (
+        "probe_inconclusive_evaluations",
+        "evaluation_episodes",
+        "evaluation_seconds",
+        "full_eval_attempts",
+        "scheduler_probes",
+    ):
+        legacy["state"].pop(key)
+
+    restored = EvaluationConvergenceController.from_dict(legacy)
+    assert restored.inconclusive_scheduler_mode == "defer_v1"
+    assert restored.bounded_inconclusive_patience == 0
+    assert restored.full_eval_attempts == 0
+    assert restored.evaluation_episodes == 0
+
+
 def test_v2_controller_migration_clears_potentially_polluted_patience() -> None:
     controller = EvaluationConvergenceController(
         2, 0.5, 0.001, 2, 0.25, require_paired_promotion=True
@@ -397,6 +661,10 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     controller.regression_stop_delta = 0.2
     controller.adaptive_eval_max_episodes = 8
     controller.adaptive_eval_growth_factor = 2.0
+    controller.full_eval_seed_base = 400_000
+    controller.full_eval_max_attempts = 4
+    controller.full_eval_attempts = 1
+    controller.record_evaluation_cost(17, 1.25)
     controller.set_paired_reference([3.0] * 8)
     controller.plateau_evaluations = 1
     checkpoint = tmp_path / "latest.pt"
@@ -443,6 +711,11 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
     assert restored.to_dict() == controller.to_dict()
     assert resume_args.lr_plateau_patience == 2
     assert resume_args.adaptive_eval_max_episodes == 8
+    assert resume_args.full_eval_seed_base == 400_000
+    assert resume_args.full_eval_max_attempts == 4
+    assert restored.full_eval_attempts == 1
+    assert restored.evaluation_episodes == 17
+    assert restored.evaluation_seconds == pytest.approx(1.25)
     assert metadata["base_learning_rate"] == pytest.approx(agent.lr)
     assert metadata["current_learning_rates"] == [5e-5]
 
@@ -523,6 +796,8 @@ def test_controller_serialization_restore_and_explicit_conflict(tmp_path: Path) 
             str(checkpoint),
             "--lr-plateau-factor",
             "0.25",
+            "--full-eval-seed-base",
+            "500000",
             "--output",
             str(tmp_path / "best.pt"),
             "--latest-output",
@@ -596,7 +871,7 @@ def test_new_training_defaults_use_survival_mask_with_legacy_safe_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = parse_args([])
-    assert args.action_mask_mode == "one_step_survival_v1"
+    assert args.action_mask_mode == "topology_survival_v1"
     assert args.idle_limit_floor_steps == 0
     assert args.policy_anchor_final_weight == pytest.approx(args.policy_anchor_weight)
     assert args.policy_anchor_decay_steps == 0
@@ -607,7 +882,10 @@ def test_new_training_defaults_use_survival_mask_with_legacy_safe_overrides(
 
     env = SnakeGameEnv(GameConfig(width=5, height=5))
     agent = make_agent(env.config)
-    monkeypatch.setattr(env, "relative_survival_mask", lambda: (False, True, False))
+    agent.action_mask_mode = "topology_survival_v1"
+    monkeypatch.setattr(
+        env, "relative_topology_survival_mask", lambda: (False, True, False)
+    )
     assert action_mask(agent, env) == [False, True, False]
     agent.action_mask_mode = "legal_v1"
     assert action_mask(agent, env) == [True, True, True]
@@ -721,6 +999,174 @@ def save_source_checkpoint(
         episodes_started=episode,
     )
     return agent
+
+
+def pending_best_promotion_fixture(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    Path,
+    DQNAgent,
+    EvaluationConvergenceController,
+    object,
+]:
+    config = GameConfig(width=5, height=5, max_episode_steps=2)
+    best = tmp_path / "transaction-best.pt"
+    latest = tmp_path / "transaction-latest.pt"
+    args = parse_args(
+        [
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "2",
+            "--hidden",
+            "16",
+            "--output",
+            str(best),
+            "--latest-output",
+            str(latest),
+        ]
+    )
+    agent = make_agent(config)
+    controller = EvaluationConvergenceController(
+        lr_plateau_patience=0,
+        lr_plateau_factor=0.5,
+        lr_plateau_min=1e-6,
+        early_stop_patience=0,
+        early_stop_delta=0.1,
+        require_paired_promotion=True,
+        adaptive_eval_max_episodes=6,
+        full_eval_confirmation_interval=8,
+        full_eval_seed_base=400_000,
+        full_eval_max_attempts=4,
+    )
+    controller.set_paired_reference([1.0, 1.0])
+    save_checkpoint(
+        agent,
+        best,
+        episode=0,
+        run_seed=args.seed,
+        best_eval_score=1.0,
+        best_eval_episode=0,
+        train_args=args,
+        checkpoint_role="best_eval",
+        best_checkpoint_path=best,
+        convergence_controller=controller,
+    )
+    agent.behavior_steps = 777
+    agent.learn_step_counter = 23
+    controller.full_eval_attempts = 2
+    controller.set_paired_reference([2.0, 2.0])
+    marker = training_module._best_promotion_marker(best, score=2.0, episode=5)
+    save_checkpoint(
+        agent,
+        latest,
+        episode=5,
+        run_seed=args.seed,
+        best_eval_score=2.0,
+        best_eval_episode=5,
+        train_args=args,
+        checkpoint_role="latest",
+        best_checkpoint_path=best,
+        episodes_started=6,
+        convergence_controller=controller,
+        pending_best_promotion=marker,
+    )
+    return best, latest, agent, controller, args
+
+
+@pytest.mark.parametrize(
+    "crash_window",
+    ["marker_only", "best_checkpoint_only", "best_complete"],
+)
+def test_pending_best_promotion_reconciles_all_write_windows_without_rollback(
+    tmp_path: Path, crash_window: str
+) -> None:
+    best, latest, agent, controller, args = pending_best_promotion_fixture(tmp_path)
+    if crash_window == "best_checkpoint_only":
+        agent.save(str(best))
+    elif crash_window == "best_complete":
+        save_checkpoint(
+            agent,
+            best,
+            episode=5,
+            run_seed=args.seed,
+            best_eval_score=2.0,
+            best_eval_episode=5,
+            train_args=args,
+            checkpoint_role="best_eval",
+            best_checkpoint_path=best,
+            episodes_started=6,
+            convergence_controller=controller,
+        )
+
+    metadata = load_resume_metadata(latest, ignore_mismatch=False)
+    restored_agent = DQNAgent.restore_training_checkpoint(str(latest), device="cpu")
+    restored_controller = EvaluationConvergenceController.from_dict(
+        metadata["convergence_controller"]
+    )
+    reconciled = training_module.reconcile_pending_best_promotion(
+        metadata,
+        restored_agent,
+        restored_controller,
+        args,
+        resume_path=latest,
+        output_path=best,
+    )
+
+    best_metadata = json.loads(best.with_suffix(".meta.json").read_text("utf-8"))
+    latest_metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    reloaded_latest = DQNAgent.restore_training_checkpoint(str(latest), device="cpu")
+    assert reconciled["pending_best_promotion"] is None
+    assert latest_metadata["pending_best_promotion"] is None
+    assert latest_metadata["episodes_completed"] == 5
+    assert latest_metadata["episodes_started"] == 6
+    assert reloaded_latest.behavior_steps == 777
+    assert reloaded_latest.learn_step_counter == 23
+    assert best_metadata["best_eval_score"] == latest_metadata["best_eval_score"] == 2.0
+    assert best_metadata["best_eval_episode"] == latest_metadata["best_eval_episode"] == 5
+    assert latest_metadata["best_checkpoint_sha256"] == file_sha256(best)
+    assert best_metadata["checkpoint_sha256"] == file_sha256(best)
+    assert (
+        best_metadata["convergence_controller"]["state"]["full_eval_attempts"]
+        == latest_metadata["convergence_controller"]["state"]["full_eval_attempts"]
+        == 2
+    )
+
+
+def test_pending_best_promotion_rejects_unknown_best_artifact(tmp_path: Path) -> None:
+    best, latest, _agent, _controller, args = pending_best_promotion_fixture(tmp_path)
+    unknown = make_agent(GameConfig(width=5, height=5, max_episode_steps=2))
+    with torch.no_grad():
+        next(unknown.policy_net.parameters()).add_(1.0)
+    save_checkpoint(
+        unknown,
+        best,
+        episode=99,
+        run_seed=args.seed,
+        best_eval_score=99.0,
+        best_eval_episode=99,
+        train_args=args,
+        checkpoint_role="best_eval",
+        best_checkpoint_path=best,
+    )
+    metadata = load_resume_metadata(latest, ignore_mismatch=False)
+    restored_agent = DQNAgent.restore_training_checkpoint(str(latest), device="cpu")
+    restored_controller = EvaluationConvergenceController.from_dict(
+        metadata["convergence_controller"]
+    )
+
+    with pytest.raises(RuntimeError, match="unknown best artifact"):
+        training_module.reconcile_pending_best_promotion(
+            metadata,
+            restored_agent,
+            restored_controller,
+            args,
+            resume_path=latest,
+            output_path=best,
+        )
 
 
 def test_episode_seed_is_stable_and_stream_separated() -> None:
@@ -951,6 +1397,53 @@ def test_resume_metadata_rejects_tampered_checkpoint(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="mismatch"):
         load_resume_metadata(checkpoint, ignore_mismatch=False)
     assert load_resume_metadata(checkpoint, ignore_mismatch=True) == {}
+
+
+@pytest.mark.parametrize("failure", ["wrong_role", "tampered_checkpoint"])
+def test_policy_evaluation_reference_requires_authenticated_best(
+    tmp_path: Path, failure: str
+) -> None:
+    config = GameConfig(width=5, height=5, max_episode_steps=2)
+    best = tmp_path / "best.pt"
+    agent = make_agent(config)
+    args = parse_args(
+        [
+            "--width",
+            "5",
+            "--height",
+            "5",
+            "--max-steps",
+            "2",
+            "--hidden",
+            "16",
+            "--output",
+            str(best),
+            "--latest-output",
+            str(tmp_path / "latest.pt"),
+        ]
+    )
+    save_checkpoint(
+        agent,
+        best,
+        episode=3,
+        run_seed=args.seed,
+        best_eval_score=2.0,
+        best_eval_episode=3,
+        train_args=args,
+        checkpoint_role="best_eval",
+        best_checkpoint_path=best,
+    )
+    if failure == "wrong_role":
+        metadata = json.loads(best.with_suffix(".meta.json").read_text("utf-8"))
+        metadata["checkpoint_role"] = "latest"
+        best.with_suffix(".meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+        match = "best_eval sidecar"
+    else:
+        best.write_bytes(best.read_bytes() + b"tampered")
+        match = "SHA-256 authentication"
+
+    with pytest.raises(RuntimeError, match=match):
+        training_module.load_policy_evaluation_reference(best, agent, config)
 
 
 def test_warm_start_metadata_is_required_and_authenticated(tmp_path: Path) -> None:
@@ -1453,7 +1946,7 @@ def test_adaptive_warm_start_promotion_and_resume_keep_full_reference(
     evaluation_record = next(
         record
         for record in records
-        if record.get("record_type") == "episode" and "eval_score_mean" in record
+        if record.get("record_type") == "evaluation" and record.get("episode") != 0
     )
     assert evaluation_record["eval_episodes_actual"] == 6
     assert evaluation_record["eval_episodes_planned"] == 6
@@ -1622,7 +2115,7 @@ def test_teacher_replay_blocks_learning_and_paired_regression_stops_run(
     assert latest_metadata["learn_step_counter"] == 2
     assert latest_metadata["best_eval_score"] == pytest.approx(5.0)
     assert latest_metadata["best_eval_episode"] == 0
-    assert latest_metadata["action_mask_mode"] == "one_step_survival_v1"
+    assert latest_metadata["action_mask_mode"] == "topology_survival_v1"
     assert latest_metadata["effective_agent_config"]["policy_anchor_enabled"] is True
     assert latest_metadata["effective_agent_config"][
         "policy_anchor_final_weight"
@@ -1848,6 +2341,280 @@ def test_short_training_creates_distinct_latest_and_best(tmp_path: Path) -> None
     )
     with pytest.raises(RuntimeError, match="environment/MDP"):
         train(drift_args)
+
+
+def test_collection_log_interval_keeps_evaluation_and_final_records_compact(
+    tmp_path: Path,
+) -> None:
+    best = tmp_path / "best.pt"
+    latest = tmp_path / "latest.pt"
+    logs = tmp_path / "logs"
+    train(
+        parse_args(
+            [
+                "--episodes",
+                "3",
+                "--width",
+                "5",
+                "--height",
+                "5",
+                "--max-steps",
+                "1",
+                "--eval-interval",
+                "2",
+                "--eval-episodes",
+                "2",
+                "--checkpoint-interval",
+                "2",
+                "--collection-log-interval",
+                "10",
+                "--batch-size",
+                "2",
+                "--min-replay",
+                "2",
+                "--replay-capacity",
+                "16",
+                "--hidden",
+                "16",
+                "--output",
+                str(best),
+                "--latest-output",
+                str(latest),
+                "--log-dir",
+                str(logs),
+                "--device",
+                "cpu",
+                "--disable-amp",
+            ]
+        )
+    )
+
+    records = [
+        json.loads(line)
+        for line in next(logs.glob("train_log_*.jsonl"))
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    collections = [r for r in records if r["record_type"] == "collection"]
+    episodes = [r for r in records if r["record_type"] == "episode"]
+    evaluations = [r for r in records if r["record_type"] == "evaluation"]
+    assert len(collections) == 2
+    assert len(episodes) == 3
+    assert len(evaluations) == 1
+    assert evaluations[0]["episode"] == 2
+    assert "reference_scores" in evaluations[0]["convergence_controller"]["state"]
+    for record in [*collections, *episodes]:
+        state = record["convergence_controller"]["state"]
+        assert "reference_scores" not in state
+        assert "reference_scores_count" in state
+    assert not any("eval_score_mean" in record for record in episodes)
+
+
+def test_gated_training_uses_fresh_full_pair_and_persists_costs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pt"
+    reference_marker = save_source_checkpoint(source)
+    best = tmp_path / "best.pt"
+    latest = tmp_path / "latest.pt"
+    logs = tmp_path / "logs"
+    calls: list[tuple[DQNAgent, list[int]]] = []
+
+    def fake_evaluate(
+        evaluated_agent: DQNAgent,
+        _config: GameConfig,
+        seeds: list[int],
+        _max_steps: int,
+    ) -> dict[str, object]:
+        seed_list = list(seeds)
+        calls.append((evaluated_agent, seed_list))
+        if seed_list[0] >= 400_000:
+            score = 0.0 if evaluated_agent is reference_marker else 1.0
+        elif len(seed_list) == 2:
+            score = 1.0
+        else:
+            score = 0.0
+        return _evaluation_payload(seed_list, score)
+
+    monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
+    monkeypatch.setattr(
+        training_module,
+        "load_policy_evaluation_reference",
+        lambda *_args: reference_marker,
+    )
+    train(
+        parse_args(
+            [
+                "--episodes",
+                "1",
+                "--width",
+                "5",
+                "--height",
+                "5",
+                "--max-steps",
+                "1",
+                "--eval-interval",
+                "1",
+                "--eval-episodes",
+                "2",
+                "--adaptive-eval-max-episodes",
+                "6",
+                "--full-eval-confirmation-interval",
+                "8",
+                "--full-eval-seed-base",
+                "400000",
+                "--full-eval-max-attempts",
+                "4",
+                "--require-paired-promotion",
+                "--paired-promotion-min-delta",
+                "0.1",
+                "--batch-size",
+                "2",
+                "--min-replay",
+                "2",
+                "--replay-capacity",
+                "16",
+                "--hidden",
+                "16",
+                "--warm-start-from",
+                str(source),
+                "--output",
+                str(best),
+                "--latest-output",
+                str(latest),
+                "--log-dir",
+                str(logs),
+                "--device",
+                "cpu",
+                "--disable-amp",
+            ]
+        )
+    )
+
+    fixed = list(range(100_000, 100_006))
+    probe = fixed[:2]
+    fresh = list(range(400_000, 400_006))
+    assert [seeds for _, seeds in calls] == [fixed, probe, fresh, fresh]
+    assert set(probe).isdisjoint(fresh)
+    metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    state = metadata["convergence_controller"]["state"]
+    assert state["full_eval_attempts"] == 1
+    assert state["evaluation_episodes"] == 20
+    assert metadata["best_eval_episode"] == 1
+    records = [
+        json.loads(line)
+        for line in next(logs.glob("train_log_*.jsonl"))
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    full = next(
+        record
+        for record in records
+        if record.get("evaluation_kind") == "full_confirmation"
+    )
+    assert full["eval_full_attempt_index"] == 0
+    assert full["eval_execution_episodes"] == 14
+    assert full["eval_reference_score_samples"] == [0.0] * 6
+    assert full["convergence_decision"]["paired_promotion_eligible"] is True
+
+
+def test_fresh_gated_training_establishes_episode_zero_best_before_first_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    best = tmp_path / "fresh-gated-best.pt"
+    latest = tmp_path / "fresh-gated-latest.pt"
+    logs = tmp_path / "fresh-gated-logs"
+    calls: list[list[int]] = []
+
+    def fake_evaluate(
+        _agent: DQNAgent,
+        _config: GameConfig,
+        seeds: list[int],
+        _max_steps: int,
+    ) -> dict[str, object]:
+        seed_list = list(seeds)
+        calls.append(seed_list)
+        if len(calls) == 2:
+            assert best.is_file()
+            assert latest.is_file()
+            baseline_metadata = json.loads(
+                latest.with_suffix(".meta.json").read_text("utf-8")
+            )
+            assert baseline_metadata["best_eval_episode"] == 0
+        return _evaluation_payload(seed_list, 1.0)
+
+    monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)
+    train(
+        parse_args(
+            [
+                "--episodes",
+                "1",
+                "--width",
+                "5",
+                "--height",
+                "5",
+                "--max-steps",
+                "1",
+                "--eval-interval",
+                "1",
+                "--eval-episodes",
+                "2",
+                "--eval-seed-base",
+                "100",
+                "--adaptive-eval-max-episodes",
+                "6",
+                "--full-eval-confirmation-interval",
+                "8",
+                "--full-eval-seed-base",
+                "1000",
+                "--full-eval-max-attempts",
+                "4",
+                "--require-paired-promotion",
+                "--paired-promotion-min-delta",
+                "0.1",
+                "--batch-size",
+                "2",
+                "--min-replay",
+                "2",
+                "--replay-capacity",
+                "16",
+                "--hidden",
+                "16",
+                "--output",
+                str(best),
+                "--latest-output",
+                str(latest),
+                "--log-dir",
+                str(logs),
+                "--device",
+                "cpu",
+                "--disable-amp",
+            ]
+        )
+    )
+
+    assert calls == [list(range(100, 106)), [100, 101]]
+    best_metadata = json.loads(best.with_suffix(".meta.json").read_text("utf-8"))
+    latest_metadata = json.loads(latest.with_suffix(".meta.json").read_text("utf-8"))
+    assert best_metadata["checkpoint_role"] == "best_eval"
+    assert best_metadata["best_eval_episode"] == latest_metadata["best_eval_episode"] == 0
+    assert latest_metadata["best_checkpoint_sha256"] == file_sha256(best)
+    assert latest_metadata["convergence_controller"]["state"]["reference_scores"] == [
+        1.0,
+        1.0,
+    ]
+    records = [
+        json.loads(line)
+        for line in next(logs.glob("train_log_*.jsonl")).read_text("utf-8").splitlines()
+    ]
+    baseline = next(record for record in records if record.get("episode") == 0)
+    probe = next(
+        record
+        for record in records
+        if record.get("record_type") == "evaluation" and record.get("episode") == 1
+    )
+    assert baseline["baseline_source"] == "fresh"
+    assert probe["eval_scope"] == "scheduler_probe"
 
 
 def test_parallel_training_batches_environments_and_logs_throughput(

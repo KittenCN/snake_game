@@ -1,5 +1,14 @@
 # History
 
+## 0.7.0 - 2026-08-10
+
+- Added the versioned `topology_survival_v1` shield with pure two-step projection, exact growth/tail/wrap/food-spawn semantics, head-to-tail connectivity checks and conservative topology/two-step/one-step/all-fatal fallbacks.
+- Split frequent scheduler probes from immutable-best confirmation: full attempts now use fresh non-overlapping seed blocks and re-evaluate candidate and best on the same complete suite.
+- Pre-registered and persisted the full-evaluation attempt budget with family-wise Bonferroni correction; reservations are checkpointed before results are observed so crash recovery cannot reuse a holdout block.
+- Added bounded inconclusive probe scheduling that may advance LR patience before minimum LR but can never promote a model or consume minimum-LR early-stop patience.
+- Replaced repeated full controller payloads with compact JSONL summaries, added configurable collection-log sampling, and recorded evaluation episode/time cost explicitly.
+- Added the evidence-backed fixed-12x12 v9 fine-tuning profile with lower update pressure, fully decaying source-policy anchor and independent probe/full seed namespaces.
+
 ## 0.6.0 - 2026-08-09
 
 - Added a configurable idle-limit floor so large boards do not terminate otherwise safe long-path play before one board-area traversal.

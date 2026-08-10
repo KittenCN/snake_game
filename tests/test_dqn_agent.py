@@ -83,7 +83,7 @@ def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> N
         obs_shape=(20, 8, 8),
         game_config=source_config,
         lr=0.003,
-        action_mask_mode="one_step_survival_v1",
+        action_mask_mode="topology_survival_v1",
     )
     source.behavior_steps = 123
     source.learn_step_counter = 17
@@ -119,7 +119,7 @@ def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> N
     assert transferred.game_config == target_config
     assert transferred.hidden_sizes == source.hidden_sizes
     assert transferred.network_version == source.network_version
-    assert transferred.action_mask_mode == "one_step_survival_v1"
+    assert transferred.action_mask_mode == "topology_survival_v1"
     assert transferred.lr == pytest.approx(0.0004)
     assert transferred.optimizer.state_dict()["state"] == {}
     assert len(transferred.replay_buffer) == 0

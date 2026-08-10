@@ -90,7 +90,11 @@ _NETWORK_SCHEMAS: dict[int, dict[str, Any]] = {
     },
 }
 
-_ACTION_MASK_MODES = {"legal_v1", "one_step_survival_v1"}
+_ACTION_MASK_MODES = {
+    "legal_v1",
+    "one_step_survival_v1",
+    "topology_survival_v1",
+}
 
 
 class ReplayBuffer:
@@ -1044,9 +1048,9 @@ class DQNAgent:
             raise ValueError(
                 f"action_mask_mode must be one of {sorted(_ACTION_MASK_MODES)}"
             )
-        if action_mask_mode == "one_step_survival_v1" and action_dim != 3:
+        if action_mask_mode != "legal_v1" and action_dim != 3:
             raise ValueError(
-                "one_step_survival_v1 requires the three-action relative policy"
+                "survival action masks require the three-action relative policy"
             )
         self.action_mask_mode = action_mask_mode
         if not math.isfinite(policy_anchor_weight) or policy_anchor_weight < 0:

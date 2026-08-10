@@ -243,6 +243,36 @@ demo replay 到达容量后会先对完整轨迹做准入预检：只有质量�
 README 中的完整命令使用新 seed base 1700000 和全新输出。episode-0 baseline 是 v7 权重在 v8 身份下
 的重新评估；v8 只在自身相同评估身份内做 paired promotion、降学习率和停止决策。
 
+### v8 运行证据与 v9 根治
+
+服务器 v8 的实时证据显示，提分本身是成功的，但后期吞吐和统计控制仍有结构性问题：immutable best 已从
+episode-0 baseline `12.193` 提升到 `27.368 @ episode 26800`；到 episode 33600 时最近 1000 回合平均
+score 为 `26.338`、平均 444.4 steps。行为步数约为 v7 的 2.95 倍，同时每个 collection 做 10 次更新，
+因此“进度变慢”主要是长局、额外更新和评估成本共同造成，不是 GPU 显存不足。
+
+v8 还暴露了四项需要改变运行身份的根因：
+
+- 固定 probe seed 被跨 checkpoint 反复用于筛选和确认，单次 adaptive looks 的 Bonferroni 不能校正这种
+  跨 checkpoint selection；v9 把固定 64-seed probe 与 fresh 600-seed full namespace 完全隔离。
+- 每个 full attempt 都在同一组新 seeds 上完整重评 candidate 与 immutable best，不从 probe 前缀晋升；
+  attempt 计数和 seed block 在观察结果前写入 latest，恢复后不能重用 holdout。
+- 旧 inconclusive 永久 defer 会冻结学习率。`bounded_probe_v1` 将连续 3 次 probe ambiguity 兑换为一个
+  pre-min-LR plateau tick；到达 min LR 后 ambiguity 不消耗 early-stop，停止仍只接受 fresh full plateau
+  或独立 clear-regression 证据。
+- 高频 collection/controller payload 曾把 600 个 reference scores 复制进大量 episode 行。v9 的普通记录
+  只写 compact summary，并用 `--collection-log-interval 10` 降频；完整恢复状态只进 checkpoint/sidecar，
+  evaluation 行保留独立审计信息和累计评估 episodes/seconds。
+
+v9 的 `topology_survival_v1` 使用纯状态投影，精确覆盖进食不腾尾、普通移动腾尾、wrap 和食物 RNG；对每个
+候选先检查安全第二步和 successor 的 head-to-tail BFS 连通性，再按 topology-safe、two-step-safe、
+one-step-safe、all-fatal 顺序保守回退。helper 不调用真实 `step()`、不修改环境或消费真实 RNG，并由行为、
+teacher、固定评估、play 和非终止 Double-DQN target 共用。终止 next mask 仍规范化为全 true。
+
+由于 topology mask 与 fresh-full 评估协议都改变了评估身份，v9 必须从经过 sidecar/SHA-256 认证的 v8
+immutable best 做 policy-only warm start；不得 full resume v8 latest。README 给出的 v9 profile 同时把
+updates/collection 从 10 调回 8、anchor 从 0.15 退火到 0，并预注册最多 64 个 full attempts。按 400 回合
+一次 probe、每 8 probe 一次 full 估算，评估/训练 episode 比例上界从旧路径的约 1.5 降到约 0.535。
+
 从 immutable `stable_v5_best` 迁移到 10x10 的新推荐命令：
 
 ```bash
@@ -345,6 +375,8 @@ best checkpoint 作为下一阶段 source；不要从未经独立配对证据验
 - 单元测试覆盖 replay、n-step target、动作掩码、target 同步、截断和固定 seed 评估。
 - 保守 warm start 覆盖冻结 teacher、零更新 replay 预热、anchor checkpoint 恢复、配对晋升与退化停止。
 - demonstration 回归覆盖完整轨迹原子晋升、覆盖版本保护、success/elite 分层采样、large-margin imitation 和 resume 参数身份。
-- 12x12 提分回归覆盖 idle floor、一步生存动作掩码/all-fatal 回退、terminal next mask、anchor 退火恢复、
-  demo 严格质量替换与多步 terminal imitation 排除。
+- 12x12 提分回归覆盖 idle floor、拓扑/两步/一步/all-fatal 四级回退、投影 RNG 纯度、terminal next mask、
+  anchor 退火恢复、demo 严格质量替换与多步 terminal imitation 排除。
+- 两阶段评估回归覆盖 probe/full seed 隔离、fresh paired immutable-best 重评、full reservation 崩溃恢复、
+  预注册 family-wise alpha 预算、bounded probe 的 min-LR 保守语义与 compact JSONL 大小上限。
 - 确定性短训练 smoke test 无 NaN/Inf，能生成可恢复 latest checkpoint 与独立选出的 best checkpoint。

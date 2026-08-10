@@ -11,6 +11,13 @@ if TYPE_CHECKING:
 
 
 GridPosition = Tuple[int, int]
+ProjectedState = Tuple[
+    Tuple[GridPosition, ...],
+    "Action",
+    Optional[GridPosition],
+    object,
+    bool,
+]
 
 
 class Action(IntEnum):
@@ -282,6 +289,56 @@ class SnakeGameEnv:
         )
         return mask if any(mask) else tuple(True for _ in RelativeAction)
 
+    def relative_topology_survival_mask(self) -> Tuple[bool, ...]:
+        """Prefer moves with a safe continuation and a route back to the tail.
+
+        The projection is pure: it predicts growth, food spawning and wrapping from a
+        copied RNG state without advancing the live environment.  If every topology
+        candidate is rejected, the mask falls back to immediate one-step safety; only
+        a position with no immediately safe action falls back to all actions.
+        """
+
+        initial: ProjectedState = (
+            tuple(self._snake),
+            self._direction,
+            self._food,
+            self._rng.getstate(),
+            False,
+        )
+        one_step = [False] * len(RelativeAction)
+        two_step = [False] * len(RelativeAction)
+        topology = [False] * len(RelativeAction)
+        for relative in RelativeAction:
+            absolute = relative_to_absolute(self._direction, relative)
+            projected = self._project_state(initial, absolute)
+            if projected is None:
+                continue
+            index = int(relative)
+            one_step[index] = True
+            if projected[4]:
+                two_step[index] = True
+                topology[index] = True
+                continue
+            next_direction = projected[1]
+            two_step[index] = any(
+                self._project_state(
+                    projected, relative_to_absolute(next_direction, next_relative)
+                )
+                is not None
+                for next_relative in RelativeAction
+            )
+            topology[index] = two_step[index] and self._projected_tail_reachable(
+                projected
+            )
+
+        if any(topology):
+            return tuple(topology)
+        if any(two_step):
+            return tuple(two_step)
+        if any(one_step):
+            return tuple(one_step)
+        return tuple(True for _ in RelativeAction)
+
     @property
     def done(self) -> bool:
         return self._done
@@ -436,6 +493,88 @@ class SnakeGameEnv:
             self._food = None
             return
         self._food = self._rng.choice(free_spaces)
+
+    def _project_state(
+        self, state: ProjectedState, action: Union[int, Action]
+    ) -> Optional[ProjectedState]:
+        """Project one action without mutating the live environment or its RNG."""
+
+        snake, direction, food, rng_state, won = state
+        if won or not snake:
+            return state
+        candidate = action if isinstance(action, Action) else Action(action)
+        move_direction = (
+            direction if candidate == self._OPPOSITE[direction] else candidate
+        )
+        head_x, head_y = snake[0]
+        dx, dy = move_direction.vector
+        target = (head_x + dx, head_y + dy)
+        if self.config.allow_wrap:
+            target = (target[0] % self.config.width, target[1] % self.config.height)
+        elif self._is_out_of_bounds(target):
+            return None
+
+        grew = target == food
+        tail = snake[-1]
+        if target in set(snake) and not (target == tail and not grew):
+            return None
+        projected_snake = (
+            (target, *snake) if grew else (target, *snake[:-1])
+        )
+        projected_food = food
+        projected_rng_state = rng_state
+        projected_won = False
+        if grew:
+            occupied = set(projected_snake)
+            free_spaces = [
+                (x, y)
+                for x in range(self.config.width)
+                for y in range(self.config.height)
+                if (x, y) not in occupied
+            ]
+            if not free_spaces:
+                projected_food = None
+                projected_won = True
+            else:
+                projected_rng = random.Random()
+                projected_rng.setstate(rng_state)
+                projected_food = projected_rng.choice(free_spaces)
+                projected_rng_state = projected_rng.getstate()
+        return (
+            tuple(projected_snake),
+            move_direction,
+            projected_food,
+            projected_rng_state,
+            projected_won,
+        )
+
+    def _projected_tail_reachable(self, state: ProjectedState) -> bool:
+        snake, _, _, _, won = state
+        if won or len(snake) <= 1:
+            return True
+        head = snake[0]
+        tail = snake[-1]
+        blocked = set(snake[1:-1])
+        reachable = {head}
+        frontier = deque([head])
+        while frontier:
+            x, y = frontier.popleft()
+            for dx, dy in (Action.UP.vector, Action.RIGHT.vector, Action.DOWN.vector, Action.LEFT.vector):
+                candidate = (x + dx, y + dy)
+                if self.config.allow_wrap:
+                    candidate = (
+                        candidate[0] % self.config.width,
+                        candidate[1] % self.config.height,
+                    )
+                elif self._is_out_of_bounds(candidate):
+                    continue
+                if candidate == tail:
+                    return True
+                if candidate in blocked or candidate in reachable:
+                    continue
+                reachable.add(candidate)
+                frontier.append(candidate)
+        return False
 
     def _sanitize_action(self, action: Union[int, Action]) -> Action:
         if isinstance(action, Action):

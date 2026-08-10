@@ -208,6 +208,8 @@ def build_env_from_metadata(agent: DQNAgent, seed: int | None) -> SnakeGameEnv:
 
 def action_mask(agent: DQNAgent, env: SnakeGameEnv) -> list[bool]:
     if agent.action_dim == len(RelativeAction):
+        if agent.action_mask_mode == "topology_survival_v1":
+            return list(env.relative_topology_survival_mask())
         if agent.action_mask_mode == "one_step_survival_v1":
             return list(env.relative_survival_mask())
         return [True] * agent.action_dim

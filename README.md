@@ -306,6 +306,73 @@ best 晋升、学习率和停止决策只比较 v8 内相同 seed、相同掩码
 训练器会用 source sidecar 自动认证 checkpoint；启动前可另行核对 v7 best SHA-256 为
 `1cf8438c41a0a4b99e424a470779fc99daf9aca1888eef4d9a4f383bf6ed0027`。
 
+### 固定 12x12 的 v9 拓扑提分阶段
+
+服务器 v8 在长局阶段明显变慢：每个训练 episode 的平均行为步数约为 v7 的 2.95 倍，且旧评估路径
+每 400 个训练 episode 最多重复执行 600 个固定 seed，评估成本可能超过训练本身。v9 从 v8 的
+immutable best 做新的 policy-only warm start，并同时解决后期动作陷阱、评估选择偏差、模糊证据无限
+等待和 JSONL 重复膨胀。不要从 v8 latest 做 full resume，也不要与仍在运行的 v8 共用一块 GPU。
+
+先进入新的 tmux 会话，再在仓库根目录执行：
+
+```bash
+tmux new -s snake_v9_12x12
+cd /root/autodl-tmp/snake_game
+mkdir -p runs/stable_v9_topology_12x12
+env PYTHONUNBUFFERED=1 /root/miniconda3/bin/python train_dqn.py \
+  --episodes 100000 --seed 20260812 \
+  --warm-start-from models/dqn_snake_12x12_stable_v8_score_best.pt \
+  --width 12 --height 12 --initial-length 3 --max-steps 0 \
+  --reward-step -0.003 --reward-food 5 --reward-death -5 \
+  --reward-shaping-scale 1 --max-idle-steps 90 \
+  --idle-growth-per-food 2 --idle-limit-floor-steps 144 --idle-penalty -5 \
+  --network-version 3 --hidden 256 256 \
+  --action-mask-mode topology_survival_v1 \
+  --gamma 0.99 --n-step 3 --per-alpha 0.6 \
+  --per-beta-start 0.4 --per-beta-frames 800000 \
+  --target-update 5000 --target-update-tau 0.005 \
+  --num-envs 32 --rollout-steps 4 --updates-per-collection 8 \
+  --batch-size 512 --min-replay 50000 --replay-capacity 100000 \
+  --policy-anchor-weight 0.15 --policy-anchor-final-weight 0 \
+  --policy-anchor-decay-steps 400000 --teacher-replay-steps 50000 \
+  --demonstration-capacity 20000 --demonstration-batch-fraction 0.25 \
+  --elite-demonstration-batch-fraction 0.10 \
+  --demonstration-min-score 8 --demonstration-min-return 30 \
+  --demonstration-elite-score 14 --demonstration-elite-return 60 \
+  --demonstration-terminal-exclusion-steps 3 \
+  --imitation-loss-weight 0.15 --imitation-margin 0.8 \
+  --lr 0.00000078125 --lr-plateau-patience 5 \
+  --lr-plateau-factor 0.5 --lr-plateau-min 0.000000048828125 \
+  --early-stop-patience 10 --early-stop-delta 0.10 \
+  --require-paired-promotion --paired-promotion-min-delta 0.10 \
+  --regression-stop-patience 3 --regression-stop-delta 0.20 \
+  --epsilon-start 0.015 --epsilon-final 0.003 --epsilon-decay-steps 1000000 \
+  --eval-interval 400 --eval-episodes 64 \
+  --adaptive-eval-max-episodes 600 --adaptive-eval-growth-factor 2 \
+  --eval-seed-base 1700000 \
+  --inconclusive-scheduler-mode bounded_probe_v1 \
+  --bounded-inconclusive-patience 3 \
+  --full-eval-confirmation-interval 8 \
+  --full-eval-seed-base 3000000 --full-eval-max-attempts 64 \
+  --collection-log-interval 10 --checkpoint-interval 400 \
+  --device cuda --allow-nondeterministic \
+  --output models/dqn_snake_12x12_stable_v9_topology_best.pt \
+  --latest-output models/dqn_snake_12x12_stable_v9_topology_latest.pt \
+  --log-dir runs/stable_v9_topology_12x12 \
+  2>&1 | tee runs/stable_v9_topology_12x12/console_$(date +%Y%m%d_%H%M%S).log
+```
+
+按 `Ctrl-B`、再按 `D` 可安全离开 tmux；`tmux attach -t snake_v9_12x12` 可重新查看。固定的 64-seed
+probe 仅用于调度；每 8 次 probe 的 full confirmation 会在全新的 600-seed block 上，用完全相同的 seeds
+重新评估 candidate 与 immutable best。每个 full block 会在观察结果前持久预留，并在最多 64 次的预注册
+family-wise alpha 预算内判定；崩溃恢复不会复用已经查看过的 holdout。连续 3 次 probe inconclusive 只会在
+学习率高于最小值时兑换一个 plateau tick，绝不会在最小学习率上误触发早停。
+
+`topology_survival_v1` 在一步安全之外验证下一步逃生动作和头尾连通性；过严时依次退回两步安全、一步安全，
+只有所有动作都会立即死亡时才开放完整动作集合。anchor 从 0.15 完全退火到 0，降低 v8 后期 anchor loss
+长期压过 TD loss 的约束；每轮 collection 的梯度更新也从 10 降到 8。普通 JSONL collection 每 10 轮采样
+一次，evaluation 和最终状态仍强制记录，完整控制器状态只保存在 checkpoint/sidecar 中。
+
 历史 8x8 adaptive 示例：
 
 ```bash

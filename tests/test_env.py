@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections import deque
 
 import pytest
@@ -254,6 +255,160 @@ def test_relative_survival_mask_falls_back_when_every_action_is_terminal() -> No
     )
 
     assert env.relative_survival_mask() == (True, True, True)
+
+
+def test_topology_mask_rejects_a_two_step_dead_end() -> None:
+    env = SnakeGameEnv(GameConfig(width=5, height=5, seed=1))
+    _install_state(
+        env,
+        [(1, 4), (1, 3), (0, 3), (0, 2), (1, 2)],
+        direction=Action.DOWN,
+        food=(2, 0),
+    )
+
+    assert env.relative_survival_mask() == (False, True, True)
+    assert env.relative_topology_survival_mask() == (False, True, False)
+
+
+def test_topology_mask_rejects_a_head_tail_disconnection() -> None:
+    env = SnakeGameEnv(GameConfig(width=6, height=6, seed=2))
+    _install_state(
+        env,
+        [(4, 3), (4, 2), (5, 2), (5, 1), (4, 1), (4, 0), (5, 0)],
+        direction=Action.DOWN,
+        food=(5, 3),
+    )
+
+    assert env.relative_survival_mask() == (True, True, True)
+    assert env.relative_topology_survival_mask() == (True, False, True)
+
+
+def test_topology_mask_falls_back_to_one_step_before_all_fatal() -> None:
+    env = SnakeGameEnv(GameConfig(width=5, height=5, seed=2))
+    _install_state(
+        env,
+        [(0, 4), (1, 4), (1, 3), (1, 2), (0, 2), (0, 1)],
+        direction=Action.LEFT,
+        food=(0, 3),
+    )
+
+    assert env.relative_survival_mask() == (False, False, True)
+    assert env.relative_topology_survival_mask() == (False, False, True)
+
+    trapped = SnakeGameEnv(GameConfig(width=5, height=5))
+    _install_state(
+        trapped,
+        [
+            (2, 2),
+            (2, 1),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+            (3, 2),
+            (3, 1),
+        ],
+        direction=Action.UP,
+        food=(0, 0),
+    )
+    assert trapped.relative_topology_survival_mask() == (True, True, True)
+
+
+def test_topology_mask_falls_back_to_two_step_before_one_step() -> None:
+    env = SnakeGameEnv(GameConfig(width=5, height=5, seed=2))
+    _install_state(
+        env,
+        [(1, 4), (1, 3), (0, 3), (0, 2), (0, 1), (1, 1), (1, 0), (0, 0)],
+        direction=Action.DOWN,
+        food=(2, 4),
+    )
+
+    assert env.relative_survival_mask() == (False, True, True)
+    assert env.relative_topology_survival_mask() == (False, True, False)
+
+
+def test_topology_projection_is_pure_and_handles_growth_and_wrap() -> None:
+    env = SnakeGameEnv(GameConfig(width=5, height=5, seed=81))
+    _install_state(
+        env,
+        [(2, 2), (1, 2), (1, 3), (2, 3)],
+        direction=Action.RIGHT,
+        food=(3, 2),
+    )
+    before = (
+        env.snake,
+        env.direction,
+        env.food,
+        env.score,
+        env.steps,
+        env.steps_since_food,
+        env._rng.getstate(),
+    )
+    mask = env.relative_topology_survival_mask()
+    after = (
+        env.snake,
+        env.direction,
+        env.food,
+        env.score,
+        env.steps,
+        env.steps_since_food,
+        env._rng.getstate(),
+    )
+    assert mask[RelativeAction.STRAIGHT]
+    assert before == after
+
+    wrapped = SnakeGameEnv(GameConfig(width=5, height=5, allow_wrap=True, seed=3))
+    _install_state(
+        wrapped,
+        [(2, 0), (2, 1), (2, 2)],
+        direction=Action.UP,
+        food=(4, 4),
+    )
+    assert wrapped.relative_topology_survival_mask()[RelativeAction.STRAIGHT]
+
+
+def test_topology_projection_matches_a_cloned_real_step() -> None:
+    env = SnakeGameEnv(GameConfig(width=5, height=5, seed=91))
+    _install_state(
+        env,
+        [(2, 2), (1, 2), (1, 3), (2, 3)],
+        direction=Action.RIGHT,
+        food=(3, 2),
+    )
+    state = (
+        tuple(env.snake),
+        env.direction,
+        env.food,
+        env._rng.getstate(),
+        False,
+    )
+
+    for relative in RelativeAction:
+        absolute = relative_to_absolute(env.direction, relative)
+        projected = env._project_state(state, absolute)
+        clone = copy.deepcopy(env)
+        _, _, done, _ = clone.step(absolute)
+        if projected is None:
+            assert done
+            continue
+        assert not done or projected[4]
+        assert tuple(clone.snake) == projected[0]
+        assert clone.direction is projected[1]
+        assert clone.food == projected[2]
+        assert clone._rng.getstate() == projected[3]
+
+
+def test_topology_mask_accepts_a_board_filling_food_move() -> None:
+    env = SnakeGameEnv(GameConfig(width=3, height=3, initial_length=2, seed=4))
+    _install_state(
+        env,
+        [(1, 2), (0, 2), (0, 1), (0, 0), (1, 0), (2, 0), (2, 1), (1, 1)],
+        direction=Action.RIGHT,
+        food=(2, 2),
+    )
+
+    assert env.relative_topology_survival_mask()[RelativeAction.STRAIGHT]
 
 
 def test_config_seed_produces_reproducible_but_distinct_episode_sequence() -> None:
