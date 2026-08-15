@@ -96,6 +96,9 @@ _ACTION_MASK_MODES = {
     "topology_survival_v1",
 }
 
+_TRUNCATION_BOOTSTRAP_MODES = {"terminal_v1", "bootstrap_v1"}
+_TIME_FEATURE_MODES = {"finite_horizon_progress_v1", "constant_zero_v1"}
+
 
 class ReplayBuffer:
     """Lazy CPU ring buffer with proportional prioritized replay.
@@ -987,6 +990,8 @@ class DQNAgent:
         obs_shape: Tuple[int, int, int] | None = None,
         network_version: int = 3,
         action_mask_mode: str = "legal_v1",
+        truncation_bootstrap_mode: str = "bootstrap_v1",
+        time_feature_mode: str | None = None,
         amp_enabled: bool | None = None,
         pin_memory: bool | None = None,
         policy_anchor_weight: float = 0.0,
@@ -1053,6 +1058,27 @@ class DQNAgent:
                 "survival action masks require the three-action relative policy"
             )
         self.action_mask_mode = action_mask_mode
+        if truncation_bootstrap_mode not in _TRUNCATION_BOOTSTRAP_MODES:
+            raise ValueError(
+                "truncation_bootstrap_mode must be one of "
+                f"{sorted(_TRUNCATION_BOOTSTRAP_MODES)}"
+            )
+        self.truncation_bootstrap_mode = truncation_bootstrap_mode
+        if time_feature_mode is None:
+            time_feature_mode = (
+                "finite_horizon_progress_v1"
+                if game_config is not None and game_config.max_episode_steps > 0
+                else "constant_zero_v1"
+            )
+        if time_feature_mode not in _TIME_FEATURE_MODES:
+            raise ValueError(f"time_feature_mode must be one of {sorted(_TIME_FEATURE_MODES)}")
+        finite_horizon = game_config is not None and game_config.max_episode_steps > 0
+        if finite_horizon != (time_feature_mode == "finite_horizon_progress_v1"):
+            raise ValueError(
+                "time_feature_mode must match whether game_config.max_episode_steps "
+                "defines a finite horizon"
+            )
+        self.time_feature_mode = time_feature_mode
         if not math.isfinite(policy_anchor_weight) or policy_anchor_weight < 0:
             raise ValueError("policy_anchor_weight must be finite and non-negative")
         if policy_anchor_final_weight is None:
@@ -1200,12 +1226,21 @@ class DQNAgent:
                     float,
                     torch.Tensor,
                     bool,
+                    bool,
                     torch.Tensor | None,
                 ]
             ],
         ] = {}
         self._n_step_buffer: Deque[
-            tuple[torch.Tensor, int, float, torch.Tensor, bool, torch.Tensor | None]
+            tuple[
+                torch.Tensor,
+                int,
+                float,
+                torch.Tensor,
+                bool,
+                bool,
+                torch.Tensor | None,
+            ]
         ] = self._n_step_buffers.setdefault(0, deque())
         self._episode_replay_tokens: dict[int, list[tuple[int, int]]] = {}
         self.demonstration_trajectories_seen = 0
@@ -1351,12 +1386,20 @@ class DQNAgent:
         next_action_mask: torch.Tensor | Sequence[bool] | None = None,
         *,
         stream_id: int = 0,
+        episode_end: bool | float | torch.Tensor | None = None,
     ) -> None:
         state_t = self._ensure_cpu_observation(state)
         next_state_t = self._ensure_cpu_observation(next_state)
         action_value = int(torch.as_tensor(action).reshape(()).item())
         reward_value = float(torch.as_tensor(reward).reshape(()).item())
         done_value = bool(torch.as_tensor(done).reshape(()).item())
+        episode_end_value = (
+            done_value
+            if episode_end is None
+            else bool(torch.as_tensor(episode_end).reshape(()).item())
+        )
+        if done_value and not episode_end_value:
+            raise ValueError("a terminal transition must also end its episode")
         mask_t: torch.Tensor | None = None
         if next_action_mask is not None:
             raw_mask = torch.as_tensor(
@@ -1377,9 +1420,17 @@ class DQNAgent:
         stream_id = int(stream_id)
         stream_buffer = self._n_step_buffers.setdefault(stream_id, deque())
         stream_buffer.append(
-            (state_t, action_value, reward_value, next_state_t, done_value, mask_t)
+            (
+                state_t,
+                action_value,
+                reward_value,
+                next_state_t,
+                done_value,
+                episode_end_value,
+                mask_t,
+            )
         )
-        if done_value:
+        if episode_end_value:
             while stream_buffer:
                 self._emit_n_step_transition(stream_id)
         elif len(stream_buffer) >= self.n_step:
@@ -1659,7 +1710,7 @@ class DQNAgent:
     def save(self, path: str) -> None:
         numpy_state = np.random.get_state()
         checkpoint = {
-            "checkpoint_schema_version": 4,
+            "checkpoint_schema_version": 5,
             "policy_state_dict": self.policy_net.state_dict(),
             "target_state_dict": self.target_net.state_dict(),
             "policy_anchor_state_dict": (
@@ -1688,7 +1739,7 @@ class DQNAgent:
                 else [],
             },
             "metadata": {
-                "checkpoint_schema_version": 4,
+                "checkpoint_schema_version": 5,
                 "state_dim": self.state_dim,
                 "action_dim": self.action_dim,
                 "hidden_sizes": self.hidden_sizes,
@@ -1723,6 +1774,8 @@ class DQNAgent:
                 "obs_shape": self.obs_shape,
                 "network_version": self.network_version,
                 "action_mask_mode": self.action_mask_mode,
+                "truncation_bootstrap_mode": self.truncation_bootstrap_mode,
+                "time_feature_mode": self.time_feature_mode,
                 "observation_schema": _NETWORK_SCHEMAS[self.network_version][
                     "observation_schema"
                 ],
@@ -2084,6 +2137,28 @@ class DQNAgent:
         action_mask_mode = str(
             options.pop("action_mask_mode", metadata.get("action_mask_mode", "legal_v1"))
         )
+        truncation_bootstrap_mode = str(
+            options.pop(
+                "truncation_bootstrap_mode",
+                metadata.get("truncation_bootstrap_mode", "terminal_v1"),
+            )
+        )
+        source_time_feature_mode = str(
+            metadata.get(
+                "time_feature_mode",
+                "finite_horizon_progress_v1"
+                if source_config is not None and source_config.max_episode_steps > 0
+                else "constant_zero_v1",
+            )
+        )
+        target_time_feature_mode = str(
+            options.pop(
+                "time_feature_mode",
+                "finite_horizon_progress_v1"
+                if target_game_config.max_episode_steps > 0
+                else "constant_zero_v1",
+            )
+        )
         target_obs_shape = (
             int(source_obs_shape[0]),
             int(target_game_config.height),
@@ -2142,6 +2217,8 @@ class DQNAgent:
             obs_shape=target_obs_shape,
             network_version=network_version,
             action_mask_mode=action_mask_mode,
+            truncation_bootstrap_mode=truncation_bootstrap_mode,
+            time_feature_mode=target_time_feature_mode,
             **options,
         )
         embedded_metadata = agent._apply_policy_checkpoint_snapshot(snapshot)
@@ -2169,6 +2246,12 @@ class DQNAgent:
             "source_action_dim": action_dim,
             "source_action_mask_mode": metadata.get("action_mask_mode", "legal_v1"),
             "target_action_mask_mode": agent.action_mask_mode,
+            "source_truncation_bootstrap_mode": metadata.get(
+                "truncation_bootstrap_mode", "terminal_v1"
+            ),
+            "target_truncation_bootstrap_mode": agent.truncation_bootstrap_mode,
+            "source_time_feature_mode": source_time_feature_mode,
+            "target_time_feature_mode": agent.time_feature_mode,
             "source_hidden_sizes": list(hidden_sizes),
             "source_obs_shape": list(source_obs_shape),
             "target_obs_shape": list(target_obs_shape),
@@ -2197,6 +2280,10 @@ class DQNAgent:
             "action_dim": transfer_provenance.get("source_action_dim"),
             "obs_shape": transfer_provenance.get("source_obs_shape"),
             "action_mask_mode": transfer_provenance.get("source_action_mask_mode"),
+            "truncation_bootstrap_mode": transfer_provenance.get(
+                "source_truncation_bootstrap_mode"
+            ),
+            "time_feature_mode": transfer_provenance.get("source_time_feature_mode"),
         }
         conflicts = {
             key: (sidecar_metadata[key], value)
@@ -2273,6 +2360,10 @@ class DQNAgent:
             obs_shape=obs_shape,
             network_version=metadata.get("network_version", 1),
             action_mask_mode=metadata.get("action_mask_mode", "legal_v1"),
+            truncation_bootstrap_mode=metadata.get(
+                "truncation_bootstrap_mode", "terminal_v1"
+            ),
+            time_feature_mode=metadata.get("time_feature_mode"),
             amp_enabled=metadata.get("amp_enabled"),
             # Pinned memory is a runtime/device property and replay is not
             # restored, so configure it from the selected device every time.
@@ -2444,8 +2535,8 @@ class DQNAgent:
         steps = 0
         final_next_state = stream_buffer[0][3]
         final_done = False
-        final_mask = stream_buffer[0][5]
-        for _, _, reward, next_state, done, next_mask in list(stream_buffer)[
+        final_mask = stream_buffer[0][6]
+        for _, _, reward, next_state, done, _, next_mask in list(stream_buffer)[
             : self.n_step
         ]:
             accumulated_reward += (self.gamma**steps) * reward
@@ -2455,7 +2546,7 @@ class DQNAgent:
             final_mask = next_mask
             if done:
                 break
-        state, action, _, _, action_was_terminal, _ = stream_buffer[0]
+        state, action, _, _, action_was_terminal, _, _ = stream_buffer[0]
         token = self.replay_buffer.push(
             state,
             action,

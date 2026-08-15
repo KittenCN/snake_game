@@ -333,6 +333,55 @@ def _event(record: LogRecord) -> str | None:
     return None
 
 
+def _termination_summary(
+    records: Sequence[LogRecord], *, recent_window: int = 100
+) -> dict[str, Any]:
+    """Summarize episode endings and expose horizon saturation explicitly."""
+    event_rows = [
+        (record, event)
+        for record in records
+        if (event := _event(record)) is not None
+    ]
+
+    def summarize(rows: Sequence[tuple[LogRecord, str]]) -> dict[str, Any]:
+        counts = Counter(event for _, event in rows)
+        total = len(rows)
+        truncation_count = counts.get("time_limit", 0) + counts.get("truncated", 0)
+        return {
+            "count": total,
+            "counts": dict(counts),
+            "rates": {
+                event: count / total for event, count in sorted(counts.items())
+            }
+            if total
+            else {},
+            "truncation_count": truncation_count,
+            "truncation_rate": truncation_count / total if total else None,
+            "idle_timeout_rate": counts.get("idle_timeout", 0) / total
+            if total
+            else None,
+        }
+
+    overall = summarize(event_rows)
+    recent = summarize(event_rows[-recent_window:])
+    recent_rate = recent["truncation_rate"]
+    if recent_rate is None:
+        horizon_status = "unavailable"
+    elif recent_rate >= 0.5:
+        horizon_status = "severely_saturated"
+    elif recent_rate >= 0.1:
+        horizon_status = "saturated"
+    else:
+        horizon_status = "not_saturated"
+    return {
+        "available": bool(event_rows),
+        **overall,
+        "recent_window": recent_window,
+        "recent": recent,
+        "horizon_status": horizon_status,
+    }
+
+
 def _bucket_name(value: float) -> str:
     if value <= 0:
         return "0"
@@ -441,9 +490,6 @@ def build_report(
 ) -> dict[str, Any]:
     episodes = _values(records, "episode")
     scores = _values(records, "score")
-    events = Counter(
-        event for record in records if (event := _event(record)) is not None
-    )
     report = {
         "input": {
             "patterns": list(patterns),
@@ -477,7 +523,7 @@ def build_report(
         "demonstration_replay_elite_count": _series_summary(
             _values(records, "demonstration_replay_elite_count")
         ),
-        "termination_events": {"available": bool(events), "counts": dict(events)},
+        "termination_events": _termination_summary(records),
         "score_buckets": _bucket_summary(records, ("score",)),
         "snake_length_buckets": _bucket_summary(
             records, ("snake_length", "snake_len", "final_snake_length")
@@ -558,6 +604,17 @@ def format_human(report: Mapping[str, Any]) -> str:
             )
     else:
         lines.append("Evaluation: no evaluation fields found")
+    termination = report["termination_events"]
+    if termination["available"]:
+        recent = termination["recent"]
+        lines.append(
+            "Termination: "
+            f"counts={termination['counts']}, "
+            f"recent{termination['recent_window']} truncation_rate="
+            f"{_fmt(recent['truncation_rate'])}, "
+            f"idle_timeout_rate={_fmt(recent['idle_timeout_rate'])}, "
+            f"horizon={termination['horizon_status']}"
+        )
     floor_position = epsilon["first_floor_position"]
     lines.append(
         "Epsilon: "

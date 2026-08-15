@@ -20,6 +20,7 @@ from train_dqn import (
     action_mask,
     adaptive_evaluation_plan,
     deterministic_episode_seed,
+    episode_step_limit,
     evaluate_agent,
     evaluate_adaptive_paired,
     evaluate_fresh_full_pair,
@@ -57,6 +58,10 @@ from train_dqn import (
         ["--teacher-replay-steps", "-1"],
         ["--teacher-replay-steps", "101", "--replay-capacity", "100"],
         ["--collection-log-interval", "0"],
+        ["--max-steps", "-1"],
+        ["--eval-vector-envs", "0"],
+        ["--max-steps", "0", "--time-feature-mode", "finite_horizon_progress_v1"],
+        ["--max-steps", "10", "--time-feature-mode", "constant_zero_v1"],
         ["--idle-limit-floor-steps", "-1"],
         ["--max-idle-steps", "0", "--idle-limit-floor-steps", "1"],
         ["--policy-anchor-weight", "0.1", "--policy-anchor-final-weight", "0.2"],
@@ -473,6 +478,7 @@ def test_adaptive_paired_evaluation_uses_disjoint_chunks_and_full_promotion(
         _config: GameConfig,
         seeds: list[int],
         _max_steps: int,
+        **_options: object,
     ) -> dict[str, object]:
         seed_chunks.append(list(seeds))
         return _evaluation_payload(list(seeds), candidate_score)
@@ -524,6 +530,7 @@ def test_probe_and_fresh_full_attempts_use_disjoint_seed_namespaces(
         _config: GameConfig,
         seeds: list[int],
         _max_steps: int,
+        **_options: object,
     ) -> dict[str, object]:
         calls.append((agent, list(seeds)))
         score = 1.0 if agent is candidate else 0.0
@@ -547,6 +554,41 @@ def test_probe_and_fresh_full_attempts_use_disjoint_seed_namespaces(
     )
     assert candidate_full["seeds"] == reference_full["seeds"] == first[1]
     assert calls[-2:] == [(reference, first[1]), (candidate, first[1])]
+
+
+def test_interrupted_full_pair_consumes_reservation_without_observing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GameConfig(width=5, height=5)
+    candidate = make_agent(config)
+    reference = make_agent(config)
+    controller = EvaluationConvergenceController(
+        0,
+        0.5,
+        0.001,
+        0,
+        0.1,
+        require_paired_promotion=True,
+        full_eval_seed_base=1_000,
+        full_eval_max_attempts=2,
+    )
+    reserved = reserve_full_evaluation_attempt(controller, episodes=4)
+    assert reserved is not None
+    calls = 0
+
+    def interrupt_candidate(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return _evaluation_payload(reserved[1], 0.0)
+
+    monkeypatch.setattr(training_module, "evaluate_agent", interrupt_candidate)
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_fresh_full_pair(candidate, reference, config, reserved[1], None)
+
+    assert controller.full_eval_attempts == 1
+    assert controller.evaluations == 0
 
 
 def test_full_confirmation_uses_pre_registered_attempt_alpha_not_probe_selection() -> None:
@@ -1182,6 +1224,8 @@ def test_full_resume_rejects_best_checkpoint_role() -> None:
         "network_version": agent.network_version,
         "action_dim": agent.action_dim,
         "action_mask_mode": agent.action_mask_mode,
+        "truncation_bootstrap_mode": agent.truncation_bootstrap_mode,
+        "time_feature_mode": agent.time_feature_mode,
         "obs_shape": list(agent.obs_shape),
         "behavior_steps": agent.behavior_steps,
         "learn_step_counter": agent.learn_step_counter,
@@ -1320,6 +1364,52 @@ def test_resume_seed_change_requires_explicit_permission() -> None:
     validate_resume_seed({"run_seed": 8}, args)
 
 
+def test_resume_evaluation_execution_migrates_legacy_and_gates_refill_size() -> None:
+    legacy_args = parse_args([])
+    training_module.restore_evaluation_execution(
+        {"evaluation_identity": {"eval_episodes": 50}}, legacy_args
+    )
+    assert legacy_args.eval_execution_mode == "all_active_v1"
+
+    metadata = {
+        "evaluation_identity": {
+            "evaluation_execution": {
+                "schema": "refill_slots_v1",
+                "vector_envs": 32,
+            }
+        }
+    }
+    adopted = parse_args([])
+    training_module.restore_evaluation_execution(metadata, adopted)
+    assert adopted.eval_execution_mode == "refill_slots_v1"
+    assert adopted.eval_vector_envs == 32
+    conflicting = parse_args(["--eval-vector-envs", "16"])
+    with pytest.raises(RuntimeError, match="vector size conflicts"):
+        training_module.restore_evaluation_execution(metadata, conflicting)
+
+
+def test_full_resume_rejects_finite_horizon_to_timeless_identity_switch() -> None:
+    finite_config = GameConfig(width=5, height=5, max_episode_steps=100)
+    agent = make_agent(finite_config)
+    args = parse_args(
+        [
+            "--max-steps",
+            "0",
+            "--time-feature-mode",
+            "constant_zero_v1",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="hyperparameters conflict"):
+        validate_resume_agent_options(args, agent)
+    with pytest.raises(RuntimeError, match="environment/MDP differs"):
+        training_module.validate_resume_environment(
+            agent,
+            GameConfig(width=5, height=5, max_episode_steps=0),
+            allow_change=False,
+        )
+
+
 def test_fresh_outputs_require_explicit_overwrite(tmp_path: Path) -> None:
     best = tmp_path / "best.pt"
     latest = tmp_path / "latest.pt"
@@ -1355,6 +1445,59 @@ def test_fixed_seed_evaluation_is_repeatable() -> None:
     assert first["seeds"] == [10, 11, 12]
     assert len(first["score_samples"]) == 3
     assert first["score"]["mean"] == pytest.approx(sum(first["score_samples"]) / 3)
+
+
+def test_zero_max_steps_is_truly_unbounded_and_uses_timeless_identity() -> None:
+    args = parse_args(["--max-steps", "0"])
+    config = GameConfig(width=5, height=5, max_episode_steps=args.max_steps)
+
+    assert episode_step_limit(config, args.max_steps) is None
+    assert args.time_feature_mode == "constant_zero_v1"
+    finite = parse_args(["--max-steps", "100"])
+    assert finite.time_feature_mode == "finite_horizon_progress_v1"
+    assert episode_step_limit(
+        GameConfig(width=5, height=5, max_episode_steps=100), finite.max_steps
+    ) == 100
+
+
+def test_refill_evaluator_preserves_seed_order_and_matches_all_active(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = GameConfig(width=5, height=5, max_idle_steps=10)
+    agent = make_agent(config)
+    capacities: list[int] = []
+    original_encoder = training_module.BatchObservationEncoder
+
+    def tracking_encoder(*args: object, **kwargs: object) -> object:
+        capacities.append(int(kwargs["max_batch_size"]))
+        return original_encoder(*args, **kwargs)
+
+    monkeypatch.setattr(training_module, "BatchObservationEncoder", tracking_encoder)
+    seeds = [19, 3, 41, 7, 23]
+    refill = evaluate_agent(
+        agent,
+        config,
+        seeds,
+        max_steps=None,
+        vector_envs=2,
+        execution_mode="refill_slots_v1",
+        heartbeat_seconds=1e-12,
+    )
+    all_active = evaluate_agent(
+        agent,
+        config,
+        seeds,
+        max_steps=None,
+        vector_envs=2,
+        execution_mode="all_active_v1",
+    )
+
+    assert capacities == [2, 5]
+    assert refill == all_active
+    assert refill["seeds"] == seeds
+    progress = capsys.readouterr().out
+    assert "Evaluation progress:" in progress
+    assert "score" not in progress.lower()
 
 
 def test_fixed_evaluation_counts_environment_time_limit() -> None:
@@ -1878,6 +2021,7 @@ def test_adaptive_warm_start_promotion_and_resume_keep_full_reference(
         _config: GameConfig,
         seeds: list[int],
         _max_steps: int,
+        **_options: object,
     ) -> dict[str, object]:
         current = list(seeds)
         calls.append(current)
@@ -2425,6 +2569,7 @@ def test_gated_training_uses_fresh_full_pair_and_persists_costs(
         _config: GameConfig,
         seeds: list[int],
         _max_steps: int,
+        **_options: object,
     ) -> dict[str, object]:
         seed_list = list(seeds)
         calls.append((evaluated_agent, seed_list))
@@ -2531,6 +2676,7 @@ def test_fresh_gated_training_establishes_episode_zero_best_before_first_probe(
         _config: GameConfig,
         seeds: list[int],
         _max_steps: int,
+        **_options: object,
     ) -> dict[str, object]:
         seed_list = list(seeds)
         calls.append(seed_list)
@@ -2541,6 +2687,7 @@ def test_fresh_gated_training_establishes_episode_zero_best_before_first_probe(
                 latest.with_suffix(".meta.json").read_text("utf-8")
             )
             assert baseline_metadata["best_eval_episode"] == 0
+            assert baseline_metadata["episodes_completed"] == 1
         return _evaluation_payload(seed_list, 1.0)
 
     monkeypatch.setattr(training_module, "evaluate_agent", fake_evaluate)

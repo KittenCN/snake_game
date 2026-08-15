@@ -147,6 +147,75 @@ def test_policy_checkpoint_constructs_fresh_cross_map_agent(tmp_path: Path) -> N
     assert resumed.policy_transfer_provenance == provenance
 
 
+def test_policy_transfer_changes_finite_horizon_feature_to_timeless_target(
+    tmp_path: Path,
+) -> None:
+    source_config = GameConfig(width=8, height=8, max_episode_steps=40)
+    source = make_agent(
+        state_dim=20 * 8 * 8,
+        action_dim=3,
+        obs_shape=(20, 8, 8),
+        game_config=source_config,
+        time_feature_mode="finite_horizon_progress_v1",
+    )
+    path = tmp_path / "finite-source.pt"
+    source.save(str(path))
+
+    transferred = DQNAgent.from_policy_checkpoint(
+        str(path),
+        target_game_config=GameConfig(width=8, height=8, max_episode_steps=0),
+        device="cpu",
+        agent_options={
+            "truncation_bootstrap_mode": "bootstrap_v1",
+            "time_feature_mode": "constant_zero_v1",
+        },
+    )
+
+    assert transferred.time_feature_mode == "constant_zero_v1"
+    assert transferred.truncation_bootstrap_mode == "bootstrap_v1"
+    assert transferred.policy_transfer_provenance is not None
+    assert (
+        transferred.policy_transfer_provenance["source_time_feature_mode"]
+        == "finite_horizon_progress_v1"
+    )
+    assert (
+        transferred.policy_transfer_provenance["target_time_feature_mode"]
+        == "constant_zero_v1"
+    )
+
+
+def test_legacy_checkpoint_restores_terminal_truncation_contract(tmp_path: Path) -> None:
+    config = GameConfig(width=12, height=12, max_episode_steps=100)
+    source = make_agent(game_config=config)
+    path = tmp_path / "legacy-boundary.pt"
+    source.save(str(path))
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint["checkpoint_schema_version"] = 4
+    checkpoint["metadata"]["checkpoint_schema_version"] = 4
+    checkpoint["metadata"].pop("truncation_bootstrap_mode")
+    checkpoint["metadata"].pop("time_feature_mode")
+    torch.save(checkpoint, path)
+
+    restored = DQNAgent.restore_training_checkpoint(str(path), device="cpu")
+
+    assert restored.truncation_bootstrap_mode == "terminal_v1"
+    assert restored.time_feature_mode == "finite_horizon_progress_v1"
+
+
+def test_v3_horizon_channel_matches_versioned_time_feature_identity() -> None:
+    unlimited = SnakeGameEnv(GameConfig(width=5, height=5, max_episode_steps=0))
+    unlimited.reset(seed=1)
+    unlimited.step(Action.RIGHT)
+    unlimited_state = flatten_observation(unlimited, "cpu", expected_channels=20)
+    assert torch.count_nonzero(unlimited_state[19]).item() == 0
+
+    finite = SnakeGameEnv(GameConfig(width=5, height=5, max_episode_steps=10))
+    finite.reset(seed=1)
+    finite.step(Action.RIGHT)
+    finite_state = flatten_observation(finite, "cpu", expected_channels=20)
+    assert torch.allclose(finite_state[19], torch.full((5, 5), 0.1))
+
+
 def test_policy_checkpoint_sha_and_structure_fail_before_transfer(
     tmp_path: Path,
 ) -> None:
@@ -774,6 +843,75 @@ def test_n_step_terminal_flush_emits_all_prefixes() -> None:
         [0.125, 0.25, 0.5]
     )
     assert agent.replay_buffer._dones[:3].tolist() == [1.0, 1.0, 1.0]
+
+
+def test_n_step_truncation_flushes_without_terminal_bootstrap_or_cross_reset() -> None:
+    agent = make_agent(gamma=0.5, n_step=3)
+    states = [torch.full(agent.obs_shape, float(index)) for index in range(4)]
+    final_mask = [False, True, False, False]
+    agent.remember(
+        states[0],
+        0,
+        1.0,
+        states[1],
+        False,
+        next_action_mask=[True, True, False, False],
+    )
+    agent.remember(
+        states[1],
+        1,
+        2.0,
+        states[2],
+        False,
+        next_action_mask=final_mask,
+        episode_end=True,
+    )
+
+    assert len(agent._n_step_buffer) == 0
+    assert len(agent.replay_buffer) == 2
+    assert agent.replay_buffer._rewards is not None
+    assert agent.replay_buffer._discounts is not None
+    assert agent.replay_buffer._dones is not None
+    assert agent.replay_buffer._next_states is not None
+    assert agent.replay_buffer._next_action_masks is not None
+    assert agent.replay_buffer._rewards[:2].tolist() == pytest.approx([2.0, 2.0])
+    assert agent.replay_buffer._discounts[:2].tolist() == pytest.approx([0.25, 0.5])
+    assert agent.replay_buffer._dones[:2].tolist() == [0.0, 0.0]
+    assert torch.all(agent.replay_buffer._next_states[:2] == states[2].to(torch.float16))
+    assert agent.replay_buffer._next_action_masks[:2].tolist() == [final_mask, final_mask]
+
+    agent.remember(states[2], 2, 10.0, states[3], True)
+    assert agent.replay_buffer._rewards[2].item() == pytest.approx(10.0)
+
+
+def test_truncated_transition_bootstraps_in_td_target() -> None:
+    agent = make_agent(
+        gamma=1.0,
+        n_step=1,
+        batch_size=1,
+        min_replay_size=1,
+        target_update_tau=0.0,
+        hard_update_interval=100,
+    )
+    agent.policy_net = FixedQ([0.0, 2.0, 3.0, 100.0])
+    agent.target_net = FixedQ([10.0, 20.0, 30.0, 40.0])
+    agent.target_net.eval()
+    agent.optimizer = torch.optim.Adam(agent.policy_net.parameters(), lr=1e-3)
+    state = torch.zeros(agent.obs_shape)
+    agent.remember(
+        state,
+        0,
+        0.0,
+        state,
+        False,
+        next_action_mask=[True, False, False, False],
+        episode_end=True,
+    )
+
+    metrics = agent.learn()
+
+    assert metrics is not None
+    assert metrics["td_error"] == pytest.approx(10.0)
 
 
 def test_terminal_next_action_mask_is_canonical_all_true() -> None:

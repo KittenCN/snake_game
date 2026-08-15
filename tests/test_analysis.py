@@ -61,6 +61,8 @@ def test_report_tolerates_bad_and_missing_fields(tmp_path: Path) -> None:
     assert report["loss"]["count"] == 2
     assert report["loss"]["last"] == pytest.approx(1.0)
     assert report["termination_events"]["counts"] == {"hit_wall": 1, "hit_self": 1}
+    assert report["termination_events"]["truncation_rate"] == pytest.approx(0.0)
+    assert report["termination_events"]["horizon_status"] == "not_saturated"
     assert report["score_buckets"]["buckets"]["0"]["count"] == 1
     assert report["score_buckets"]["buckets"]["5-9"]["count"] == 1
     assert report["score_buckets"]["buckets"]["10-19"]["count"] == 1
@@ -97,6 +99,33 @@ def test_evaluation_and_epsilon_floor_positions(tmp_path: Path) -> None:
     assert report["epsilon"]["observed_floor"] == pytest.approx(0.01)
     assert report["epsilon"]["first_floor_position"]["episode"] == 30
     assert report["epsilon"]["first_floor_position"]["record_index"] == 3
+
+
+def test_termination_summary_flags_recent_horizon_saturation(tmp_path: Path) -> None:
+    path = tmp_path / "horizon.jsonl"
+    rows = [
+        {
+            "record_type": "episode",
+            "episode": episode,
+            "score": episode,
+            "terminal_event": "time_limit" if episode <= 9 else "idle_timeout",
+        }
+        for episode in range(1, 11)
+    ]
+    _write_jsonl(path, rows)
+
+    report = _report(path, plateau_window=2)
+    termination = report["termination_events"]
+
+    assert termination["count"] == 10
+    assert termination["truncation_count"] == 9
+    assert termination["truncation_rate"] == pytest.approx(0.9)
+    assert termination["recent"]["truncation_rate"] == pytest.approx(0.9)
+    assert termination["recent"]["idle_timeout_rate"] == pytest.approx(0.1)
+    assert termination["horizon_status"] == "severely_saturated"
+    rendered = analyze_training.format_human(report)
+    assert "Termination:" in rendered
+    assert "horizon=severely_saturated" in rendered
 
 
 def test_zero_eval_reward_ranks_above_negative_reward(tmp_path: Path) -> None:
